@@ -8,8 +8,5 @@ fn main() -> i64 {
     let diff: secret u8 = k ^ g;
     let eq: u8 = declassify(diff);
 
-	print("Hello World");
-
-
     if eq == i64_to_u8(0) { 42 } else { 0 }
 }
