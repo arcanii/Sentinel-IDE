@@ -33,6 +33,14 @@ scripts\build.bat            :: configures + builds → build\Sentinel-IDE.exe
 - The IDE auto-detects `snc` and the MSVC environment; both are overridable in **Settings**.
 - Build number auto-increments (`packaging/build_number.txt`); the marketing version is fixed at `0.1.0`.
 
+### Installer
+
+`packaging/Sentinel-IDE.iss` is an [Inno Setup](https://jrsoftware.org/isinfo.php) script that produces a per-user `setup.exe` (Start-Menu shortcut, `.sntproject`/`.sentinel` file associations, uninstall). With Inno Setup 6 installed (`winget install JRSoftware.InnoSetup`):
+
+```
+scripts\make-installer.bat   :: → build\installer\Sentinel-IDE-0.1.0-setup.exe
+```
+
 ## Layout
 
 | Path | What |

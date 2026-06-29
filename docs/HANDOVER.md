@@ -60,6 +60,8 @@ exist so far:
 | `scripts/capture.ps1` | Screenshot the window → `build\shot.png` (DPI-aware PrintWindow; `-Class` for dialogs) |
 | `scripts/convert-icon.ps1` | PNG → multi-size letterboxed `.ico`. Defaults `art/S2_icon.png`→`packaging/app.ico`; `-Src/-Dst` for `file.ico`. (Letterboxes — S2 is 554×657, not square. After rerun, touch the `.rc` so ninja relinks; the per-size Win icon cache may need `ie4uinit -ClearIconCache` + reboot to refresh large/extra-large.) |
 | `scripts/loc.ps1` | Counts the IDE's source by language → `build/generated/Loc.h` (About-box badges); builds the corpus and runs **`tools/loc.sentinel`** via `snc` for the Sentinel-verified total. Called by `build.bat`. |
+| `packaging/Sentinel-IDE.iss` | **Inno Setup** installer script → per-user `setup.exe` (Start-Menu shortcut, file associations mirroring `FileAssoc.h`, uninstall). |
+| `scripts/make-installer.bat` | Build the app, then compile the installer (needs Inno Setup 6: `winget install JRSoftware.InnoSetup`) → `build/installer/`. |
 | `tools/loc.sentinel` | **The first part of SentinelIDE written *in* Sentinel** — a whole-file line counter (read_file/write_file). Counts toward the "Sentinel" LOC badge. |
 | `examples/` | Sample project: `sentinel.toml` (+ `[[target]]`s), `sentinel-trust.toml`, `crypto.sentinel`(+`.sig`), `hello.sentinel` |
 | `art/` | `S2_icon.png` (app icon — metallic shield), `A_simple_clean…827808.png` (the `.sentinel` file icon — page + blue S + padlock), `S_icon.png` (old), `guard_icon1/2.png` |
@@ -205,7 +207,21 @@ See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
 - **Single-instance / IPC:** a double-click (or a 2nd launch) currently spawns a new window; route the
   path to an existing instance (named pipe / `WM_COPYDATA` to a `FindWindow` of the app class) so the
   open project gains a file/tab instead. Also: drag-drop files onto the window; a shell "New ▸ Sentinel
-  Project" entry; and bundling the associations into a real installer (HKLM + uninstall).
+  Project" entry.
+- **Windows installer (drafted, phase 28):** `packaging/Sentinel-IDE.iss` (Inno Setup) + `scripts/
+  make-installer.bat`. Per-user `setup.exe`: exe + examples + docs, Start-Menu shortcut, the
+  `.sntproject`/`.sentinel` associations (declarative, mirrors `FileAssoc.h`), uninstall. **Not yet
+  compiled** — Inno Setup isn't installed (`winget install JRSoftware.InnoSetup`, then
+  `scripts\make-installer.bat`). WiX/MSI or MSIX (Store) are the heavier alternatives if needed later.
+- **Cross-platform = one repo, layered (decided direction).** Keep a single repo (the IDE is one
+  product); split into a **portable core** (project model, manifest/format parsers, the `.sealed`
+  format + crypto, signing/trust, the snc driver) and a **per-platform native host** (`src/ui` = the
+  Win32 host today; macOS/Linux hosts would be Cocoa / GTK-or-Qt rewrites — *not* a shared GUI). The
+  reuse layer is **Sentinel itself**: the core's logic (esp. the sealing AEAD+KDF, which `std/security`
+  already provides cross-platform + constant-time) becomes a Sentinel C-ABI lib each host links — the
+  project's own thesis. **Do NOT scaffold empty `macos/`/`linux/` trees yet** (dead weight); add a host
+  when a port actually starts. Today the `src/core/*.h` "core" is still Win32-coupled (wchar_t, BCrypt,
+  Compression API, profile API) — step 1 of any port is pulling that logic behind a portable seam.
 - **Sealing follow-ons:** more **unlock slots** (key file, Ed25519/smartcard, TPM — each wraps the
   same DEK, no re-encryption); a "**remove plaintext after sealing**" option (with confirmation;
   today seal is non-destructive); **re-seal in place** / "lock" of an unsealed working copy; show
