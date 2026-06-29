@@ -4,8 +4,8 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-#include "ui/PasswordDialog.h"
-#include "ui/Theme.h"
+#include "host/win32/PasswordDialog.h"
+#include "host/win32/Theme.h"
 
 #include <windows.h>
 #include <string>

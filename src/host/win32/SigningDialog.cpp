@@ -6,8 +6,8 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-#include "ui/SigningDialog.h"
-#include "ui/Theme.h"
+#include "host/win32/SigningDialog.h"
+#include "host/win32/Theme.h"
 #include "core/Logger.h"
 #include "core/Signing.h"
 

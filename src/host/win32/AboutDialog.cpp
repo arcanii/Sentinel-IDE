@@ -5,10 +5,10 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-#include "ui/AboutDialog.h"
+#include "host/win32/AboutDialog.h"
 #include "Version.h"     // generated: SENTINEL_VERSION_DISPLAY_W (marketing + auto build number)
 #include "Loc.h"         // generated: SENTINEL_LOC_* lines-of-code by language (scripts/loc.ps1)
-#include "ui/Theme.h"
+#include "host/win32/Theme.h"
 #include "core/Logger.h"
 
 #include <windows.h>

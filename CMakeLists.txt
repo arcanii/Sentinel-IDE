@@ -17,14 +17,17 @@ if(MSVC)
   add_compile_definitions(UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# Layered: src/core/ = portable-intended logic (the reuse layer, trending toward a
+# Sentinel C-ABI lib); src/host/win32/ = the thin Win32 native host. A macOS/Linux
+# port would add src/host/<os>/ against the same core — added when a port starts.
 add_executable(SentinelIDE WIN32
-  src/WinMain.cpp
-  src/ui/MainWindow.cpp
-  src/ui/SettingsDialog.cpp
-  src/ui/ProjectSettingsDialog.cpp
-  src/ui/SigningDialog.cpp
-  src/ui/AboutDialog.cpp
-  src/ui/PasswordDialog.cpp
+  src/host/win32/WinMain.cpp
+  src/host/win32/MainWindow.cpp
+  src/host/win32/SettingsDialog.cpp
+  src/host/win32/ProjectSettingsDialog.cpp
+  src/host/win32/SigningDialog.cpp
+  src/host/win32/AboutDialog.cpp
+  src/host/win32/PasswordDialog.cpp
   packaging/SentinelIDE.rc)
 
 # Version header — normally written by scripts\build.bat (auto-incrementing build

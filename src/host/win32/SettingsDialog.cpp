@@ -5,8 +5,8 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-#include "ui/SettingsDialog.h"
-#include "ui/Theme.h"
+#include "host/win32/SettingsDialog.h"
+#include "host/win32/Theme.h"
 #include "core/Logger.h"
 
 #include <windows.h>

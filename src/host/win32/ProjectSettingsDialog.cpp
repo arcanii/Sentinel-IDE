@@ -7,8 +7,8 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-#include "ui/ProjectSettingsDialog.h"
-#include "ui/Theme.h"
+#include "host/win32/ProjectSettingsDialog.h"
+#include "host/win32/Theme.h"
 #include "core/Logger.h"
 
 #include <windows.h>

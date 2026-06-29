@@ -8,9 +8,9 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-#include "ui/MainWindow.h"
+#include "host/win32/MainWindow.h"
 #include "Version.h"     // generated: SENTINEL_VERSION_DISPLAY_W (marketing + auto build number)
-#include "ui/Theme.h"
+#include "host/win32/Theme.h"
 #include "core/Logger.h"
 #include "core/Settings.h"
 #include "core/Project.h"
@@ -18,11 +18,11 @@
 #include "core/Toolchain.h"
 #include "core/Seal.h"
 #include "core/FileAssoc.h"
-#include "ui/SettingsDialog.h"
-#include "ui/ProjectSettingsDialog.h"
-#include "ui/SigningDialog.h"
-#include "ui/AboutDialog.h"
-#include "ui/PasswordDialog.h"
+#include "host/win32/SettingsDialog.h"
+#include "host/win32/ProjectSettingsDialog.h"
+#include "host/win32/SigningDialog.h"
+#include "host/win32/AboutDialog.h"
+#include "host/win32/PasswordDialog.h"
 
 #include <windows.h>
 #include <windowsx.h>

@@ -9,7 +9,7 @@
 #endif
 #include <windows.h>
 
-#include "ui/MainWindow.h"
+#include "host/win32/MainWindow.h"
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow) {
     return sentinelide::runApp(hInstance, nCmdShow, pCmdLine);
