@@ -1,0 +1,9 @@
+# sentinel-trust.toml — the consumer trust manifest (ADR 0061).
+# The "signing confirmations": which keys are trusted, under what policy, and
+# bounded to which capabilities. snc --require-signatures gates the build against it.
+
+[dependencies.std-security]
+sig     = "ed25519:RWQexampleFingerprintReplaceWithRealKey00000="
+policy  = "exact-key"
+grants  = ["secret", "constant_time", "alloc"]
+forbids = ["network", "filesystem", "subprocess"]

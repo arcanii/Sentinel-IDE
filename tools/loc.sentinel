@@ -1,0 +1,51 @@
+// tools/loc.sentinel — a small part of SentinelIDE written *in* Sentinel.
+//
+// Counts the lines in `loc_corpus.txt` (the IDE's own source, concatenated by
+// scripts/loc.ps1) and writes the total to `loc_total.txt`. Sentinel can read
+// and write whole files but has no argv or directory access (ADR 0035), so the
+// native host hands it a fixed corpus file and reads back the fixed result —
+// the thin-host / Sentinel-core split the project is built around.
+
+fn count_lines(data: [u8]) -> i64 {
+    let n: i64 = len(data);
+    let mut lines: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        lines = lines + (if u8_to_i64(data[i]) == 10 { 1 } else { 0 });   // '\n'
+        i = i + 1;
+    }
+    // a final line with no trailing newline still counts as a line
+    lines + (if n > 0 { if u8_to_i64(data[n - 1]) != 10 { 1 } else { 0 } } else { 0 })
+}
+
+// Render a non-negative i64 as decimal ASCII bytes, with a trailing newline.
+fn to_decimal(x: i64) -> [u8] {
+    let mut digits: Vec<u8> = vec_new();
+    let mut v: i64 = x;
+    // emit the least-significant digit first (this also handles x == 0)
+    let q0: i64 = v / 10;
+    push(&mut digits, i64_to_u8(v - q0 * 10 + 48));   // '0' == 48; no `%` operator
+    v = q0;
+    while v > 0 {
+        let q: i64 = v / 10;
+        push(&mut digits, i64_to_u8(v - q * 10 + 48));
+        v = q;
+    }
+    // digits are least-significant first → reverse them into the output
+    let mut out: Vec<u8> = vec_new();
+    let m: i64 = len(digits);
+    let mut j: i64 = m - 1;
+    while j >= 0 {
+        push(&mut out, digits[j]);
+        j = j - 1;
+    }
+    push(&mut out, i64_to_u8(10));                     // trailing '\n'
+    vec_to_array(out)
+}
+
+fn main() -> i64 {
+    let corpus: [u8] = read_file("loc_corpus.txt");
+    let total: i64 = count_lines(corpus);
+    write_file("loc_total.txt", to_decimal(total));
+    total
+}

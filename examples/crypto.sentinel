@@ -1,0 +1,15 @@
+// crypto.sentinel — a constant-time flavor, self-contained (no imports).
+// Compares two secret bytes branch-free, declassifying only the final result.
+fn main() -> i64 {
+    let k: secret u8 = 'k';
+    let g: secret u8 = 'k';
+
+    // XOR stays in the secret domain — never branch on a secret.
+    let diff: secret u8 = k ^ g;
+    let eq: u8 = declassify(diff);
+
+	print("Hello World");
+
+
+    if eq == i64_to_u8(0) { 42 } else { 0 }
+}

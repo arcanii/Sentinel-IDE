@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SentinelIDE — import signing key & sign build (Flow 5)</title>
+<style>
+/* ============================================================================
+   KEY SCREEN — Flow 5 / UJ-5: import a signing key,
+   sign built artifacts, and show signing status in the UI.
+   Governs / illustrates:
+     EXPERIENCE.md → Key Flows > Flow 5; Component Patterns > App menu (≡),
+       Signing status indicator, Import-key/Signing dialog; State Patterns >
+       "Key loaded" / "Build signed"; Voice and Tone (honest signing copy).
+     DESIGN.md → Components: import-key-dialog, status-signing, app-menu-button,
+       button-primary; Colors: trust-verified (signed), diag-info (honesty note),
+       accent (Sign now / toggle on). Dark base tokens.
+   HONESTY (PRD §5): key handling is NOT a hardened Sentinel surface in v1 — the
+   dialog says so. Signing = v1 UX; key-surface hardens next increment.
+   Offline, no JS, no network.
+   ============================================================================ */
+:root{
+  --window-bg:#161618; --panel-bg:#1A1A1C; --panel-elev-bg:#202023;
+  --alt-row-bg:#1C1C1F; --hover-bg:#2A2A2D; --border:#303034;
+  --text-primary:#E6E6E8; --text-secondary:#9A9AA0; --text-muted:#6A6A70;
+  --accent:#D97757; --accent-text:#28120A; --selection-bg:#5C3426; --selection-text:#F7EEE9;
+  --syn-keyword:#C98FD6; --syn-number:#9FD19A; --syn-string:#E0966B; --syn-comment:#769676;
+  --diag-error:#E06C75; --diag-info:#6CA8C4; --trust-verified:#7FB37A;
+  --ui:"Segoe UI",system-ui,-apple-system,sans-serif;
+  --mono:"Cascadia Code","Cascadia Mono",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:#0d0d0f;font-family:var(--ui);color:var(--text-primary);
+  display:flex;align-items:center;justify-content:center;padding:28px}
+
+.window{position:relative;width:1080px;height:680px;border-radius:8px;overflow:hidden;
+  border:1px solid var(--border);box-shadow:0 24px 70px rgba(0,0,0,.6);display:flex;
+  flex-direction:column;background:var(--window-bg)}
+.titlebar{height:34px;background:var(--panel-elev-bg);display:flex;align-items:center;padding:0 12px;color:var(--text-secondary);font-size:12px;flex:0 0 auto;gap:8px}
+.titlebar .app{color:var(--text-primary);font-weight:600}
+.titlebar .sep{color:var(--text-muted)}
+.titlebar .winctl{margin-left:auto;display:flex;gap:18px;color:var(--text-secondary);font-size:13px}
+
+.toolbar{height:40px;background:var(--panel-bg);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:0 10px;flex:0 0 auto}
+.menubtn{width:30px;height:26px;border-radius:4px;display:flex;align-items:center;justify-content:center;color:var(--text-secondary);font-size:16px}
+.menubtn:hover{background:var(--hover-bg)}
+.btn{height:26px;border-radius:4px;border:1px solid var(--border);background:var(--panel-elev-bg);color:var(--text-primary);font-family:var(--ui);font-size:13px;padding:0 12px;display:flex;align-items:center;gap:6px;cursor:default}
+.btn.primary{background:var(--accent);color:var(--accent-text);border-color:transparent;font-weight:600}
+.cmdline{margin-left:6px;font-family:var(--mono);font-size:12px;color:var(--text-muted);background:var(--window-bg);border:1px solid var(--border);border-radius:4px;padding:4px 10px}
+
+.body{flex:1 1 auto;display:flex;min-height:0}
+.tree{width:230px;flex:0 0 auto;background:var(--panel-bg);border-right:1px solid var(--border);font-size:13px;padding:6px 0}
+.tree .grp{color:var(--text-secondary);text-transform:uppercase;font-size:11px;letter-spacing:.04em;padding:6px 14px 4px}
+.tree .row{height:22px;display:flex;align-items:center;gap:8px;padding:0 14px;color:var(--text-primary)}
+.tree .row .ico{color:var(--text-secondary);font-size:12px;width:14px;text-align:center}
+.tree .row.sel{background:var(--selection-bg);color:var(--selection-text)}
+.tree .row.indent{padding-left:30px}
+
+.main{flex:1 1 auto;display:flex;flex-direction:column;min-width:0}
+.tabs{height:36px;background:var(--panel-elev-bg);display:flex;align-items:flex-end;flex:0 0 auto;border-bottom:1px solid var(--border)}
+.tab{height:36px;display:flex;align-items:center;gap:8px;padding:0 14px;font-size:13px;color:var(--text-secondary);border-right:1px solid var(--border)}
+.tab.active{background:var(--window-bg);color:var(--text-primary);box-shadow:inset 0 2px 0 var(--accent)}
+.editor{flex:1 1 auto;background:var(--window-bg);display:flex;overflow:hidden;font-family:var(--mono);font-size:14px;line-height:1.55}
+.gutter{flex:0 0 auto;background:var(--panel-bg);color:var(--text-muted);text-align:right;padding:10px 0}
+.gutter .ln{height:1.55em;padding:0 12px 0 16px}
+.code{flex:1 1 auto;padding:10px 0;overflow:hidden;white-space:pre;color:var(--text-primary)}
+.code .ln{height:1.55em;padding:0 16px}
+.k{color:var(--syn-keyword)} .n{color:var(--syn-number)} .c{color:var(--syn-comment)} .t{color:var(--text-primary)}
+
+/* output dock */
+.dock{height:120px;flex:0 0 auto;background:var(--panel-bg);border-top:1px solid var(--border);display:flex;flex-direction:column}
+.dock .dtabs{height:30px;display:flex;align-items:center;background:var(--panel-elev-bg);border-bottom:1px solid var(--border);font-size:12px}
+.dock .dtab{padding:0 14px;height:30px;display:flex;align-items:center;color:var(--text-secondary)}
+.dock .dtab.active{color:var(--text-primary);box-shadow:inset 0 -2px 0 var(--accent)}
+.out{flex:1 1 auto;font-family:var(--mono);font-size:12.5px;line-height:1.6;padding:8px 14px}
+.out .ok{color:var(--text-secondary)} .out .cmd{color:var(--text-secondary)} .out .sgn{color:var(--trust-verified)}
+
+/* status bar with signing indicator */
+.status{height:24px;flex:0 0 auto;background:var(--panel-elev-bg);border-top:1px solid var(--border);display:flex;align-items:center;gap:18px;padding:0 14px;font-size:12px;color:var(--text-secondary)}
+.status .right{margin-left:auto;display:flex;gap:18px;align-items:center}
+.sign-chip{display:flex;align-items:center;gap:6px;color:var(--trust-verified);font-weight:600}
+
+/* dialog */
+.scrim{position:absolute;inset:0;background:rgba(10,10,12,.42)}
+.dialog{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:520px;background:var(--panel-bg);border:1px solid var(--border);border-radius:4px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.7)}
+.dialog .dtitle{height:36px;background:var(--panel-elev-bg);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 14px;font-size:13px;color:var(--text-secondary)}
+.dialog .dtitle .x{margin-left:auto}
+.dlg-body{padding:16px 18px}
+.lead{font-size:15px;font-weight:600;margin:0 0 14px}
+.fld{margin-bottom:12px}
+.fld label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:5px}
+.inrow{display:flex;gap:8px}
+.input{flex:1 1 auto;background:var(--window-bg);border:1px solid var(--border);border-radius:4px;padding:6px 10px;font-family:var(--mono);font-size:12px;color:var(--text-primary)}
+.loaded{display:flex;align-items:flex-start;gap:9px;background:var(--panel-elev-bg);border:1px solid var(--border);border-radius:4px;padding:10px 12px;margin:4px 0 14px}
+.loaded .id{font-size:13px;color:var(--text-primary)} .loaded .meta{font-size:11.5px;color:var(--text-muted);font-family:var(--mono);margin-top:2px}
+.toggle-row{display:flex;align-items:center;gap:10px;margin:2px 0 14px;font-size:13px;color:var(--text-primary)}
+.toggle{width:34px;height:18px;border-radius:9px;background:var(--accent);position:relative;flex:0 0 auto}
+.toggle .knob{position:absolute;top:2px;left:18px;width:14px;height:14px;border-radius:50%;background:#F7EEE9}
+.note{display:flex;gap:10px;background:var(--panel-elev-bg);border:1px solid var(--border);border-left:3px solid var(--diag-info);border-radius:4px;padding:11px 13px;margin:0 0 18px}
+.note .ntext{font-size:12.5px;color:var(--text-secondary);line-height:1.5}
+.note .ntext b{color:var(--text-primary);font-weight:600}
+.actions{display:flex;justify-content:flex-end;gap:10px}
+.cap{position:fixed;bottom:8px;left:0;right:0;text-align:center;color:#5a5a60;font-size:11px;font-family:var(--ui)}
+svg{display:inline-block;vertical-align:middle}
+</style>
+</head>
+<body>
+<div class="window" role="img" aria-label="SentinelIDE import signing key dialog with signed status">
+
+  <div class="titlebar">
+    <span class="app">SentinelIDE</span><span class="sep">—</span><span>crypto.sentinel</span>
+    <span class="winctl"><span>&#x2014;</span><span>&#x25A1;</span><span>&#x2715;</span></span>
+  </div>
+
+  <div class="toolbar">
+    <div class="menubtn" title="Menu">&#x2261;</div>
+    <div class="btn primary">&#x25B6;&nbsp; Build</div>
+    <div class="btn">Run</div>
+    <span class="cmdline">snc build crypto.sentinel</span>
+  </div>
+
+  <div class="body">
+    <div class="tree">
+      <div class="grp">crypto-lib</div>
+      <div class="row"><span class="ico">&#x25BE;</span> src</div>
+      <div class="row indent sel"><span class="ico">&#x25A0;</span> crypto.sentinel</div>
+      <div class="row indent"><span class="ico">&#x25A1;</span> hash.sentinel</div>
+      <div class="row"><span class="ico">&#x25A1;</span> sentinel.toml</div>
+    </div>
+
+    <div class="main">
+      <div class="tabs"><div class="tab active">crypto.sentinel</div></div>
+      <div class="editor">
+        <div class="gutter"><div class="ln">1</div><div class="ln">2</div><div class="ln">3</div><div class="ln">4</div><div class="ln">5</div><div class="ln">6</div></div>
+        <div class="code">
+<div class="ln"><span class="c">// crypto.sentinel — constant-time token check</span></div>
+<div class="ln"><span class="k">use</span> <span class="t">std::ct</span></div>
+<div class="ln"> </div>
+<div class="ln"><span class="k">fn</span> <span class="t">verify</span>(<span class="t">token</span>: <span class="k">secret</span>[<span class="t">u8</span>; <span class="n">32</span>], <span class="t">given</span>: [<span class="t">u8</span>; <span class="n">32</span>]) -&gt; <span class="t">bool</span> {</div>
+<div class="ln">    <span class="k">return</span> <span class="t">ct::eq(token, given)</span></div>
+<div class="ln">}</div>
+        </div>
+      </div>
+      <div class="dock">
+        <div class="dtabs"><div class="dtab active">Output</div><div class="dtab">Problems</div></div>
+        <div class="out">
+<div><span class="cmd">&gt; snc build crypto.sentinel</span></div>
+<div><span class="ok">  Build OK · 1.4s → crypto.exe</span></div>
+<div><span class="sgn">  Signed crypto.exe · ACME Code Signing CA</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="status">
+    <span>Ln 5, Col 5</span>
+    <span class="right">
+      <span>Spaces: 4</span><span>Sentinel</span>
+      <span class="sign-chip" title="Last build signed">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path fill="#7FB37A" d="M8 1.2l5 1.9v3.9c0 3.4-2.4 5.9-5 6.8-2.6-.9-5-3.4-5-6.8V3.1l5-1.9z"/><path fill="#161618" d="M7 8.6L5.7 7.3l-.9.9L7 10.4l4.2-4.2-.9-.9z"/></svg>
+        Signed
+      </span>
+    </span>
+  </div>
+
+  <!-- Import signing key / Signing dialog -->
+  <div class="scrim"></div>
+  <div class="dialog" role="dialog" aria-label="Import signing key">
+    <div class="dtitle"><span>Signing</span><span class="x">&#x2715;</span></div>
+    <div class="dlg-body">
+      <p class="lead">Sign your built artifacts with your key.</p>
+
+      <div class="fld">
+        <label>Key file</label>
+        <div class="inrow">
+          <div class="input">C:\keys\acme-codesign.pfx</div>
+          <div class="btn">Browse…</div>
+        </div>
+      </div>
+      <div class="fld">
+        <label>Passphrase</label>
+        <div class="input">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</div>
+      </div>
+
+      <div class="loaded">
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="#7FB37A" d="M8 1.2l5 1.9v3.9c0 3.4-2.4 5.9-5 6.8-2.6-.9-5-3.4-5-6.8V3.1l5-1.9z"/><path fill="#161618" d="M7 8.7L5.6 7.3l-.9.9L7 10.5l4.3-4.3-.9-.9z"/></svg>
+        <div><div class="id">Loaded: ACME Code Signing CA</div><div class="meta">RSA-3072 · SHA-256 · valid to 2027-04-01</div></div>
+      </div>
+
+      <div class="toggle-row"><div class="toggle"><div class="knob"></div></div> Sign on every build</div>
+
+      <div class="note">
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="none" stroke="#6CA8C4" stroke-width="1.4"/><circle cx="8" cy="4.7" r="1" fill="#6CA8C4"/><rect x="7.2" y="6.8" width="1.6" height="5" rx="0.6" fill="#6CA8C4"/></svg>
+        <div class="ntext"><b>Key handling isn't a hardened Sentinel surface yet.</b> The native host holds your key for this session. Hardening the signing-key surface is the next increment — we won't claim more than that today.</div>
+      </div>
+
+      <div class="actions">
+        <div class="btn">Remove key</div>
+        <div class="btn primary">Sign now</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+<div class="cap">SentinelIDE · key screen — Flow 5: import a key, sign the build, status visible in the chrome (status-bar "Signed"). Honest about the not-yet-hardened key surface. Spine is the contract; mock illustrates.</div>
+</body>
+</html>

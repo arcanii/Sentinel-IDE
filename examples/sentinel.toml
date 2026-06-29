@@ -1,0 +1,39 @@
+# Sentinel project manifest (read by SentinelIDE; snc parses the full TOML).
+# A project is a library or an executable; debug/release are build targets.
+
+[project]
+name    = "crypto-lib"
+version = "0.1.0"
+type    = "executable"
+entry   = "crypto.sentinel"
+icon    = "../art/S2_icon.png"
+authors = ["Bryan"]
+
+[build]
+src          = "."
+lib_paths    = []
+links        = []
+# Build tier (TIERED_RELEASES.md): development | experimental | stable | hardened.
+# The IDE's top selector picks the active tier; output → target/<tier>/.
+default_tier = "experimental"
+
+# require = warn|strict emits snc --require-signatures/--trust (ADR 0061).
+# The installed snc C1.0b does not accept those flags yet, so default to off;
+# the IDE passes them automatically once snc supports them.
+[signing]
+require = "off"
+trust   = "sentinel-trust.toml"
+sign    = false
+
+# Build targets (Xcode-style). With no [[target]] blocks the [project] above is the
+# single implicit target; declared targets override it. The scheme selector at the
+# top of the window (target ▾ · tier ▾) picks the active one; output → target/<tier>/.
+[[target]]
+name  = "crypto"
+type  = "executable"
+entry = "crypto.sentinel"
+
+[[target]]
+name  = "hello"
+type  = "executable"
+entry = "hello.sentinel"

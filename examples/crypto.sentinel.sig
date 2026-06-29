@@ -1,0 +1,5 @@
+sentinel-signature v1
+algorithm: ed25519
+key: c8761e4b064664184a478875c301dcb2aa9ed0bd223ccdbfe0b92b84d0c9a28a
+grants: secret,constant_time,alloc
+signature: 410f9d1c2e333c2766a3ce91807e05ebdba8abe4d56d87bc923ca9f39788af5c85bc6a5a5ea651b9556bf9064de1f0f4648cb1ef0b452d19b12bc2b38d9c2003

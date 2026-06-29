@@ -1,0 +1,8 @@
+# Windows-first project: keep CRLF in the working tree on every platform, so the
+# signed demo's line endings match the bytes its .sig was computed over.
+* text=auto eol=crlf
+
+# Never line-ending-convert signature carriers or binary assets.
+*.sig binary
+*.ico binary
+*.png binary
