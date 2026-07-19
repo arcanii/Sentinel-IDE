@@ -9,6 +9,7 @@
 #include "Version.h"     // generated: SENTINEL_VERSION_DISPLAY_W (marketing + auto build number)
 #include "Loc.h"         // generated: SENTINEL_LOC_* lines-of-code by language (scripts/loc.ps1)
 #include "host/win32/Theme.h"
+#include "host/win32/Updater.h"
 #include "core/Logger.h"
 
 #include <windows.h>
@@ -21,7 +22,7 @@
 namespace sentinelide {
 namespace {
 
-enum { IDC_TITLE = 201, IDC_VER, IDC_TAG, IDC_LINE1, IDC_LINE2, IDC_COPY, IDC_CLOSE };
+enum { IDC_TITLE = 201, IDC_VER, IDC_TAG, IDC_LINE1, IDC_LINE2, IDC_COPY, IDC_CLOSE, IDC_UPDATE };
 
 struct AboutState { bool done = false; HICON icon = nullptr; int pad = 20, iconSz = 72;
                     int capY = 0, badgeY = 0, badgeH = 0; HFONT badgeFont = nullptr; };
@@ -93,6 +94,9 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_CTLCOLORBTN: return dialogCtlColor(msg, w);
         case WM_COMMAND:
+            // Deliberately does NOT close the About box: WinSparkle's UI appears in front
+            // of it, and if the user cancels the check they are back where they started.
+            if (LOWORD(w) == IDC_UPDATE) { checkForUpdates(hwnd); return 0; }
             if (st && (LOWORD(w) == IDC_CLOSE || LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL)) st->done = true;
             return 0;
         case WM_CLOSE: if (st) st->done = true; return 0;
@@ -147,6 +151,22 @@ void showAboutDialog(HWND owner) {
     HWND ok = CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
                               clientW - M - bw, by, bw, S(28), hwnd, (HMENU)(INT_PTR)IDC_CLOSE, hi, nullptr);
     SendMessageW(ok, WM_SETFONT, (WPARAM)ui, TRUE);
+
+    // "Check for Updates…" sits next to Close — the conventional home for it, and the
+    // place a user looks after reading the version right above. Left-aligned, away from
+    // Close, so the destructive-ish action isn't adjacent to the default button.
+    //
+    // Created only when the updater is compiled in AND has a real signing key, matching
+    // the ≡ menu: a check that cannot verify a signature must not be offered at all.
+    // WinSparkle's UI is its own top-level window and this dialog stays open behind it;
+    // that is fine, and the nested-loop WM_QUIT fix below is what makes it safe when the
+    // check ends in "quit so I can install".
+    if (updaterAvailable()) {
+        const int uw = S(150);
+        HWND up = CreateWindowExW(0, L"BUTTON", L"Check for Updates…", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                  M, by, uw, S(28), hwnd, (HMENU)(INT_PTR)IDC_UPDATE, hi, nullptr);
+        SendMessageW(up, WM_SETFONT, (WPARAM)ui, TRUE);
+    }
     const int clientH = by + S(28) + M;
 
     RECT wr{ 0, 0, clientW, clientH };

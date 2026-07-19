@@ -233,8 +233,13 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     at `raw.githubusercontent.com/arcanii/Sentinel-IDE/main/appcast.xml`; the Inno installer is the
     update artifact. `src/host/win32/Updater.{h,cpp}` keeps a three-function surface
     (`initUpdater(HWND)` / `checkForUpdates(HWND)` / `shutdownUpdater()`) so a macOS host could back
-    the same names with Sparkle. **≡ ▸ Check for Updates…**; `initUpdater` runs after the window
-    exists (WinSparkle's shutdown request needs a HWND) and also starts the periodic background check.
+    the same names with Sparkle. Reachable from **≡ ▸ Check for Updates…** *and* a **Check for
+    Updates…** button in the **About box** (beside the version it reports — the conventional home,
+    and the dialog a user is in when they wonder about their version); `initUpdater` runs after the
+    window exists (WinSparkle's shutdown request needs a HWND) and also starts the periodic
+    background check. `shutdownUpdater()` is called **after `runApp`'s message loop, not in
+    `WM_DESTROY`** — `win_sparkle_cleanup()` joins WinSparkle's worker threads and the
+    shutdown-request callback runs *on* one of them, so tearing down from `WM_DESTROY` races it.
     **The repo being PUBLIC is now load-bearing** — WinSparkle fetches over *unauthenticated* HTTPS,
     so a private repo answers 404 and every check silently reports "no updates". Verified both ways:
     the raw URL 404'd while private, returns 200 now. Making it private again breaks updates with

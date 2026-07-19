@@ -1552,7 +1552,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
     }
     case WM_DESTROY:
-        shutdownUpdater();   // before the rest of teardown; WinSparkle joins its own threads
         destroyFonts(); if (g.himl) ImageList_Destroy(g.himl);
         if (g.textDoc) { g.textDoc->Release(); g.textDoc = nullptr; }
         if (g.memBmp) DeleteObject(g.memBmp); if (g.memDC) DeleteDC(g.memDC);
@@ -1632,6 +1631,11 @@ int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     if (hAccel) DestroyAcceleratorTable(hAccel);
+    // AFTER the message loop, not in WM_DESTROY: win_sparkle_cleanup() joins WinSparkle's
+    // worker threads, and the shutdown-request callback that triggers this teardown runs
+    // ON one of them. Tearing down from inside WM_DESTROY races that callback; by here the
+    // window is gone and the callback has long returned. (Same placement RabbitEars uses.)
+    shutdownUpdater();
     CoUninitialize();
     return (int)msg.wParam;
 }

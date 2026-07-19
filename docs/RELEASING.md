@@ -111,8 +111,8 @@ To activate:
    ```
    A 404 enclosure is the worst outcome: clients see an update, then fail to download it.
 
-Installed builds pick it up via **≡ ▸ Check for Updates…** and WinSparkle's periodic
-background check.
+Installed builds pick it up via **≡ ▸ Check for Updates…**, the **Check for Updates…** button in
+the **About box** (next to the version it reports), or WinSparkle's periodic background check.
 
 ---
 
@@ -125,7 +125,9 @@ background check.
   before running the installer. If the process does not exit, the installer cannot
   overwrite the locked exe and the update fails.
 
-  This is why every modal dialog's nested message loop **re-posts `WM_QUIT`**
+  This is why the **About box hosting a Check-for-Updates button is not incidental** — it is the
+  dialog most likely to be open when WinSparkle asks the app to quit, and why every modal dialog's
+  nested message loop **re-posts `WM_QUIT`**
   (`GetMessageW` returns 0 for it *and consumes it* — a nested loop that swallows it
   leaves `runApp`'s outer loop blocked forever with the process still alive). There is
   also a 3-second force-exit watchdog in `Updater.cpp` as a backstop. Both matter: unlike
