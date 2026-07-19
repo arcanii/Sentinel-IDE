@@ -30,6 +30,10 @@ set "VERH=%GENDIR%\Version.h"
 >>"%VERH%" echo #define SENTINEL_VERSION_DISPLAY_W L"%MKT% (build %BUILDNO%)"
 >>"%VERH%" echo #define SENTINEL_FILEVERSION %MKTRC%,%BUILDNO%
 >>"%VERH%" echo #define SENTINEL_FILEVERSION_STR "%MKT%.%BUILDNO%"
+REM Wide form — WinSparkle's win_sparkle_set_app_details takes wchar_t*, and the
+REM version it reports must be marketing.build so it compares against the appcast's
+REM sparkle:version (the marketing version alone never advances).
+>>"%VERH%" echo #define SENTINEL_FILEVERSION_STR_W L"%MKT%.%BUILDNO%"
 echo BUILD_NUMBER %BUILDNO%
 
 REM --- Lines-of-code accounting (About box) -----------------------------------

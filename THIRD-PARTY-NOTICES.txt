@@ -1,0 +1,56 @@
+THIRD-PARTY NOTICES
+===================
+
+Sentinel-IDE itself is licensed GPL-3.0-or-later (see LICENSE). It ships and/or
+derives from the third-party components below.
+
+
+WinSparkle
+----------
+Vendored under third_party/winsparkle/ (version 0.9.3, official prebuilt x64
+release binaries: WinSparkle.dll, WinSparkle.lib, and headers) and installed
+alongside Sentinel-IDE.exe. Used for auto-update; see src/host/win32/Updater.cpp
+and docs/RELEASING.md.
+
+  Copyright (C) 2009-2024 Vaclav Slavik
+  https://winsparkle.org/  ·  https://github.com/vslavik/winsparkle
+
+Licensed under the MIT License:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
+WinSparkle bundles Expat (MIT) for XML parsing; see the WinSparkle project for
+its own third-party notices.
+
+
+SQLTerminal-Win32
+-----------------
+Sentinel-IDE's Win32 shell derives from SQLTerminal-Win32 (same author), which is
+licensed GPL-3.0. The dark/coral palette in src/host/win32/Theme.h, the themed
+dialog conventions, the tree/splitter handling, and the worker-thread build model
+all originate there. This is why Sentinel-IDE is GPL-3.0-or-later rather than a
+more permissive licence.
+
+
+Appcast format
+--------------
+The auto-update feed follows the Sparkle appcast XML namespace
+(http://www.andymatuschak.org/xml-namespaces/sparkle), originally from the Sparkle
+project for macOS. The format is used here for interoperability with WinSparkle; no
+Sparkle code is included in this repository.

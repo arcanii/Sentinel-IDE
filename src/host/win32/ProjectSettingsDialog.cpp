@@ -258,9 +258,16 @@ bool showProjectSettingsDialog(HWND owner, SentinelProject& p) {
     ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); SetFocus(st.eName);
     SendMessageW(st.eEntry, CB_SETEDITSEL, 0, MAKELPARAM(0, 0));   // collapse the combo's auto-selection highlight
 
+    // Re-post WM_QUIT — GetMessageW consumes it, and a nested loop that swallows it
+    // leaves runApp's outer loop blocked forever with the process still alive. Matters
+    // because a background update check can request shutdown while this is open.
+    // See host/win32/Updater.cpp.
     MSG msg;
-    while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0)
+    while (!st.done) {
+        const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+        if (r <= 0) { if (r == 0) PostQuitMessage((int)msg.wParam); break; }
         if (!IsDialogMessageW(hwnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
 
     EnableWindow(owner, TRUE); if (owner) SetForegroundWindow(owner);
     DestroyWindow(hwnd); DeleteObject(ui); DeleteObject(hdr);

@@ -23,6 +23,7 @@
 #include "host/win32/SigningDialog.h"
 #include "host/win32/AboutDialog.h"
 #include "host/win32/PasswordDialog.h"
+#include "host/win32/Updater.h"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -58,6 +59,7 @@ enum CtrlId : int { IDC_TREE = 2001, IDC_EDIT = 2002, IDC_OUT = 2003, IDC_PROBLE
 enum TreeImg : int { IMG_PROJECT = 0, IMG_FOLDER, IMG_FILE, IMG_TOML };
 enum MenuId : UINT { ID_OPEN_PROJECT = 1001, ID_NEW_PROJECT, ID_NEW_FILE, ID_SAVE, ID_UNDO, ID_REDO, ID_PROJECT_SETTINGS, ID_BUILD, ID_RUN, ID_SIGNING, ID_LINE_NUMBERS, ID_SETTINGS, ID_ABOUT, ID_EXIT,
                      ID_CLOSE_PROJECT, ID_RECENT_CLEAR, ID_SEAL_PROJECT, ID_OPEN_SEALED, ID_FILE_ASSOC,
+                     ID_CHECK_UPDATES,
                      ID_TIER_DEV = 1100, ID_TIER_EXP, ID_TIER_STABLE, ID_TIER_HARD,
                      ID_TARGET_BASE = 1200,    // ID_TARGET_BASE + <target index>
                      ID_RECENT_BASE = 1300 };  // ID_RECENT_BASE + <recent index>
@@ -1275,7 +1277,11 @@ void showAppMenu(HWND hwnd) {
     AppendMenuW(m, MF_STRING, ID_FILE_ASSOC, L"Register File Associations…");
     AppendMenuW(m, MF_STRING, ID_SETTINGS, L"Settings…\tCtrl+,");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_ABOUT, L"About SentinelIDE");
+    // Hidden rather than greyed when auto-update isn't compiled in or has no signing
+    // key — a permanently disabled item invites "why is this greyed out?", and there
+    // is nothing the user can do about it from here.
+    if (updaterAvailable()) AppendMenuW(m, MF_STRING, ID_CHECK_UPDATES, L"Check for Updates…");
+    AppendMenuW(m, MF_STRING, ID_ABOUT, L"About Sentinel-IDE");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
     POINT pt{ g.rMenuBtn.left, g.rMenuBtn.bottom }; ClientToScreen(hwnd, &pt);
@@ -1528,6 +1534,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case ID_ABOUT: showAboutDialog(hwnd); break;
+        case ID_CHECK_UPDATES: checkForUpdates(hwnd); break;
         case ID_TIER_DEV: case ID_TIER_EXP: case ID_TIER_STABLE: case ID_TIER_HARD:
             g.tier = LOWORD(wParam) - ID_TIER_DEV; setProjectTitle(hwnd);
             logMsg(LogLevel::Info, std::wstring(L"Tier → ") + tierName(g.tier));
@@ -1545,6 +1552,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
     }
     case WM_DESTROY:
+        shutdownUpdater();   // before the rest of teardown; WinSparkle joins its own threads
         destroyFonts(); if (g.himl) ImageList_Destroy(g.himl);
         if (g.textDoc) { g.textDoc->Release(); g.textDoc = nullptr; }
         if (g.memBmp) DeleteObject(g.memBmp); if (g.memDC) DeleteDC(g.memDC);
@@ -1575,6 +1583,11 @@ int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
     applyWindowDarkMode(hwnd);
     applyMenuDarkMode();   // dark popup/context menus from first open
     ShowWindow(hwnd, nCmdShow); UpdateWindow(hwnd);
+
+    // Auto-update. Started after the window exists because WinSparkle's shutdown
+    // request needs a HWND to post WM_CLOSE to; it also begins its periodic
+    // background check here (WinSparkle asks the user's permission on first run).
+    initUpdater(hwnd);
 
     // CLI: SentinelIDE.exe <file|folder> [--build]
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);

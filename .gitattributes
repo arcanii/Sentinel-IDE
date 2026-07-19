@@ -2,7 +2,12 @@
 # signed demo's line endings match the bytes its .sig was computed over.
 * text=auto eol=crlf
 
-# Never line-ending-convert signature carriers or binary assets.
+# Never line-ending-convert signature carriers or binary assets. `* text=auto` above
+# would otherwise CRLF-mangle any of these that git guesses is text — which for a DLL
+# or an import library means a corrupt file that fails to load at runtime.
 *.sig binary
 *.ico binary
 *.png binary
+*.dll binary
+*.lib binary
+*.exe binary

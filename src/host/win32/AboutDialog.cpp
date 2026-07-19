@@ -159,9 +159,17 @@ void showAboutDialog(HWND owner) {
     EnableWindow(owner, FALSE);
     ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd); SetFocus(ok);
 
+    // A nested modal loop MUST re-post WM_QUIT. GetMessageW returns 0 for it and
+    // consumes it, so without this runApp's outer loop blocks forever on a queue that
+    // will never see another one: the window is gone but the process lives on, holding
+    // Sentinel-IDE.exe locked. That is precisely what makes a WinSparkle update fail to
+    // install, and this dialog is the one hosting "Check for Updates…". See Updater.cpp.
     MSG msg;
-    while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0)
+    while (!st.done) {
+        const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+        if (r <= 0) { if (r == 0) PostQuitMessage((int)msg.wParam); break; }
         if (!IsDialogMessageW(hwnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
 
     EnableWindow(owner, TRUE); if (owner) SetForegroundWindow(owner);
     DestroyWindow(hwnd);

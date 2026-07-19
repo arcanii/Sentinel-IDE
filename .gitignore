@@ -17,6 +17,12 @@ target/
 /examples/crypto
 /examples/hello
 
+# Vendored third-party binaries are deliberately committed — the *.lib and *.dll
+# rules above are about OUR build output, not dependencies. Without these negations
+# WinSparkle.lib is silently dropped and the updater build breaks on a fresh clone.
+!/third_party/**/*.lib
+!/third_party/**/*.dll
+
 # Sealed projects, signing keys, and unsealed working copies — never commit
 *.sealed
 *.key

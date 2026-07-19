@@ -40,8 +40,17 @@ Name: "assoc"; Description: "Associate .sntproject and .sentinel files with {#Ap
 
 [Files]
 Source: "..\build\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; WinSparkle (auto-update) is loaded at process start, so a missing DLL is a launch
+; failure rather than a degraded feature — it must ship with every installed build.
+; Sourced from build\ (CMake copies it beside the exe) so the installer always
+; carries the same DLL the build was linked against.
+Source: "..\build\WinSparkle.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";       DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "..\LICENSE";         DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
+; NB: *.sig is deliberately NOT excluded — examples\crypto.sentinel.sig is what makes
+; the installed demo show a real "Signed" trust chip. Dropping it would silently
+; downgrade the example that exists to demonstrate ADR-0061.
 Source: "..\examples\*";      DestDir: "{app}\examples"; Excludes: "target\*,*.o,*.obj,*.exe,*.sealed"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

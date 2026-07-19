@@ -28,7 +28,35 @@ add_executable(SentinelIDE WIN32
   src/host/win32/SigningDialog.cpp
   src/host/win32/AboutDialog.cpp
   src/host/win32/PasswordDialog.cpp
+  src/host/win32/Updater.cpp
   packaging/SentinelIDE.rc)
+
+# WinSparkle (auto-update) — vendored prebuilt DLL/lib/header, 0.9.3 official release
+# binaries, x64 only (the app is x64-only, so there is no arch-selection problem to
+# solve). Update checks read an EdDSA-signed appcast; see src/host/win32/Updater.cpp
+# and docs/RELEASING.md. OFF produces a build with the updater compiled out entirely.
+option(SENTINELIDE_UPDATER "Build with WinSparkle auto-update" ON)
+if(SENTINELIDE_UPDATER)
+  set(WS_DIR "${CMAKE_SOURCE_DIR}/third_party/winsparkle")
+  if(NOT EXISTS "${WS_DIR}/lib/x64/WinSparkle.lib")
+    message(FATAL_ERROR
+      "SENTINELIDE_UPDATER=ON but third_party/winsparkle is missing. "
+      "Re-run with -DSENTINELIDE_UPDATER=OFF to build without auto-update.")
+  endif()
+  add_library(WinSparkle SHARED IMPORTED)
+  set_target_properties(WinSparkle PROPERTIES
+    IMPORTED_IMPLIB "${WS_DIR}/lib/x64/WinSparkle.lib"
+    IMPORTED_LOCATION "${WS_DIR}/bin/x64/WinSparkle.dll"
+    INTERFACE_INCLUDE_DIRECTORIES "${WS_DIR}/include")
+  target_compile_definitions(SentinelIDE PRIVATE SENTINELIDE_HAVE_WINSPARKLE)
+  target_link_libraries(SentinelIDE PRIVATE WinSparkle)
+  # WinSparkle.dll must sit beside the exe — it is loaded at process start, so a
+  # missing copy is a launch failure, not a lazy one.
+  add_custom_command(TARGET SentinelIDE POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WS_DIR}/bin/x64/WinSparkle.dll" "$<TARGET_FILE_DIR:SentinelIDE>"
+    COMMENT "Copying WinSparkle.dll next to Sentinel-IDE.exe")
+endif()
 
 # Version header — normally written by scripts\build.bat (auto-incrementing build
 # number). Provide a fallback so a raw `cmake --build` (no build.bat) still compiles.
@@ -42,7 +70,8 @@ if(NOT EXISTS "${SENTINEL_GENERATED_DIR}/Version.h")
     "#define SENTINEL_VERSION_DISPLAY \"0.1.0 (build 0)\"\n"
     "#define SENTINEL_VERSION_DISPLAY_W L\"0.1.0 (build 0)\"\n"
     "#define SENTINEL_FILEVERSION 0,1,0,0\n"
-    "#define SENTINEL_FILEVERSION_STR \"0.1.0.0\"\n")
+    "#define SENTINEL_FILEVERSION_STR \"0.1.0.0\"\n"
+    "#define SENTINEL_FILEVERSION_STR_W L\"0.1.0.0\"\n")
 endif()
 if(NOT EXISTS "${SENTINEL_GENERATED_DIR}/Loc.h")
   file(WRITE "${SENTINEL_GENERATED_DIR}/Loc.h"
