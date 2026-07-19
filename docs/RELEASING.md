@@ -29,24 +29,61 @@ to work while being unable to verify a signature.
 
 To activate:
 
-1. **Generate a dedicated key pair.** Download the WinSparkle release zip
-   (<https://github.com/vslavik/winsparkle/releases>) and run its `generate_keys.exe`.
-   It stores the private key in the **Windows credential store** and prints the base64
-   public half.
+1. **Get the tools.** They are **not** in `third_party/winsparkle/` — we vendored only the
+   DLL, import library and headers. `generate_keys.exe` and `sign_update.exe` ship in the
+   **WinSparkle release zip**: <https://github.com/vslavik/winsparkle/releases> (match the
+   version we vendor, **0.9.3**). Unpack somewhere outside the repo; they are release
+   tooling, not build inputs.
 
-   A dedicated pair — rather than reusing the family key that signs RabbitEars and the
-   macOS apps — means a compromise here cannot be used to ship a malicious update for
-   those products.
+2. **Generate a dedicated key pair.**
+   ```
+   generate_keys.exe
+   ```
+   With no arguments it creates a new Ed25519 pair, stores the **private key in the Windows
+   credential store** (under the current user — it never touches the filesystem, so there is
+   no key file to leak or accidentally commit), and prints the **base64 public key** to
+   stdout. Run it again later with no arguments and it prints the existing public key rather
+   than overwriting — so it is safe to re-run to recover the public half.
 
-2. **Paste the public key** into `kEdDsaPublicKey` in `src/host/win32/Updater.cpp`.
-   That value is *meant* to be public and committed; it is the trust anchor.
+   Use a dedicated pair rather than the family key that signs RabbitEars and the macOS apps:
+   a compromise here then cannot ship a malicious update for those products.
 
-3. **Back up the private key** somewhere durable. If it is lost, no existing install
-   can ever be updated again — they will reject anything signed by a new key, and the
-   only path forward is a manual re-install by every user.
+3. **Back up the private key before doing anything else.** It lives in *your Windows user
+   profile's* credential store. If the machine dies or the profile is lost, **no existing
+   install can ever be updated again** — clients reject anything signed by a different key,
+   and the only recovery is a manual re-install by every user. Export it and store it
+   somewhere durable and offline.
 
-4. **Never commit the private key.** `.gitignore` covers `*.key`, but the credential
-   store is the intended home.
+4. **Paste the public key** into `kEdDsaPublicKey` in `src/host/win32/Updater.cpp`, replacing
+   `@@SENTINEL_IDE_ED25519_PUBLIC_KEY@@`. That value is *meant* to be public and committed —
+   it is the trust anchor every installed client checks downloads against.
+
+   Paste the bare base64 line only, e.g. `sKPprIa95Hw+DX3bMoxWMsyC0w9vc4MzEpgx7TBDP1I=` —
+   no `ed25519:` prefix, no quotes beyond the existing ones, no trailing whitespace.
+
+5. **Rebuild and confirm it took.** `scripts\build.bat`, run the app, then check
+   `%LOCALAPPDATA%\SentinelIDE\logs\sentinelide.log`:
+
+   | Log line | Meaning |
+   |---|---|
+   | `Updater: initialised (0.1.0.<n>)` | key accepted; **Check for Updates…** now appears in ≡ and the About box |
+   | `Updater: WinSparkle rejected the EdDSA public key` | the string is not valid base64 — re-copy it |
+   | `Updater: no EdDSA public key compiled in` | still the placeholder |
+
+   The rejection case is checked deliberately: `win_sparkle_set_eddsa_public_key` returns 0
+   for a malformed key and WinSparkle would otherwise fall back to an `EdDSAPub`/`EDDSA`
+   Windows resource that this exe does not ship — leaving the updater running with **no trust
+   anchor at all**. Verified by compiling a deliberately truncated key.
+
+**Never commit the private key.** `.gitignore` covers `*.key`, but the credential store is
+the intended home — `generate_keys.exe` writes no key file, so there should be nothing on disk
+to commit in the first place.
+
+> **Alternative worth knowing:** WinSparkle can also read the public key from a Windows
+> resource named `EdDSAPub` of type `EDDSA` instead of a compile-time call. We use the explicit
+> `win_sparkle_set_eddsa_public_key()` call because it is greppable, diffable, and its failure
+> is checkable — but embedding it in `SentinelIDE.rc` is a supported option if that is ever
+> preferable.
 
 ---
 

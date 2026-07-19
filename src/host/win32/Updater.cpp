@@ -81,7 +81,16 @@ void initUpdater(HWND mainWnd) {
     // sparkle:version. The marketing version alone would never advance and every
     // build would look identical to the feed.
     win_sparkle_set_app_details(L"Sentinel", L"Sentinel-IDE", SENTINEL_FILEVERSION_STR_W);
-    win_sparkle_set_eddsa_public_key(kEdDsaPublicKey);
+    // Returns 0 if the string is not a valid base64 EdDSA key. Checked, because a
+    // mistyped key is otherwise SILENT: WinSparkle would fall back to looking for an
+    // "EdDSAPub"/"EDDSA" Windows resource, which this exe does not ship, leaving the
+    // updater running with no trust anchor at all. Refuse to start instead.
+    if (!win_sparkle_set_eddsa_public_key(kEdDsaPublicKey)) {
+        logMsg(LogLevel::Error,
+               L"Updater: WinSparkle rejected the EdDSA public key — auto-update disabled. "
+               L"It must be the bare base64 line printed by generate_keys.exe. See docs/RELEASING.md.");
+        return;
+    }
     win_sparkle_set_can_shutdown_callback(onCanShutdown);
     win_sparkle_set_shutdown_request_callback(onShutdownRequest);
     win_sparkle_init();   // also runs the periodic background check
