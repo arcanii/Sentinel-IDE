@@ -30,10 +30,18 @@ to work while being unable to verify a signature.
 To activate:
 
 1. **Get the tool.** It is **not** in `third_party/winsparkle/` — we vendored only the DLL,
-   import library and headers. Download the **WinSparkle release zip** matching the version we
-   vendor, **0.9.3** (<https://github.com/vslavik/winsparkle/releases> →
-   `WinSparkle-0.9.3.zip`, 27,194,631 bytes). The tool is `bin\winsparkle-tool.exe`. Unpack
-   outside the repo — it is release tooling, not a build input.
+   import library and headers.
+
+   **On this machine it is already unpacked at `E:\util\WinSparkle-0.9.3\`**, so the tool is:
+   ```
+   E:\util\WinSparkle-0.9.3\bin\winsparkle-tool.exe
+   ```
+   (verified 2026-07-19: reports `0.9.3`, and that copy's `x64\Release\WinSparkle.dll` is
+   byte-identical to the DLL vendored in `third_party/`.)
+
+   Otherwise download the **WinSparkle release zip** matching the version we vendor, **0.9.3**
+   (<https://github.com/vslavik/winsparkle/releases> → `WinSparkle-0.9.3.zip`, 27,194,631
+   bytes) and unpack it outside the repo — it is release tooling, not a build input.
 
    > Older WinSparkle shipped separate `generate_keys.exe` / `sign_update.exe`. **0.9.3 has
    > neither**; everything is subcommands of the single `winsparkle-tool.exe`. Documentation
