@@ -8,17 +8,34 @@ set "CMAKE=%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe
 set "NINJA=%VS%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 
 REM --- Version stamping -------------------------------------------------------
-REM Marketing version is fixed; the build number auto-increments on every build.
-REM Counter persists in packaging\build_number.txt; the composed macros are written
-REM to build\generated\Version.h, consumed by both the C++ sources and the .rc.
+REM Marketing version is fixed; the build number is DERIVED FROM GIT — the commit
+REM count on HEAD — so the same commit always stamps the same version and a released
+REM artifact can be rebuilt from its tag. It replaces a packaging\build_number.txt
+REM counter that incremented on every run (including failed ones), was tied to nothing
+REM reproducible, and dirtied a tracked file on every build. That mattered once the
+REM number started naming shipped installers and driving WinSparkle's version compare.
+REM
+REM BUILDBASE keeps the sequence above the retired counter's high-water mark (38), so
+REM the version never goes backwards across the switch. Nothing had been released when
+REM this changed, so the offset is cosmetic continuity, not a correctness requirement —
+REM but a version that regresses is exactly the bug WinSparkle cannot recover from.
 set "MKT=0.1.0"
 set "MKTRC=0,1,0"
-set "NUMFILE=%~dp0..\packaging\build_number.txt"
+set "BUILDBASE=100"
 set "BUILDNO="
-if exist "%NUMFILE%" set /p BUILDNO=<"%NUMFILE%"
-if not defined BUILDNO set "BUILDNO=0"
-set /a BUILDNO=BUILDNO+1 || exit /b 1
->"%NUMFILE%" echo %BUILDNO%
+for /f %%i in ('git -C "%~dp0.." rev-list --count HEAD 2^>nul') do set "BUILDNO=%%i"
+if not defined BUILDNO (
+  echo ERROR: cannot derive the build number - 'git rev-list --count HEAD' failed.
+  echo        Build from a git working tree ^(or fix git on PATH^).
+  exit /b 1
+)
+set /a BUILDNO=BUILDNO+BUILDBASE || exit /b 1
+REM A dirty tree means the binary does not correspond to the commit it is stamped with.
+REM Fine while developing; never ship one — the version would name a commit whose
+REM contents differ from what shipped.
+set "DIRTY="
+for /f %%i in ('git -C "%~dp0.." status --porcelain 2^>nul ^| find /c /v ""') do set "DIRTY=%%i"
+if not "%DIRTY%"=="0" echo BUILD_DIRTY %DIRTY% uncommitted change^(s^) - build %BUILDNO% does not match commit contents
 set "GENDIR=%~dp0..\build\generated"
 if not exist "%GENDIR%" mkdir "%GENDIR%"
 set "VERH=%GENDIR%\Version.h"

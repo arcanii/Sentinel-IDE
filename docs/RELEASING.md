@@ -142,12 +142,23 @@ treat that as a safety net, never as the plan.
    If `build\Sentinel-IDE.exe` is missing, ISCC stops with an explicit `#error` rather than
    producing a mis-versioned installer.
 
-   > **Caveat on the build number.** It now names a shipped artifact, but it is *not*
-   > reproducible: `build.bat` increments `packaging/build_number.txt` **before** compiling,
-   > so a failed build still burns a number, and nothing ties a number to a commit. You
-   > cannot rebuild a given `Sentinel-IDE-0.1.0.<n>-setup.exe` after the fact. Before relying
-   > on these as release identities, consider deriving the number from
-   > `git rev-list --count HEAD` or moving the increment after `BUILD_OK`.
+   > **The build number is reproducible.** It is `git rev-list --count HEAD` plus a fixed
+   > `BUILDBASE` offset (see `scripts\build.bat`), so the same commit always stamps the same
+   > version and any released `Sentinel-IDE-0.1.0.<n>-setup.exe` can be rebuilt from its tag.
+   > Two consequences worth knowing:
+   >
+   > - **Build from a clean tree when releasing.** `build.bat` prints
+   >   `BUILD_DIRTY <n> uncommitted change(s)` when the working tree does not match HEAD;
+   >   the binary is then stamped with a commit whose contents it does not have. Fine while
+   >   developing, never ship one.
+   > - **The number only advances when you commit.** Rebuilding the same commit repeatedly
+   >   yields the same version — that is the point, but it means you cannot tell two builds
+   >   of one commit apart by version alone.
+   >
+   > `BUILDBASE` exists solely to keep the sequence above the retired
+   > `packaging/build_number.txt` counter's high-water mark of 38 (the commit count was 26 at
+   > the switch). Do not lower it: a version that goes backwards is unrecoverable for clients,
+   > since WinSparkle only ever offers an update whose `sparkle:version` is *higher*.
 
 3. **Sign the installer** — use the script, not the tool directly:
    ```

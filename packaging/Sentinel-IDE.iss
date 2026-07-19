@@ -15,7 +15,8 @@
 
 ; Version is READ FROM THE BUILT EXE, not hard-coded, so the installer and its
 ; filename can never disagree with the binary inside it. scripts\build.bat stamps
-; the exe's FileVersion as 0.1.0.<build> from packaging\build_number.txt.
+; the exe's FileVersion as 0.1.0.<build>, where <build> is derived from the git
+; commit count — so the same commit always produces the same installer name.
 ;
 ; This matters more now that auto-update ships: WinSparkle compares the running
 ; build's SENTINEL_FILEVERSION_STR against the appcast's sparkle:version, and

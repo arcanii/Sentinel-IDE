@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–33 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–34 built and verified.
 
 ---
 
@@ -68,8 +68,7 @@ exist so far:
 | `src/core/Settings.h` | `settings.ini` in `%LOCALAPPDATA%\SentinelIDE` — font/theme/log/toolchain + the **`[recents]`** project list (`addRecent`, capped `kMaxRecents`) |
 | `src/core/Project.h` | manifest parsing (`findManifest`: prefers `*.sntproject`, else `sentinel.toml`) + tiers + **`[[target]]`** + `saveProject` (surgical writer → the loaded manifest; preserves comments + unmodeled keys incl. `[[target]]`) |
 | `packaging/` | `app.manifest` (ComCtl v6, per-monitor-v2 DPI), `SentinelIDE.rc`, `app.ico` (res 100), `file.ico` (res 101 — `.sentinel` tree icon) |
-| `scripts/build.bat` | Configure + build (needs VS 2026 — path is hard-coded inside). **Auto-increments the build number** (`packaging/build_number.txt`) and writes `build/generated/Version.h` (consumed by the C++ sources + the `.rc`). |
-| `packaging/build_number.txt` | Persistent build-number counter (committed). `build.bat` reads → +1 → writes it back each build. Marketing version (`0.1.0`) stays fixed; only the build number climbs. |
+| `scripts/build.bat` | Configure + build (needs VS 2026 — path is hard-coded inside). **Derives the build number from `git rev-list --count HEAD`** (+ a `BUILDBASE` offset) and writes `build/generated/Version.h` (consumed by the C++ sources + the `.rc`). Warns `BUILD_DIRTY` when the tree doesn't match HEAD. |
 | `scripts/launch.ps1` | Launch the exe **detached** (WMI) so it survives the shell |
 | `scripts/capture.ps1` | Screenshot the window → `build\shot.png` (DPI-aware PrintWindow; `-Class` for dialogs) |
 | `scripts/convert-icon.ps1` | PNG → multi-size letterboxed `.ico`. Defaults `art/S2_icon.png`→`packaging/app.ico`; `-Src/-Dst` for `file.ico`. (Letterboxes — S2 is 554×657, not square. After rerun, touch the `.rc` so ninja relinks; the per-size Win icon cache may need `ie4uinit -ClearIconCache` + reboot to refresh large/extra-large.) |
@@ -123,15 +122,21 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   (The old `[string]$Args` param collided with PowerShell's automatic `$Args` and silently
   dropped every argument — that's why a launch could come up with no folder open.)
 
-- **Versioning:** marketing version is **fixed at `0.1.0`**; the **build number auto-increments on
-  every `build.bat` run** (counter in `packaging/build_number.txt`, at 18 as of this writing — it
-  drifts on every build, and a *failed* build still burns a number because the stamp precedes cmake).
+- **Versioning:** marketing version is **fixed at `0.1.0`**; the build number is
+  **`git rev-list --count HEAD` + `BUILDBASE`** (phase 34). Same commit → same version, so any
+  released artifact can be rebuilt from its tag. It only advances when you **commit**, so repeated
+  builds of one commit are indistinguishable by version — deliberate. `build.bat` prints
+  `BUILD_DIRTY <n>` when the tree doesn't match HEAD (the binary is then stamped with a commit
+  whose contents it lacks — fine while developing, never ship one), and **fails** if git can't
+  answer rather than stamping a wrong version.
+  `BUILDBASE` (=100) exists only to stay above the **retired** `packaging/build_number.txt`
+  counter's high-water mark of 38 — the commit count was 26 at the switch, so a raw count would
+  have moved the version *backwards*, which WinSparkle can never recover from. Don't lower it.
   `build.bat` composes `build/generated/Version.h` (`SENTINEL_VERSION_DISPLAY_W` = `L"0.1.0 (build N)"`,
   `SENTINEL_FILEVERSION` = `0,1,0,N`, etc.), included by `MainWindow.cpp` (status bar), `AboutDialog.cpp`,
   and `SentinelIDE.rc` (the exe's **FileVersion** = `0.1.0.N`; **ProductVersion** stays the marketing
   `0.1.0.0`). CMake writes a fallback `Version.h` (build 0) so a raw `cmake --build` without `build.bat`
-  still compiles. Note: every build consumes a number (incl. failed builds, since it's stamped before
-  compile), so the counter may skip — that's expected for a monotonic dev counter.
+  still compiles.
 - **Build env:** Visual Studio 2026 Community (MSVC + bundled CMake/Ninja). The exact path is
   hard-coded in `scripts\build.bat` — change it if VS moves. Drive builds through `cmd /c
   scripts\build.bat` (it calls `vcvars64.bat`). Note: a sandbox guard rejects `Remove-Item`
@@ -139,7 +144,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–33 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–34 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -296,6 +301,22 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     install mode also redirects `[Registry]` writes under HKLM into `Wow6432Node`, so a
     per-machine install's file associations were landing where 64-bit Explorer may not look.
 
+34. **Build number derived from git.** `packaging/build_number.txt` incremented on every
+    `build.bat` run — including failed ones, since the stamp preceded cmake — was tied to nothing
+    reproducible, and dirtied a tracked file each build. Tolerable while it only fed an About-box
+    badge; not once it names shipped installers *and* drives WinSparkle's version comparison, where
+    it meant a released `Sentinel-IDE-0.1.0.<n>-setup.exe` could **never be rebuilt**.
+    Now `git rev-list --count HEAD` + `BUILDBASE`: same commit → same version, verified by building
+    twice and getting 126 both times. `build.bat` **fails** if git can't answer, rather than
+    stamping a wrong version, and prints `BUILD_DIRTY <n>` when the tree doesn't match HEAD (the
+    binary would otherwise claim a commit whose contents it lacks).
+    **`BUILDBASE` (=100) is load-bearing:** the commit count was **26** against a counter already at
+    **38**, so a raw switch would have moved the version *backwards* — the one versioning mistake
+    WinSparkle cannot recover from, since it only ever offers a *higher* `sparkle:version`. Safe to
+    renumber at all only because nothing had been released (no appcast, no GitHub releases —
+    checked). `packaging/build_number.txt` deleted; references updated across README, `.iss`,
+    RELEASING and this file.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -372,11 +393,9 @@ sessions but no image was committed — treat their screenshots as absent, not l
   open project gains a file/tab instead. Also: drag-drop files onto the window; a shell "New ▸ Sentinel
   Project" entry.
 - **Installer follow-ons** (installer shipped phase 28; ~~build-number pickup~~ + ~~real `AppUrl`~~
-  done phase 33): **the build number now names shipped artifacts, which makes its semantics a
-  problem** — `build.bat` increments `packaging/build_number.txt` *before* compiling, so failed
-  builds burn numbers and nothing ties a number to a commit, meaning a given
-  `Sentinel-IDE-0.1.0.<n>-setup.exe` **can never be rebuilt**. Fix by deriving from
-  `git rev-list --count HEAD`, or by moving the increment after `BUILD_OK`. Also still open:
+  done phase 33; ~~non-reproducible build number~~ done phase 34 — now `git rev-list --count HEAD`
+  + `BUILDBASE`, so a released `Sentinel-IDE-0.1.0.<n>-setup.exe` can be rebuilt from its tag).
+  Still open:
   code-signing the `setup.exe` (needs a cert — see `docs/RELEASING.md`); WiX/MSI or MSIX (Store)
   if enterprise/Store distribution is ever needed.
 - **Trust/signing follow-ons** (phase 29 wired the manifest): v1 only ever detects the `ffi`
@@ -456,7 +475,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–33 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–34 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
@@ -503,16 +522,19 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > → exit 1 with no artifact.
 >
 > **Git.** It's a repo (`main`, GPL-3.0 `LICENSE`, `README.md`, `.gitignore`, `.gitattributes`)
-> pushed to the **private** GitHub repo **`arcanii/Sentinel-IDE`**; `main` tracks `origin/main`, and
-> `gh` (2.96.0) is installed + authed. Commit and push only when asked. **Before any `git add -A`,
+> pushed to **`arcanii/Sentinel-IDE`**, **PUBLIC since phase 32 and it must stay public** —
+> WinSparkle fetches the update appcast over unauthenticated HTTPS, so going private 404s every
+> client's update check silently. `main` tracks `origin/main`; `gh` (2.96.0) is installed + authed.
+> Commit and push only when asked. **Before any `git add -A`,
 > check `git status --untracked-files=all`:** `snc build` drops an *extensionless* PE beside the
 > source (`examples/crypto` is an MZ binary, not a folder) that `*.exe` does not catch — it is now
 > explicitly ignored, but new targets will reproduce the trap.
 >
 > **Gotchas that will bite you**
 > - `G:` is a mapped network share; git needs `safe.directory` (already configured globally).
-> - **Every `build.bat` run burns a build number** — even a failed one (stamped before cmake), and
->   `packaging/build_number.txt` is committed, so builds dirty the tree.
+> - **The build number no longer changes per build** — it's the git commit count (+`BUILDBASE`), so
+>   it moves only when you commit, and builds no longer dirty the tree. `build.bat` prints
+>   `BUILD_DIRTY <n>` if the tree doesn't match HEAD; don't ship such a build.
 > - `.gitattributes` forces `eol=crlf` on text and marks `*.sig` **binary** so the signed demo stays
 >   byte-exact. **Any tool that rewrites `examples/crypto.sentinel` with LF breaks its signature.**
 > - A raw `cmake --build` without `build.bat` silently yields "0.1.0 (build 0)" + zeroed LOC badges.

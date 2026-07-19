@@ -32,7 +32,7 @@ scripts\build.bat            :: configures + builds → build\Sentinel-IDE.exe
 
 - The VS install path is hard-coded near the top of `scripts\build.bat` — adjust it if VS lives elsewhere.
 - The IDE auto-detects `snc` and the MSVC environment; both are overridable in **Settings**.
-- Build number auto-increments (`packaging/build_number.txt`); the marketing version is fixed at `0.1.0`.
+- The build number is derived from the **git commit count**, so the same commit always stamps the same version and any released build can be rebuilt; the marketing version is fixed at `0.1.0`.
 
 ### Installer
 
