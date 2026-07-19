@@ -12,6 +12,11 @@ target/
 *.exp
 *.ilk
 
+# snc also emits an EXTENSIONLESS PE beside the source (examples\crypto is an
+# MZ binary, not a folder), which the *.exe rule above does not catch.
+/examples/crypto
+/examples/hello
+
 # Sealed projects, signing keys, and unsealed working copies — never commit
 *.sealed
 *.key
