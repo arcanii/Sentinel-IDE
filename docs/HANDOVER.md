@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–30 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–31 built and verified.
 
 ---
 
@@ -56,7 +56,8 @@ exist so far:
 | `src/host/win32/SigningDialog.{h,cpp}` | Themed modal **Signing & Trust** panel (ADR-0061 keygen/sign/verify + trust viewer) |
 | `src/host/win32/AboutDialog.{h,cpp}` | Themed modal **About** box (S2 shield + name/version/tagline + lines-of-code shields.io badges) |
 | `src/host/win32/PasswordDialog.{h,cpp}` | Themed modal password prompt (one field, or two with a match check for sealing) |
-| `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
+| `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
+| `tests/seal_test.cpp` | **The repo's only test.** One case per `.sealed` format defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` (excluded from the default build) or `ctest --test-dir build`. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
 | `src/core/Signing.h` | Trust manifest (`[[keys]]`) + `.sig` parsers, `verifyFile`, and `sncSigningCaps` — which reports **verify** and **keygen/sign** as separate capabilities (they fail independently; see phase 30) |
@@ -130,7 +131,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–30 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–31 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -193,6 +194,31 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     artifact, so an ordinary build regression-tests phase 29's fix. Also recorded: `snc build
     --lib`/`--shared` never invoke the trust gate, so Library/Shared targets enforce nothing
     regardless of `require` (upstream).
+
+31. **Seal format v2 + the repo's first test.** The `.sealed` container was still unshipped (no
+    `.sealed` file existed anywhere; the installer excludes them from shipped examples), so breaking
+    it was free *exactly once* — taken now rather than after a user seals something. Four v1 defects:
+    (a) the slot loop `for (i = 0; i < slots && !unlocked; i++)` exited on success **without
+    advancing `pos`** past the remaining slots, so the payload read began inside the next slot body —
+    latent only because v1 always wrote one slot, and it would have fired on the first multi-slot
+    file, i.e. the moment the headline sealing follow-on landed; (b) unknown slot types **aborted**
+    the unseal, contradicting the header's own promise that keyfile/Ed25519/TPM slots could be added
+    freely — v2 adds `slot_len` so readers skip what they don't parse; (c) `archive_size` was
+    unauthenticated yet fed straight to `sealDecompress` as the output-buffer size, so flipping 8
+    bytes in a file you couldn't decrypt still steered a multi-GB allocation in the victim's process —
+    v2 binds the 24-byte header prefix as GCM **AAD**; (d) `iters` — the one field neither
+    authenticated nor self-checking — went straight into PBKDF2, so a crafted file could name 2^64
+    iterations and hang the app behind a password prompt; now range-checked.
+    **The AAD deliberately covers only the fixed prefix, not `slot_count` or the slot bodies** —
+    authenticating the slot table would tie the payload tag to the current slot set, so adding an
+    unlock method would force re-encrypting the payload and destroy the very LUKS property the format
+    exists to have. Slots defend themselves (each wrapped DEK carries its own tag).
+    Also fixed while reading: `sealExtractArchive` rejected any path *containing* `..`, killing the
+    whole unseal over a legitimate `notes..txt`; and length bounds were `pos + n > size`, which can
+    wrap since the lengths are u64 off disk. **v1 files are still read** — only the writer moved.
+    `tests/seal_test.cpp` (the repo's **first test**, 25 assertions, all passing) has a case per
+    defect; two of them splice an extra slot in *before* and *after* the password slot and confirm
+    the payload still opens, which is what proves the no-re-encryption property is real.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
 
@@ -285,10 +311,15 @@ sessions but no image was committed — treat their screenshots as absent, not l
   when a port actually starts. Today the `src/core/*.h` "core" is still Win32-coupled (wchar_t, BCrypt,
   Compression API, profile API) — step 1 of any port is pulling that logic behind a portable seam.
 - **Sealing follow-ons:** more **unlock slots** (key file, Ed25519/smartcard, TPM — each wraps the
-  same DEK, no re-encryption); a "**remove plaintext after sealing**" option (with confirmation;
-  today seal is non-destructive); **re-seal in place** / "lock" of an unsealed working copy; show
-  the `.sealed` in the tree and unseal on click; upgrade the KDF to **Argon2id** (PBKDF2 today —
-  weaker vs. GPU); open the sealed payload **into memory** rather than to a plaintext working dir.
+  same DEK, no re-encryption; **format v2 / phase 31 makes this actually work** — slots are
+  skip-by-length and the AAD excludes the slot table, both covered by `tests/seal_test.cpp`);
+  a "**remove plaintext after sealing**" option (with confirmation; today seal is non-destructive —
+  and note this would be the app's only irreversible operation, so gate it behind a verify-after-seal
+  round-trip); **re-seal in place** / "lock" of an unsealed working copy; show the `.sealed` in the
+  tree and unseal on click (careful: `sealCurrentProject` writes to the project's **parent** dir,
+  and `TVN_SELCHANGEDW` would happily load a `.sealed` as UTF-8 text into RichEdit); upgrade the KDF
+  to **Argon2id** — **blocked**, no Argon2/BLAKE2 anywhere in CNG or Sentinel's stdlib (verified);
+  open the sealed payload **into memory** rather than to a plaintext working dir.
 - **Writing more of the IDE in Sentinel** (the project's destination). What `snc` can do **today**
   (verified): `fn main() -> i64` (return = exit code), **whole-file** `read_file`/`write_file`,
   `print`/`print_bytes`, TCP sockets, `[u8]`/`Vec<u8>`, `while`, structs/enums/traits, the `secret`
@@ -330,7 +361,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–30 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–31 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed

@@ -22,7 +22,10 @@ Win32 + Common Controls v6, MSVC/Ninja, C++17.
   — the themed modal dialogs (app Settings; the structured Project Settings form; the Signing & Trust panel; the About box).
 - `src/core/Project.h` — `sentinel.toml` model (incl. `[[target]]`) + `loadProject`/`saveProject`
   (the writer rewrites only managed values and preserves comments + unmodeled keys, including target blocks).
-- `src/core/Seal.h` — sealed projects: archive → LZMS → AES-256-GCM under a random DEK, LUKS-style unlock slots.
+- `src/core/Seal.h` — sealed projects: archive → LZMS → AES-256-GCM under a random DEK, LUKS-style
+  unlock slots. Format **v2** (`SNTSEAL2`): `slot_len` makes unknown slot types skippable, and the
+  24-byte header prefix is bound as AEAD **AAD** (deliberately *not* the slot table, so slots stay
+  addable without re-encrypting). Reads v1. Covered by `tests/seal_test.cpp`.
 - `src/core/Settings.h` — `settings.ini` (font/theme/log/toolchain + the `[recents]` project list).
 - `src/core/FileAssoc.h` — per-user `.sntproject`/`.sentinel` file associations.
 - `src/core/Logger.h` — thread-safe append logfile.
