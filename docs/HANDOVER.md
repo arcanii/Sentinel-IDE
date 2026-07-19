@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–31 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–32 built and verified.
 
 ---
 
@@ -34,8 +34,10 @@ exist so far:
   total is counted by **`tools/loc.sentinel`** — the first piece written *in* Sentinel — and a
   **Windows installer** (Inno Setup → `build/installer/`).
 - **It is a git repo** (branch `main`, GPL-3.0 `LICENSE`, `README.md`, `.gitignore`,
-  `.gitattributes`), pushed to the **private** GitHub repo
-  **`arcanii/Sentinel-IDE`** (`https://github.com/arcanii/Sentinel-IDE`); `main` tracks `origin/main`.
+  `.gitattributes`), pushed to **`arcanii/Sentinel-IDE`** (`https://github.com/arcanii/Sentinel-IDE`);
+  `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
+  fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
+  disables auto-update for every installed client.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
 
@@ -74,6 +76,11 @@ exist so far:
 | `scripts/loc.ps1` | Counts the IDE's source by language → `build/generated/Loc.h` (About-box badges); builds the corpus and runs **`tools/loc.sentinel`** via `snc` for the Sentinel-verified total. Called by `build.bat`. |
 | `packaging/Sentinel-IDE.iss` | **Inno Setup** installer script → per-user `setup.exe` (Start-Menu shortcut, file associations mirroring `FileAssoc.h`, uninstall). |
 | `scripts/make-installer.bat` | Build the app, then compile the installer (needs Inno Setup 6: `winget install JRSoftware.InnoSetup`) → `build/installer/`. |
+| `src/host/win32/Updater.{h,cpp}` | **Auto-update** over WinSparkle — EdDSA-signed appcast, `initUpdater`/`checkForUpdates`/`shutdownUpdater`. Inactive until a real public key replaces the placeholder (phase 32). |
+| `third_party/winsparkle/` | Vendored WinSparkle 0.9.3 x64 (DLL + import lib + headers, MIT). CMake copies the DLL beside the exe; the installer ships it. |
+| `scripts/make-appcast.ps1` | Generate `appcast.xml` for a release (takes the signature; never touches the private key). |
+| `docs/RELEASING.md` | Update-signing key setup + the per-release procedure. **Read before cutting a release.** |
+| `THIRD-PARTY-NOTICES.txt` | WinSparkle MIT text + the SQLTerminal-Win32 GPL lineage note. |
 | `tools/loc.sentinel` | **The first part of Sentinel-IDE written *in* Sentinel** — a whole-file line counter (read_file/write_file). Counts toward the "Sentinel" LOC badge. |
 | `examples/` | Sample project: `sentinel.toml` (+ `[[target]]`s), `sentinel-trust.toml`, `crypto.sentinel`(+`.sig`), `hello.sentinel` |
 | `art/` | `S2_icon.png` (app icon — metallic shield), `A_simple_clean…827808.png` (the `.sentinel` file icon — page + blue S + padlock), plus earlier iteration drafts (`…721412/818278.png`, `Remove_the_drop_shadow…726263.png`) |
@@ -131,7 +138,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–31 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–32 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -220,7 +227,36 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     defect; two of them splice an extra slot in *before* and *after* the password slot and confirm
     the payload still opens, which is what proves the no-re-encryption property is real.
 
-See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
+32. **WinSparkle auto-update (Sparkle-style), modelled on `G:\RabbitEars`.** WinSparkle 0.9.3
+    (vendored prebuilt x64, MIT — `third_party/winsparkle/`) reads an **Ed25519-signed appcast**
+    at `raw.githubusercontent.com/arcanii/Sentinel-IDE/main/appcast.xml`; the Inno installer is the
+    update artifact. `src/host/win32/Updater.{h,cpp}` keeps a three-function surface
+    (`initUpdater(HWND)` / `checkForUpdates(HWND)` / `shutdownUpdater()`) so a macOS host could back
+    the same names with Sparkle. **≡ ▸ Check for Updates…**; `initUpdater` runs after the window
+    exists (WinSparkle's shutdown request needs a HWND) and also starts the periodic background check.
+    **The repo being PUBLIC is now load-bearing** — WinSparkle fetches over *unauthenticated* HTTPS,
+    so a private repo answers 404 and every check silently reports "no updates". Verified both ways:
+    the raw URL 404'd while private, returns 200 now. Making it private again breaks updates with
+    **no visible symptom**; see `docs/RELEASING.md`.
+    **Ships inactive on purpose:** `kEdDsaPublicKey` is the placeholder `@@SENTINEL_IDE_…@@`, and
+    while it is, the updater refuses to init, logs a warning, and the menu item is **hidden** (not
+    greyed) — an updater that cannot verify a signature must not look like it works. Activate by
+    generating a **dedicated** key pair with WinSparkle's `generate_keys.exe` and pasting the public
+    half; the private half stays in the Windows credential store, never the repo.
+    **Also fixed a real hang in all five modal dialogs** (not just the one hosting the menu item):
+    each ran `while (!st.done && GetMessageW(...) > 0)`, and `GetMessageW` returns 0 for `WM_QUIT`
+    **and consumes it** — so when WinSparkle posts `WM_CLOSE` to install, the nested loop ate the
+    quit and `runApp`'s outer loop blocked forever: window gone, process alive, **exe locked, install
+    fails**. The loops now re-post `WM_QUIT` (the actual fix); a 3-s force-exit watchdog in
+    `Updater.cpp` is the backstop. RabbitEars hit this via its About box and shipped watchdog-only;
+    it's worse here because *background* checks can request shutdown while **any** dialog is open.
+    Verified end-to-end with a temporary key: init reported `0.1.0.25`, the menu item appeared, and a
+    check performed a real HTTPS fetch and surfaced WinSparkle's error UI for the unpublished
+    appcast. Temporary key reverted; absence re-confirmed by searching the tree **and the built exe**.
+    (WinSparkle's own UI is native/light — it does not follow the dark theme. Cosmetic.)
+
+See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
+release + update-signing procedure.
 
 **Screenshot coverage is partial, despite "screenshot-verified" above:** `docs/screenshots/` holds
 13 PNGs covering phases 1–11, 13 and 15. Phases 12, 14 and 16–29 were verified live during their
@@ -361,7 +397,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–31 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–32 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed

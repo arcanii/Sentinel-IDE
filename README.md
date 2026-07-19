@@ -15,6 +15,7 @@ A native, **Windows-first IDE for the Sentinel language** — built, increasingl
 - **Signing & Trust (ADR-0061)**: real `snc keygen`/`sign`/`verify` with a live status-bar trust chip; a successful build can sign the produced artifact.
 - **Sealed projects**: encrypt a project so only the holder of the password can open it — archive → LZMS-compress → AES-256-GCM under a random key, with **LUKS-style unlock slots** (PBKDF2 password slot today; key-file / smartcard / TPM slots can be added without re-encrypting — the container binds only its fixed header as AEAD associated data, precisely so the slot table stays mutable). See [`src/core/Seal.h`](src/core/Seal.h) and its tests in [`tests/seal_test.cpp`](tests/seal_test.cpp).
 - **File associations**: register `.sntproject` / `.sentinel` so a double-click opens the IDE.
+- **Auto-update** via [WinSparkle](https://winsparkle.org/): checks an **Ed25519-signed appcast** and installs the signed installer, so a release reaches existing users without a manual download. Ships inactive until a signing key is configured — see [`docs/RELEASING.md`](docs/RELEASING.md).
 - **About box** shows **lines-of-code badges** whose total is **counted by [`tools/loc.sentinel`](tools/loc.sentinel)** — the first piece of the IDE written in Sentinel.
 
 ## Built in Sentinel (the dogfood)
