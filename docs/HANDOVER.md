@@ -80,6 +80,7 @@ exist so far:
 | `third_party/winsparkle/` | Vendored WinSparkle 0.9.3 x64 (DLL + import lib + headers, MIT). CMake copies the DLL beside the exe; the installer ships it. |
 | `scripts/make-appcast.ps1` | Generate `appcast.xml` for a release (takes the signature; never touches the private key). |
 | `docs/RELEASING.md` | Update-signing key setup + the per-release procedure. **Read before cutting a release.** |
+| `docs/Sentinel-lang_request.md` | **Prioritised capability requests to the Sentinel-lang team** (R1–R15), each reproduced + measured on this machine. Also the authoritative record of what `snc`/`std` can actually do — it corrects several long-standing false claims in *this* file. |
 | `THIRD-PARTY-NOTICES.txt` | WinSparkle MIT text + the SQLTerminal-Win32 GPL lineage note. |
 | `tools/loc.sentinel` | **The first part of Sentinel-IDE written *in* Sentinel** — a whole-file line counter (read_file/write_file). Counts toward the "Sentinel" LOC badge. |
 | `examples/` | Sample project: `sentinel.toml` (+ `[[target]]`s), `sentinel-trust.toml`, `crypto.sentinel`(+`.sig`), `hello.sentinel` |
@@ -173,7 +174,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 
 24. **Recent Projects + Close Project.** `Settings` gained a `recents` list (most-recent-first, capped at `kMaxRecents`=10, persisted under `[recents]` in `settings.ini`; `addRecent` de-dupes case-insensitively and promotes to front). `openFolderPath` records a recent whenever a real project loads (so New/Open/CLI/recent all feed it). The `≡` menu gains a **Recent Projects ▸** submenu (`buildRecentsMenu` — `name⟶parent` per entry, `&`-escaped, then **Clear Recent Projects**; items are `ID_RECENT_BASE+i`); a missing folder is dropped on click. **Close Project** (in the `≡` menu + tree context menu, grayed when nothing's open) returns to the welcome state: auto-saves a dirty file first (like Build), then clears the project/file/tree/problems/output, hides the tree+editor, and resets the title/chip. Verified: opening two projects ordered the persisted recents correctly; opening recent #1 reopened the right project + its entry file; Close reset to the welcome screen. (Also fixed a pre-existing cosmetic bug — "Signing & Trust…" rendered as "Signing _Trust…" because the literal `&` was a menu mnemonic; now `&&`.)
 
-25. **Sealed projects — encrypt so only the developer can open.** `src/core/Seal.h` (header-only, native CNG + Windows Compression API) seals a project: **archive folder → LZMS-compress → AES-256-GCM encrypt under a random master key (DEK)**. The DEK is wrapped per **unlock slot** (LUKS-style) — v1 = one **password** slot: PBKDF2-HMAC-SHA256(password, 16-B salt, 600k iters) → KEK → AES-256-GCM key-wrap of the DEK. More unlock methods (key file, Ed25519/smartcard, TPM) become new slot types that wrap the *same* DEK — no re-encryption, and a project can carry several at once. The `.sealed` format (magic `SNTSEAL1`, version, AEAD-alg id, archive size, slots, payload nonce/ct/tag) records algorithm ids so a future **ChaCha20-Poly1305** slot/payload coexists with AES files. Extraction sanitizes paths (rejects `..`/absolute); GCM auth detects tampering; archiving skips `target`/`build`/`.git`/`node_modules` and any `.sealed`. UI: **≡ ▸ Seal Project…** (themed `PasswordDialog`, double-entry) → writes `<parent>\<name>.sealed` (non-destructive — the plaintext is left in place), reports in Output. **≡ ▸ Open Sealed Project…** → file picker → password → decrypts to a sibling `<name>-unsealed\` and opens it; wrong password / corruption → a clear message. **This is the headline Sentinel-rewrite target:** the AEAD + KDF core maps onto `std/security` (machine-verified constant-time ChaCha20-Poly1305 + SHA-256); the native host keeps archive/compress/dir-walk (Sentinel has no dir traversal). **Verified** end-to-end: a standalone harness round-trips (seal→unseal byte-identical, wrong-password rejected, 1-bit tamper caught by GCM); and the IDE's own seal of `examples` (7 files · 3906 B → 2134 compressed → 2286 sealed) unseals to byte-identical sources. (A test-harness gotcha, not in the engine: building a key from two separate `"literal"` expressions spans different string objects when pooling is off → use one named buffer.)
+25. **Sealed projects — encrypt so only the developer can open.** `src/core/Seal.h` (header-only, native CNG + Windows Compression API) seals a project: **archive folder → LZMS-compress → AES-256-GCM encrypt under a random master key (DEK)**. The DEK is wrapped per **unlock slot** (LUKS-style) — v1 = one **password** slot: PBKDF2-HMAC-SHA256(password, 16-B salt, 600k iters) → KEK → AES-256-GCM key-wrap of the DEK. More unlock methods (key file, Ed25519/smartcard, TPM) become new slot types that wrap the *same* DEK — no re-encryption, and a project can carry several at once. The `.sealed` format (magic `SNTSEAL1`, version, AEAD-alg id, archive size, slots, payload nonce/ct/tag) records algorithm ids so a future **ChaCha20-Poly1305** slot/payload coexists with AES files. Extraction sanitizes paths (rejects `..`/absolute); GCM auth detects tampering; archiving skips `target`/`build`/`.git`/`node_modules` and any `.sealed`. UI: **≡ ▸ Seal Project…** (themed `PasswordDialog`, double-entry) → writes `<parent>\<name>.sealed` (non-destructive — the plaintext is left in place), reports in Output. **≡ ▸ Open Sealed Project…** → file picker → password → decrypts to a sibling `<name>-unsealed\` and opens it; wrong password / corruption → a clear message. **This is the headline Sentinel-rewrite target:** the AEAD + KDF core maps onto `std/security` (machine-verified constant-time ChaCha20-Poly1305 + SHA-256); the native host keeps archive/compress/dir-walk (~~Sentinel has no dir traversal~~ — **this was wrong; re-measured 2026-07-19, dir traversal works through `extern "C"` and a full recursive archiver has been written in 100% Sentinel. See `docs/Sentinel-lang_request.md` R9**). **Verified** end-to-end: a standalone harness round-trips (seal→unseal byte-identical, wrong-password rejected, 1-bit tamper caught by GCM); and the IDE's own seal of `examples` (7 files · 3906 B → 2134 compressed → 2286 sealed) unseals to byte-identical sources. (A test-harness gotcha, not in the engine: building a key from two separate `"literal"` expressions spans different string objects when pooling is off → use one named buffer.)
 
 26. **File associations — double-click `.sntproject` / `.sentinel` → opens the IDE.** `src/core/FileAssoc.h` registers per-user associations under `HKCU\Software\Classes` (no admin, effective immediately via `SHChangeNotify`): ProgIDs `SentinelIDE.Project` / `SentinelIDE.Source` with `shell\open\command = "<thisexe>" "%1"` and `DefaultIcon = "<exe>",-100/-101` (the app + `.sentinel` file icons, by negative resource id). **≡ ▸ Register File Associations…** writes them and confirms (with a note that an existing per-extension *UserChoice* would still win — by design). The exe already accepts a path on argv; `openPathArg` was improved so a double-clicked file opens its **nearest enclosing project** (walks up to the first folder with a manifest), and a manifest opens the project landing in its entry source rather than the raw file. Verified: registry keys point at `build\Sentinel-IDE.exe`; a pure shell-association launch (`Start-Process crypto.sentinel`, no exe path) opened the IDE with the crypto-lib project + `crypto.sentinel`. (Follow-up: single-instance/IPC so a double-click reuses an open window instead of spawning a new one; today each opens its own.)
 
@@ -354,18 +355,31 @@ sessions but no image was committed — treat their screenshots as absent, not l
   round-trip); **re-seal in place** / "lock" of an unsealed working copy; show the `.sealed` in the
   tree and unseal on click (careful: `sealCurrentProject` writes to the project's **parent** dir,
   and `TVN_SELCHANGEDW` would happily load a `.sealed` as UTF-8 text into RichEdit); upgrade the KDF
-  to **Argon2id** — **blocked**, no Argon2/BLAKE2 anywhere in CNG or Sentinel's stdlib (verified);
+  to **Argon2id** — **blocked**, no Argon2/BLAKE2 anywhere in CNG or Sentinel's stdlib (verified
+  twice; note `Sentinel-lang/docs/SENTINEL_DESIGN2.md:388` *claims* the stdlib exposes Argon2id and
+  that is false against its own source — filed as R15);
   open the sealed payload **into memory** rather than to a plaintext working dir.
-- **Writing more of the IDE in Sentinel** (the project's destination). What `snc` can do **today**
-  (verified): `fn main() -> i64` (return = exit code), **whole-file** `read_file`/`write_file`,
-  `print`/`print_bytes`, TCP sockets, `[u8]`/`Vec<u8>`, `while`, structs/enums/traits, the `secret`
-  + constant-time checker, algebraic effects. What it **can't**: argv, stdin, directory traversal,
-  `stat`, streaming/seek, recoverable I/O errors, `for`, closures, tuples, **`%`**. So the dogfood
-  pattern is *the native host hands a fixed file in, reads a fixed file out*. **Top candidate: the
-  seal crypto core** — port `Seal.h`'s AEAD + KDF to a Sentinel C-ABI lib using `std/security`'s
-  constant-time ChaCha20-Poly1305 + SHA-256 (the `.sealed` format already reserves algorithm ids
-  for a ChaCha slot/payload). Also low-risk/file-driven: a **diagnostic `file:line:col` parser** or a
-  **trust-manifest validator**. Avoid: anything interactive/stream/multi-process (LSP-over-stdio).
+- **Writing more of the IDE in Sentinel** (the project's destination). **Re-measured 2026-07-19 —
+  the old capability list here was substantially WRONG; see `docs/Sentinel-lang_request.md` for the
+  evidence.** Verdicts, each checked by compiling a probe rather than by reading docs:
+
+  | Claimed gap | Reality |
+  |---|---|
+  | no argv | **PRESENT** — `arg_count()` / `arg(i)` are real builtins |
+  | no stdin | **PARTIAL** — `stdin_recv()` reads `i64` frames, not text |
+  | no directory traversal / `stat` / streaming+seek | missing as *builtins*, but **fully reachable via `extern "C"`** — a complete recursive archiver was written in 100% Sentinel and round-tripped a 47-file tree byte-identically |
+  | no recoverable I/O errors | true of the `read_file`/`write_file` **builtins** (they abort), but `CreateFileW` + `GetLastError` over FFI returns real codes with the process alive |
+  | no closures | **PARTIAL** — non-capturing `Fn<T,R>` works (ADR 0070); *captures* are missing |
+  | no `for`, no tuples, no `%` | confirmed missing (cosmetic — `while`, `struct`, `v-(v/10)*10`) |
+
+  So the old "host hands a fixed file in, reads a fixed file out" framing is **no longer the
+  constraint** — that was a limit of the builtin surface, not of the language. **Top candidate is
+  still the seal crypto core**, but the shape of the blocker changed: the C-ABI static-lib path is
+  production-viable *today* (verified linking into this exact GUI/Debug/CRT configuration, +512
+  bytes of binary), and PBKDF2-600k runs in **390 ms–1.2 s**, not the ~8 s previously recorded here.
+  What actually blocks it is **P0-R1: no way to secure-zero a `[secret u8]`**, which would make the
+  port a net security *regression* versus the CNG code it replaces. Also low-risk/file-driven: a
+  **diagnostic `file:line:col` parser** or a **trust-manifest validator**.
 - **Signing follow-ons (remaining):** surface capability-bound verify failures as Problems; an
   editable trust manifest (policy/grants) beyond add+import; a Settings field for a default signing
   key (today post-build signing uses `sentinel.key` in the project dir).
@@ -460,8 +474,15 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > - A `Remove-Item` in the *same* PowerShell call as a `cmd /c` is rejected by a sandbox guard —
 >   keep them in separate calls.
 > - Writing Sentinel: **no `%` operator** (use `v - (v/10)*10`), `if` is an *expression* so a bare
->   `if c { stmt; }` is a parse error, and there's no argv/stdin/dir-walk/`for`/closures/tuples. The
->   dogfood pattern is: the host writes a fixed input file, Sentinel reads it and writes a fixed output.
+>   `if c { stmt; }` is a parse error, and there are no `for` loops, tuples, or *capturing* closures.
+>   **But do NOT trust the older, longer gap list** — argv exists (`arg_count()`/`arg(i)`),
+>   non-capturing `Fn<T,R>` works, and directory traversal / `stat` / streaming / recoverable I/O
+>   errors are all reachable through `extern "C" link("kernel32")` even though the *builtins* lack
+>   them. A full recursive archiver has been written in 100% Sentinel and verified byte-identical.
+>   See **`docs/Sentinel-lang_request.md`** — every one of those was re-measured on 2026-07-19 and
+>   several long-standing entries in this file turned out to be false.
+> - Editing a `.bat` file with a tool that writes **LF** breaks it: `cmd.exe` needs CRLF and fails
+>   with nonsense like `'t' is not recognized`. Convert back to CRLF after any programmatic edit.
 >
 > **Pick a next task** from "What's next" — the strongest candidates are porting `Seal.h`'s AEAD+KDF
 > to a Sentinel C-ABI lib over `std/security` (the cross-platform reuse layer *and* the dogfood), the
