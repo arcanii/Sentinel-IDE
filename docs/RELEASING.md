@@ -149,24 +149,35 @@ treat that as a safety net, never as the plan.
    > on these as release identities, consider deriving the number from
    > `git rev-list --count HEAD` or moving the increment after `BUILD_OK`.
 
-3. **Sign the installer** with the private key. The tool prints one base64 line and nothing
-   else, so it is safe to capture directly:
-   ```cmd
-   winsparkle-tool.exe sign --private-key-file <path>\sentinel-ide.key ^
-        build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe
+3. **Sign the installer** — use the script, not the tool directly:
+   ```
+   pwsh scripts\sign-release.ps1              # newest installer in build\installer\
+   pwsh scripts\sign-release.ps1 -Appcast     # ...and regenerate appcast.xml in one step
    ```
 
-   Then **verify your own signature before publishing it** — this catches a wrong key file or
-   a stale installer path before any client ever sees the feed:
-   ```cmd
-   winsparkle-tool.exe verify --public-key <the base64 public key> ^
-        --signature <the signature just printed> ^
-        build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe
+   Tell it where the private key is **once**, via an environment variable so nothing
+   machine-specific is committed to this public repo:
    ```
-   `Valid signature.` and exit 0 is a pass; a wrong key gives `Failed: signature is invalid.`
-   and exit 1. (Both outcomes confirmed against a throwaway key on 2026-07-19.) The public key
-   here must be the same one compiled into `Updater.cpp`, so this also checks that the shipped
-   binary will actually accept what you are about to publish.
+   setx SENTINEL_SIGN_KEY "<path>\sentinel-ide.key"
+   ```
+   (or pass `-KeyFile <path>`).
+
+   The script does four things `winsparkle-tool sign` alone will not:
+
+   - **Verifies the signature against the public key parsed out of `Updater.cpp`.** Signing with
+     the wrong key file still produces a valid-*looking* signature; you would only find out when
+     every client rejected the update. A mismatch aborts and prints nothing usable.
+   - **Refuses a stale installer** — compares the installer's `ProductVersion` against
+     `build\Sentinel-IDE.exe`'s `FileVersion` and stops if the app has been rebuilt since
+     packaging, which would otherwise publish a feed pointing at the wrong bits.
+   - **Takes the version from the app exe, not the installer.** WinSparkle compares
+     `SENTINEL_FILEVERSION_STR` — the app's version — against `sparkle:version`. The installer's
+     own `FileVersion` is blank (Inno sets only `ProductVersion`), so reading it yields nothing.
+   - **Refuses a key stored inside the repository**, which is one `git add -A` from being public
+     forever.
+
+   All four guards are exercised and confirmed working (2026-07-19), as is the success path:
+   `verify : Valid signature.  (against the key compiled into Updater.cpp)`.
 
 4. **Generate the appcast:**
    ```cmd
