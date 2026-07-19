@@ -26,18 +26,18 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# Where the Ed25519 private key file lives (produced by
-#     winsparkle-tool.exe generate-key --file <path>\sentinel-ide.key ).
+# The Ed25519 private key file, produced by
+#     winsparkle-tool.exe generate-key --file <path>\sentinel-ide.key
 #
-# Left EMPTY on purpose. This repository is public, and committing the absolute
-# path to the release signing key publishes a map to it — free to avoid, so avoid
-# it. Supply the path per machine instead, in preference order:
+# Configured per machine via the SENTINEL_SIGN_KEY environment variable, so nothing
+# machine-specific is committed to this public repo:
 #
-#   1. setx SENTINEL_SIGN_KEY "<path>\sentinel-ide.key"     (set once, nothing to commit)
-#   2. pwsh scripts\sign-release.ps1 -KeyFile <path>
-#   3. fill this in locally — but then DON'T commit the change
+#     setx SENTINEL_SIGN_KEY "<path>\sentinel-ide.key"      (set once; new shells only)
 #
-# Wherever it goes, keep the key file itself outside this repository.
+# Precedence: -KeyFile  >  $env:SENTINEL_SIGN_KEY  >  $KeyFileDefault.
+# $KeyFileDefault stays EMPTY here on purpose — if you fill it in locally for
+# convenience, don't commit that change. Wherever the key lives, keep it outside this
+# repository; the script refuses to sign with a key found inside it.
 $KeyFileDefault = ''
 # ---------------------------------------------------------------------------
 $ToolDefault = 'E:\util\WinSparkle-0.9.3\bin\winsparkle-tool.exe'
