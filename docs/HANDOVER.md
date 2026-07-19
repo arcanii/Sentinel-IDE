@@ -273,6 +273,22 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     ⚠ **Consequence to resolve:** the build number now names a shipped artifact but is not
     reproducible — see *Installer follow-ons*.
 
+    **Also: the installer was putting an x64 app in `C:\Program Files (x86)`.** The `.iss` set
+    neither architecture directive, and Inno's `Setup.exe` is itself a **32-bit process** — so
+    without `ArchitecturesInstallIn64BitMode` it runs in 32-bit install mode and `{commonpf}`
+    resolves through WOW64 to the x86 Program Files, whatever the payload's bitness. (Per-user
+    installs were unaffected: `{autopf}` → `{localappdata}\Programs` either way, so this only
+    showed after choosing "install for all users" in the `PrivilegesRequiredOverridesAllowed`
+    dialog.) Now sets **`ArchitecturesAllowed=x64compatible`** (refuse where the exe can't run)
+    and **`ArchitecturesInstallIn64BitMode=x64compatible`** (put Setup in 64-bit mode) — two
+    directives doing different jobs; the second is the one that fixes the path. `x64compatible`
+    rather than the deprecated `x64` so the build is still offered on ARM64 under emulation.
+    Proved with a throwaway probe `.iss` that aborts in `InitializeSetup` after dumping the
+    constants: without the directive `Is64BitInstallMode=0`, `{commonpf}=C:\Program Files (x86)`;
+    with it `Is64BitInstallMode=1`, `{commonpf}=C:\Program Files`. Secondary benefit: 32-bit
+    install mode also redirects `[Registry]` writes under HKLM into `Wow6432Node`, so a
+    per-machine install's file associations were landing where 64-bit Explorer may not look.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 

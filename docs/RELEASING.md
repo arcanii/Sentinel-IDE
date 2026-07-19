@@ -63,6 +63,12 @@ To activate:
 
    → `build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe`
 
+   The installer is **x64-only** (`ArchitecturesAllowed=x64compatible`) and runs Setup in
+   **64-bit mode** (`ArchitecturesInstallIn64BitMode=x64compatible`), so a per-machine install
+   lands in `C:\Program Files`, not `C:\Program Files (x86)`. Both directives are load-bearing —
+   Inno's Setup.exe is a 32-bit process, and without the second one `{commonpf}` resolves through
+   WOW64 to the x86 directory no matter how the payload was built.
+
    The installer reads its version from the built exe's **FileVersion** resource
    (`GetVersionNumbersString`), so the filename, the setup's own version, and
    `SENTINEL_FILEVERSION_STR` cannot disagree — which is what `-Version` below must match.

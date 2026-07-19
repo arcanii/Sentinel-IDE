@@ -37,6 +37,25 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppSupportURL={#AppUrl}
+; Sentinel-IDE.exe is x64-only (CMake builds x64; third_party\winsparkle is the x64
+; slice). Both directives are required, and they do different jobs:
+;
+;   ArchitecturesAllowed          — refuse to install where the exe cannot run.
+;   ArchitecturesInstallIn64BitMode — put Setup itself into 64-bit mode.
+;
+; The second one is the one that is easy to forget and the reason this app used to
+; install into "C:\Program Files (x86)": Setup is a 32-bit process, so WITHOUT this
+; directive it runs in 32-bit mode and {autopf}/{commonpf} resolve through WOW64 to
+; the x86 Program Files — the wrong directory for a 64-bit binary. It also means
+; [Registry] writes under HKLM go to the redirected Wow6432Node view, so a
+; per-machine install's file associations land where 64-bit Explorer may not look.
+;
+; "x64compatible" rather than "x64" so the x64 build is still offered on ARM64,
+; where it runs under Windows' x64 emulation (Inno 6.3+ spelling; plain "x64" is
+; the deprecated form and excludes ARM64).
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 UninstallDisplayIcon={app}\{#AppExe}
