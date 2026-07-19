@@ -90,7 +90,7 @@ struct AppState {
     std::wstring statusLeft = L"Ln 1, Col 1", statusMsg = L"Open a folder to start", pendingMsg;
     std::vector<std::wstring> nodePaths;
     std::vector<Diag> problems;
-    bool  sncSigns = false;                       // active snc exposes ADR-0061 keygen/sign/verify
+    SncSigningCaps sncCaps;                       // what the active snc can do: verify / keygen+sign (they differ)
     std::wstring vcvarsPath;                       // resolved MSVC vcvars64.bat (link.exe env for builds)
     SignState signState = SignState::Unknown;     // signature state of the open file
     std::wstring signKey, signGrants;             // from the open file's .sig / verify
@@ -590,7 +590,7 @@ void refreshSignState(HWND hwnd) {
     const std::wstring sig = g.curFilePath + L".sig";
     if (GetFileAttributesW(sig.c_str()) == INVALID_FILE_ATTRIBUTES) { g.signState = SignState::Unsigned; return; }
     SigInfo si = readSig(sig); g.signKey = si.key; g.signGrants = si.grants;
-    if (!g.sncSigns) { g.signState = SignState::Signed; return; }   // .sig present but this snc can't verify
+    if (!g.sncCaps.verify) { g.signState = SignState::Signed; return; }   // .sig present but this snc can't verify
     g.signState = SignState::Checking;
     const std::wstring file = g.curFilePath, snc = g.sncPath;
     std::thread([hwnd, file, snc]() {
@@ -886,26 +886,32 @@ void addProblem(const Diag& d) {
 }
 
 // ---- build / run ----------------------------------------------------------
-// Prefer a signing-capable snc (ADR 0061 keygen/sign/verify). The shipped release
-// C1.0b lacks them; the 2026-06-28 / debug build has them — so a build that signs
-// wins over one that doesn't, then first-existing as a fallback.
+// Prefer the most ADR-0061-capable snc. Release is listed first (faster builds),
+// but capability wins over position: both builds carry the subcommands, yet only
+// the one with keygen_core/sign_core beside it can actually sign — so a fully
+// signing-capable build beats a verify-only one, which beats first-existing.
+// (See sncSigningCaps() — advertising `snc keygen` in help proves nothing.)
 std::wstring findSnc() {
     const wchar_t* cands[] = { L"G:\\Sentinel-lang\\target\\release\\snc.exe", L"G:\\Sentinel-lang\\target\\debug\\snc.exe" };
-    std::wstring firstFound;
+    std::wstring firstFound, verifyOnly;
     for (auto c : cands) {
         if (GetFileAttributesW(c) == INVALID_FILE_ATTRIBUTES) continue;
         if (firstFound.empty()) firstFound = c;
-        if (sncSupportsSigning(c)) return c;
+        SncSigningCaps caps = sncSigningCaps(c);
+        if (caps.sign) return c;
+        if (caps.verify && verifyOnly.empty()) verifyOnly = c;
     }
+    if (!verifyOnly.empty()) return verifyOnly;
     return firstFound.empty() ? L"snc.exe" : firstFound;
 }
 // Resolve the build toolchain from Settings (explicit override, else auto-detect):
 // the snc compiler + whether it signs, and the MSVC vcvars64.bat (link.exe env).
 void resolveToolchain() {
     g.sncPath = g.settings.sncPath.empty() ? findSnc() : g.settings.sncPath;
-    g.sncSigns = sncSupportsSigning(g.sncPath);
+    g.sncCaps = sncSigningCaps(g.sncPath);
     g.vcvarsPath = g.settings.vcvarsPath.empty() ? findVcvars() : g.settings.vcvarsPath;
-    logMsg(LogLevel::Info, L"Toolchain — snc=" + g.sncPath + L" (signing=" + (g.sncSigns ? L"yes" : L"no") +
+    logMsg(LogLevel::Info, L"Toolchain — snc=" + g.sncPath + L" (verify=" + (g.sncCaps.verify ? L"yes" : L"no") +
+           L", sign=" + (g.sncCaps.sign ? L"yes" : L"no") +
            L"), vcvars=" + (g.vcvarsPath.empty() ? L"<none>" : g.vcvarsPath));
 }
 // The captured MSVC environment block for g.vcvarsPath (empty if unavailable),
@@ -1113,7 +1119,7 @@ void openSigning(HWND hwnd) {
     const std::wstring dir = g.project.loaded ? g.project.dir : g.rootPath;
     const std::wstring trustPath = g.project.loaded ? (g.project.dir + L"\\" + g.project.trust)
                                  : (g.folderOpen ? g.rootPath + L"\\sentinel-trust.toml" : L"");
-    showSigningDialog(hwnd, g.sncPath, g.sncSigns, g.fileOpen ? g.curFilePath : L"", dir, trustPath);
+    showSigningDialog(hwnd, g.sncPath, g.sncCaps, g.fileOpen ? g.curFilePath : L"", dir, trustPath);
     refreshSignState(hwnd);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -1385,7 +1391,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g.building = false;
         // Sign the built artifact (ADR 0061) when the project opts in (signing.sign=true)
         // and a sentinel.key is present — makes the project's "Sign the artifact" real.
-        if (code == 0 && g.project.loaded && g.project.signOutput && g.sncSigns) {
+        if (code == 0 && g.project.loaded && g.project.signOutput && g.sncCaps.sign) {
             std::wstring key = g.project.dir + L"\\sentinel.key", art = artifactPath();
             if (GetFileAttributesW(key.c_str()) == INVALID_FILE_ATTRIBUTES)
                 outAppend(L"  (signing: sign=true but no sentinel.key — generate one via Signing & Trust)", th.diagWarning);

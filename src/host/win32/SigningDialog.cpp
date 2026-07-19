@@ -32,7 +32,8 @@ enum {
 
 struct SignDlg {
     std::wstring snc, file, dir, trustPath;
-    bool sncSigns = false, done = false;
+    SncSigningCaps caps;                 // verify and keygen/sign are separate — see Signing.h
+    bool done = false;
     SignState state = SignState::Unsigned;
     std::wstring detail, signKey, signGrants;
     HWND eKey = nullptr, eGrants = nullptr, list = nullptr, stState = nullptr, stDetail = nullptr;
@@ -86,7 +87,7 @@ void recompute(SignDlg& st) {
         if (GetFileAttributesW(sig.c_str()) == INVALID_FILE_ATTRIBUTES) { st.state = SignState::Unsigned; st.detail = L"No detached signature (" + base(sig) + L") next to this file."; }
         else {
             SigInfo si = readSig(sig); st.signKey = si.key; st.signGrants = si.grants;
-            if (st.sncSigns) {
+            if (st.caps.verify) {
                 VerifyResult r = verifyFile(st.snc, st.file); st.state = r.state;
                 st.detail = (r.state == SignState::Signed) ? L"Verified — the file bytes match the signature." : projTrim(r.message);
             } else { st.state = SignState::Signed; st.detail = L"Signature present — this snc build can't verify it."; }
@@ -221,7 +222,7 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
 }  // namespace
 
-void showSigningDialog(HWND owner, const std::wstring& sncPath, bool sncSigns,
+void showSigningDialog(HWND owner, const std::wstring& sncPath, SncSigningCaps caps,
                        const std::wstring& filePath, const std::wstring& dir,
                        const std::wstring& trustPath) {
     static bool reg = false;
@@ -234,7 +235,7 @@ void showSigningDialog(HWND owner, const std::wstring& sncPath, bool sncSigns,
     const UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     auto S = [dpi](int v) { return dpiScale(v, dpi); };
 
-    SignDlg st; st.snc = sncPath; st.sncSigns = sncSigns; st.file = filePath; st.dir = dir; st.trustPath = trustPath;
+    SignDlg st; st.snc = sncPath; st.caps = caps; st.file = filePath; st.dir = dir; st.trustPath = trustPath;
 
     HFONT ui  = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
     HFONT hdr = CreateFontW(-S(12), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
@@ -290,10 +291,16 @@ void showSigningDialog(HWND owner, const std::wstring& sncPath, bool sncSigns,
     mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, clientW - M - S(96), by, S(96), S(28), IDC_CLOSE, ui);
     const int clientH = by + S(28) + M;
 
-    if (!st.sncSigns) {   // no signing-capable snc — disable the actions, keep the viewer
-        for (int id : { IDC_GENKEY, IDC_SIGN, IDC_VERIFY }) EnableWindow(GetDlgItem(hwnd, id), FALSE);
-        st.detail = L"This snc build has no keygen/sign/verify — the trust viewer is read-only.";
+    // Gate each action on the capability it actually needs — they fail independently.
+    // A release snc verifies fine but has no keygen_core/sign_core beside it, so
+    // enabling Generate Key / Sign there would offer buttons that error at runtime.
+    if (!st.caps.sign) {
+        for (int id : { IDC_GENKEY, IDC_SIGN }) EnableWindow(GetDlgItem(hwnd, id), FALSE);
+        st.detail = st.caps.verify
+            ? L"This snc can verify but not sign — keygen_core/sign_core are missing beside it."
+            : L"This snc build has no keygen/sign/verify — the trust viewer is read-only.";
     }
+    if (!st.caps.verify) EnableWindow(GetDlgItem(hwnd, IDC_VERIFY), FALSE);
     recompute(st);
 
     RECT wr{ 0, 0, clientW, clientH };

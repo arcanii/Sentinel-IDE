@@ -14,8 +14,9 @@
 // those are hard parse errors that abort `snc build --require-signatures` in BOTH
 // warn and strict. Keep this parser and SigningDialog's writer in lockstep with it.
 //
-// sncSupportsSigning() probes `snc help` for the ADR-0061 subcommands (both the
-// release and debug snc builds carry them as of 2026-07).
+// sncSigningCaps() reports what a given snc build can actually do — see the note
+// above it; `verify` and `keygen`/`sign` are separate capabilities that fail
+// independently, and only the debug build currently satisfies both.
 #pragma once
 #include <windows.h>
 #include <string>
@@ -107,10 +108,35 @@ inline std::wstring shortKey(const std::wstring& key) {
     return k.size() > 16 ? k.substr(0, 16) + L"…" : k;
 }
 
-// Does this snc build expose the ADR-0061 subcommands? (Probes `snc help`.)
-inline bool sncSupportsSigning(const std::wstring& sncPath) {
-    std::wstring out; runCapture(L"\"" + sncPath + L"\" help", L"", out);
-    return out.find(L"snc keygen") != std::wstring::npos && out.find(L"snc sign") != std::wstring::npos;
+// What ADR-0061 can this snc build actually DO? Two capabilities, deliberately
+// separate — they fail independently, and conflating them ships broken buttons:
+//
+//   verify — implemented inside snc itself. Works on any build whose help lists it.
+//   keygen/sign — snc SHELLS OUT to `keygen_core.exe` / `sign_core.exe`, which are
+//     themselves Sentinel programs built beside the snc binary. They are NOT part
+//     of snc, so a build can advertise `snc keygen` in its help and still fail at
+//     runtime with ``signing tool `keygen_core` not found``. As of 2026-07 that is
+//     exactly the state of target\release\ (helpers absent) vs target\debug\
+//     (both present) — so probing the help text alone is not evidence signing works.
+struct SncSigningCaps {
+    bool verify = false;   // `snc verify` usable
+    bool sign   = false;   // `snc keygen` + `snc sign` usable (helpers present)
+};
+
+inline SncSigningCaps sncSigningCaps(const std::wstring& sncPath) {
+    SncSigningCaps caps;
+    std::wstring out;
+    runCapture(L"\"" + sncPath + L"\" help", L"", out);
+    caps.verify = out.find(L"snc verify") != std::wstring::npos;
+    if (out.find(L"snc keygen") == std::wstring::npos || out.find(L"snc sign") == std::wstring::npos)
+        return caps;
+    // The helpers are resolved beside the snc binary; require them before
+    // promising the user a working Generate Key / Sign.
+    const size_t slash = sncPath.find_last_of(L"\\/");
+    const std::wstring dir = (slash == std::wstring::npos) ? L"" : sncPath.substr(0, slash + 1);
+    auto present = [](const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; };
+    caps.sign = present(dir + L"keygen_core.exe") && present(dir + L"sign_core.exe");
+    return caps;
 }
 
 struct VerifyResult { SignState state = SignState::Unsigned; std::wstring key, grants, message; };
