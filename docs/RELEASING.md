@@ -39,6 +39,14 @@ To activate:
    > neither**; everything is subcommands of the single `winsparkle-tool.exe`. Documentation
    > elsewhere (including RabbitEars' `docs/RELEASING.md`) still names the old tools.
    >
+   > ⚠ **Do not use `bin\legacy_generate_keys.bat` / `legacy_sign_update.bat`**, which sit right
+   > beside the tool and look like the old names. They are **not** wrappers around it — they are
+   > the deprecated **DSA** path: `openssl dsaparam 4096` producing `dsa_priv.pem`/`dsa_pub.pem`,
+   > and SHA-1 DSA signing. A DSA key is useless here: `win_sparkle_set_eddsa_public_key` rejects
+   > it (you would get `Updater: WinSparkle rejected the EdDSA public key` in the log), DSA
+   > signatures in an appcast are ignored once an EdDSA key is set, and WinSparkle's own header
+   > marks DSA deprecated and due for removal. They also need `openssl` on PATH.
+   >
    > Worth knowing: the zip's binaries are **not Authenticode-signed**. Verify the download by
    > cross-checking a file you already trust — `x64\Release\WinSparkle.dll` in the zip is
    > byte-identical (SHA-256 `A69ACFCB…8B37`) to `third_party/winsparkle/bin/x64/WinSparkle.dll`
