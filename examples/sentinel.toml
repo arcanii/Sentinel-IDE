@@ -1,4 +1,4 @@
-# Sentinel project manifest (read by SentinelIDE; snc parses the full TOML).
+# Sentinel project manifest (read by Sentinel-IDE; snc parses the full TOML).
 # A project is a library or an executable; debug/release are build targets.
 
 [project]
@@ -17,11 +17,17 @@ links        = []
 # The IDE's top selector picks the active tier; output → target/<tier>/.
 default_tier = "experimental"
 
-# require = warn|strict emits snc --require-signatures/--trust (ADR 0061).
-# The installed snc C1.0b does not accept those flags yet, so default to off;
-# the IDE passes them automatically once snc supports them.
+# require = warn|strict makes the IDE emit snc --require-signatures/--trust (ADR 0061).
+#
+# Deliberately "warn", not "off": a malformed sentinel-trust.toml is a TOML parse error
+# that aborts the build in warn *and* strict, so leaving the gate armed means an ordinary
+# build of this example regression-tests the manifest schema. With "off" the flags are
+# never passed and a broken schema goes unnoticed until someone turns signing on.
+#
+# Not "strict" because the `hello` target is intentionally unsigned — strict would refuse
+# it. Under warn, `crypto` reports `trust: verified — key 58ad2d8c…` and `hello` warns.
 [signing]
-require = "off"
+require = "warn"
 trust   = "sentinel-trust.toml"
 sign    = false
 

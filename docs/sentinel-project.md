@@ -63,17 +63,32 @@ names must be unique). `snc` parses the full TOML.
 
 The **native Sentinel** supply-chain trust model (not Authenticode): Ed25519 keys
 (`snc keygen`), detached `.sig` carriers (`snc sign` / `snc verify`), and a consumer
-trust manifest declaring, per dependency, the trusted key + policy + **capability
-bounds**. `snc build --require-signatures off|warn|strict --trust <manifest>` gates
+trust manifest listing the **trusted keys** and the **capability ceiling** each one is
+bounded to. `snc build --require-signatures off|warn|strict --trust <manifest>` gates
 the build against it.
 
+The schema is exactly what snc's parser accepts — `crates/sentinel-trust/src/trust_model.rs`
+is `#[serde(deny_unknown_fields)]` over an array of `[[keys]]` tables:
+
 ```toml
-[dependencies.std-security]
-sig     = "ed25519:RWQ…"
-policy  = "exact-key"           # exact-key | trust-on-first-use
-grants  = ["secret", "constant_time", "alloc"]
-forbids = ["network", "filesystem", "subprocess"]
+[[keys]]
+name   = "Sentinel-IDE demo key"   # optional, diagnostics only
+pubkey = "58ad2d8cf5294de180a25c2cb8046f422d114dbb5c8a3a91f6483b0b9c476ca5"
+grants = ["secret", "constant_time", "alloc"]   # optional capability ceiling
 ```
+
+> **Do not invent keys here.** `pubkey` must be **64 bare hex chars** — an `ed25519:`
+> prefix parses and then never matches, silently yielding `UNTRUSTED` (configured-looking,
+> enforcing nothing). There is no `[dependencies.<name>]`, no `sig`, no `policy`, and no
+> `forbids` in v1; each is a **hard TOML parse error that aborts the build in `warn` *and*
+> `strict`**. Four places must agree on this schema: this document,
+> `examples/sentinel-trust.toml`, `core/Signing.h::loadTrust`, and `SigningDialog`'s importer.
+
+**Honest scope.** Identity and byte-integrity are genuinely enforced. `grants` is parsed and
+intersected for real, but snc's v1 capability extractor only ever detects `ffi` (from `extern`
+blocks), so `secret`/`constant_time`/`alloc` are recorded *intent*, not an enforced gate.
+Note also that `snc build --lib`/`--shared` never invoke the trust gate at all, so for
+Library and Shared targets the manifest is not enforced regardless of `require`.
 
 ## How the IDE builds a project
 
@@ -141,9 +156,16 @@ A status-bar **trust chip** reflects the open file's signature (✓ Signed / ⊘
 Signature invalid), computed by an async `snc verify`. Clicking it (or `≡ ▸ Signing & Trust…`,
 or `--signing`) opens a panel (`src/host/win32/SigningDialog.cpp`) that runs the *real* ADR-0061
 subcommands — **`snc keygen`** (Generate Key), **`snc sign … --grant <cap>`** (Sign File),
-**`snc verify`** (Verify) — and views the consumer trust manifest (dependency · key · policy ·
-grants · forbids), with **Import current key as trusted** appending an `exact-key` dependency.
-The signing-capable `snc` is auto-selected (`sncSupportsSigning` probes `snc help`).
+**`snc verify`** (Verify) — and views the consumer trust manifest (**Name · Trusted key ·
+Grants (ceiling)**), with **Import current key as trusted** appending a `[[keys]]` table.
+
+The most capable `snc` is auto-selected by `sncSigningCaps` (`core/Signing.h`), which reports
+**verify** and **keygen/sign** as *separate* capabilities. They fail independently: `verify` is
+built into snc, but `keygen`/`sign` shell out to `keygen_core.exe`/`sign_core.exe` — Sentinel
+programs built beside the snc binary. A build can advertise `snc keygen` in its help text and
+still fail at runtime with ``signing tool `keygen_core` not found``, so the probe checks for the
+helpers on disk rather than trusting the help output. Each panel action is greyed against the
+capability it actually needs.
 
 ## Known toolchain gaps (forcing-function — FR-16)
 
@@ -152,9 +174,20 @@ The signing-capable `snc` is auto-selected (`sncSupportsSigning` probes `snc hel
   that environment into the build process, so the linker + import libraries are on PATH. `examples`
   builds at exit 0 → a runnable `crypto.exe`. (Set Settings → **Sentinel (snc)** to pick the
   compiler; blank = auto-detect, preferring a signing+link-capable build.)
-- **ADR-0061 signing — available in the right binary.** The shipped **release** C1.0b lacks
-  `keygen`/`sign`/`verify` and rejects `--require-signatures`/`--trust`; the **debug** build
-  (2026-06-28) has them. The IDE prefers a signing-capable binary, so the Signing panel and the
-  chip are **real**. `composeBuild` emits `--require-signatures`/`--trust` automatically once
-  `require` is `warn`/`strict`.
+- **ADR-0061 signing — split capability, verified 2026-07-19.** *Both* snc builds now carry the
+  subcommands and accept `--require-signatures`/`--trust`, so the old "release is a signing-less
+  C1.0b" note is obsolete. But they are not equivalent: `keygen`/`sign` shell out to
+  `keygen_core.exe`/`sign_core.exe`, which exist only beside **`target\debug\`**. Measured:
+
+  | | `verify` | `keygen` | `sign` |
+  |---|---|---|---|
+  | `target\release\` | works | fails (`keygen_core` not found`) | fails (`sign_core` not found`) |
+  | `target\debug\` | works | works | works |
+
+  `findSnc` therefore ranks by capability, not list order, and selects the debug build.
+  `composeBuild` emits `--require-signatures`/`--trust` automatically once `require` is
+  `warn`/`strict`.
+- **`--lib`/`--shared` skip the trust gate entirely.** `run_trust_gate` is called only from
+  snc's executable build path, and the library path silently discards the flags. Library and
+  Shared targets show "signing: strict" in the IDE and enforce nothing. Upstream issue.
 - **No tier flag** — `snc` builds at `-O0` regardless of tier; tiers only set the output dir.

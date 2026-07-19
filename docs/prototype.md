@@ -47,7 +47,10 @@ A real, native Win32 IDE built from the UX spines + `Theme.h`:
    or **≡ ▸ Project Settings…**; Save persists via `saveProject` (comment-preserving, keeps `[[target]]`) then reloads.
 10. **Signing & Trust (ADR-0061, real)** — a status-bar **trust chip** (✓ Signed / ⊘ Unsigned / ⚠ invalid)
     from an async `snc verify` of the open file; clicking it (or **≡ ▸ Signing & Trust…**) opens a panel running
-    *real* `snc keygen`/`sign` (`--grant` caps)/`verify` + a trust-manifest viewer (dep · key · policy · grants · forbids).
+    *real* `snc keygen`/`sign` (`--grant` caps)/`verify` + a trust-manifest viewer (name · trusted key · grants).
+    The manifest schema is `[[keys]]` with a bare 64-hex `pubkey` — see `sentinel-project.md`; `policy`/`forbids`
+    do not exist in v1 and are parse errors. Actions are gated per capability: `verify` is built into snc, but
+    `keygen`/`sign` need `keygen_core.exe`/`sign_core.exe` beside the binary (only `target\debug\` has them).
 11. **Multiple targets** — `[[target]]` array-of-tables (single-target fallback if none); the scheme selector
     becomes **`target ▾ · tier ▾`**; a **Targets** tree group; Build/Run/output follow the active target.
 12. **New Project + `.sntproject`** — a folder is a project via a `*.sntproject` file (preferred) or legacy
