@@ -27,7 +27,9 @@ Win32 + Common Controls v6, MSVC/Ninja, C++17.
 - `src/core/FileAssoc.h` — per-user `.sntproject`/`.sentinel` file associations.
 - `src/core/Logger.h` — thread-safe append logfile.
 - `src/core/Proc.h` — synchronous `runCapture` + `stripAnsi`.
-- `src/core/Signing.h` — ADR-0061 trust-manifest + `.sig` parsers, `verifyFile`, `sncSupportsSigning`.
+- `src/core/Signing.h` — ADR-0061 `[[keys]]` trust-manifest + `.sig` parsers, `verifyFile`, and
+  `sncSigningCaps` (verify vs keygen/sign as separate capabilities — the latter needs
+  `keygen_core.exe`/`sign_core.exe` beside the snc binary).
 - `src/core/Toolchain.h` — `findVcvars` (auto-detect MSVC env) + `captureMsvcEnv` (vcvars → build env block).
 
 ## Status — phases 1–29 complete (1–17 detailed below; 18–29 in [HANDOVER.md](HANDOVER.md))

@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–29 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–30 built and verified.
 
 ---
 
@@ -59,7 +59,7 @@ exist so far:
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
-| `src/core/Signing.h` | Trust manifest + `.sig` parsers, `verifyFile`, `sncSupportsSigning` |
+| `src/core/Signing.h` | Trust manifest (`[[keys]]`) + `.sig` parsers, `verifyFile`, and `sncSigningCaps` — which reports **verify** and **keygen/sign** as separate capabilities (they fail independently; see phase 30) |
 | `src/core/Toolchain.h` | `findVcvars` (auto-detect MSVC env) + `captureMsvcEnv` (vcvars → env block for builds) |
 | `src/core/Logger.h` | Thread-safe append logfile (level + location) |
 | `src/core/Settings.h` | `settings.ini` in `%LOCALAPPDATA%\SentinelIDE` — font/theme/log/toolchain + the **`[recents]`** project list (`addRecent`, capped `kMaxRecents`) |
@@ -130,7 +130,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–29 (all done, screenshot-verified)
+## Prototype status — phases 1–30 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -175,7 +175,30 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 
 29. **Trust manifest wired to a real fingerprint — and a real schema bug fixed.** Investigating "put the real key in `sentinel-trust.toml`" uncovered that **the shipped schema was fiction**: snc's parser (`crates/sentinel-trust/src/trust_model.rs`, `#[serde(deny_unknown_fields)]`) accepts only `[[keys]]` tables with a **bare 64-hex `pubkey`** (plus optional `name`, `grants`). The old `[dependencies.<name>]` / `sig` / `policy` / `forbids` shape is a **hard TOML parse error that aborts the build in BOTH `warn` and `strict`** — and since `MainWindow.cpp` passes `--require-signatures --trust` whenever `[signing] require != "off"`, the example would have broken IDE-driven builds the moment anyone changed that setting. Worse, an `ed25519:` prefix *parses* but never matches, silently yielding `UNTRUSTED` (configured-looking, enforcing nothing). Fixed all three sides so the IDE and the compiler agree: `examples/sentinel-trust.toml` rewritten to `[[keys]]` with the demo's real key `58ad2d8c…`; `core/Signing.h` (`TrustDep`→**`TrustedKey`**, `deps`→`keys`, parses `[[keys]]`/`pubkey`/`name`/`grants`); and `SigningDialog`'s importer now **writes** that schema (bare hex, dedup by key) with the viewer's columns reduced to **Name · Trusted key · Grants (ceiling)** (`policy`/`forbids` don't exist in v1). **Verified end-to-end**: `snc build … --require-signatures strict --trust …` → `trust: 'crypto.sentinel' verified — key 58ad2d8cf5294de1…` (exit 0), a one-nibble-altered key → `UNTRUSTED … build refused` (exit 1), and the Signing panel now lists the trusted key next to the matching file signature. **Honest scope:** identity + byte-integrity are genuinely enforced; the `grants` ceiling is parsed and intersected for real but v1's capability extractor only ever detects `ffi` (from `extern` blocks), so `secret`/`constant_time`/`alloc` are recorded intent, not an enforced gate, and `forbids` is unimplemented.
 
+30. **Signing capability split + trust gate re-armed.** Three live defects, found by auditing the
+    repo against the toolchain rather than against its own docs. (a) `sncSupportsSigning` treated a
+    `snc help` match as proof signing worked; `keygen`/`sign` actually shell out to
+    `keygen_core.exe`/`sign_core.exe`, present only beside `target\debug\`. Since `findSnc` listed
+    release first and the probe passed, **the Signing panel enabled Generate Key / Sign on a binary
+    that could not do either**, failing at runtime. Replaced with `SncSigningCaps{verify, sign}`
+    (`core/Signing.h`), where `sign` additionally requires the helpers on disk; `findSnc` now ranks
+    by capability, not list order. Splitting the flag also avoids the inverse bug — `verify` works on
+    a verify-only snc, so it stays enabled while only keygen/sign grey out. (b) `docs/sentinel-project.md`
+    and `docs/prototype.md` still published the pre-phase-29 `[dependencies.…]`/`policy`/`forbids`
+    schema — a build-breaking parse error for anyone who copied it; the docs are the **fourth**
+    lockstep site the seed prompt didn't name. (c) `examples/sentinel.toml` had `require = "off"` on
+    a rationale ("snc C1.0b does not accept those flags") that phase 29 had already falsified, so
+    **no ordinary build ever exercised the trust manifest**. Now `warn` — verified that a signed
+    target verifies, the unsigned `hello` target warns, and the old schema fails at exit 1 with no
+    artifact, so an ordinary build regression-tests phase 29's fix. Also recorded: `snc build
+    --lib`/`--shared` never invoke the trust gate, so Library/Shared targets enforce nothing
+    regardless of `require` (upstream).
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
+
+**Screenshot coverage is partial, despite "screenshot-verified" above:** `docs/screenshots/` holds
+13 PNGs covering phases 1–11, 13 and 15. Phases 12, 14 and 16–29 were verified live during their
+sessions but no image was committed — treat their screenshots as absent, not lost.
 
 ## Key decisions
 
@@ -184,8 +207,9 @@ See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
 - **Editor:** RichEdit for now; the Direct2D/DirectWrite GPU editor (as in the reference) is
   the eventual native-perf target. Editor font = Cascadia Code, user-overridable in Settings.
 - **Signing = Sentinel-native ADR-0061** (Ed25519 keys via `snc keygen`/`sign`/`verify`,
-  `sentinel-trust.toml` with trusted key + policy + **capability grants/forbids**, gated by
-  `--require-signatures`). This **supersedes the earlier Authenticode framing** for the project.
+  `sentinel-trust.toml` declaring trusted **`[[keys]]`** with a bare 64-hex `pubkey` and an optional
+  `grants` ceiling, gated by `--require-signatures`). This **supersedes the earlier Authenticode
+  framing**. Note there is no `policy` and no `forbids` in v1 — both are parse errors, not features.
 - **Build tiers** (not debug/release): D/E/S/H per `TIERED_RELEASES.md`.
 - **Project model:** `sentinel.toml` (executable | library | later shared/dll; `lib_paths`/`links`; `default_tier`; `[signing]`).
 - **Accessibility:** backlogged; v1 relies on native Win32/Common-Controls defaults.
@@ -199,12 +223,26 @@ See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
   `CreateProcess` env block). **Verified:** `examples` builds at **exit 0**, producing a working
   `target/experimental/crypto.exe` that runs (exit 42) — so **Run works now too**. If no MSVC env
   is found, Build warns and still fails at link — set it in Settings → MSVC env.
-- **Signing — RESOLVED (use the signing-capable binary).** ADR-0061 is v1-implemented. The
-  **release** `snc.exe` (C1.0b, 2026-06-27) is stale (no `keygen`/`sign`/`verify`, rejects
-  `--require-signatures`/`--trust`); the **debug** `snc.exe` (2026-06-28) has them. The IDE
-  auto-prefers the signing-capable binary, so the signing UI is **fully real**. (For a
-  signing+link-capable *release* binary, rebuild `snc --release`; the release also needs
-  `libsentinel_runtime.a` for its own link path.)
+- **Signing — RESOLVED, but the capability is SPLIT (re-measured 2026-07-19).** ADR-0061 is
+  v1-implemented and *both* snc builds now carry the subcommands and accept
+  `--require-signatures`/`--trust` — the old "release is a signing-less C1.0b" note is **obsolete**.
+  They are still not interchangeable: `verify` is implemented *inside* snc, but `keygen`/`sign`
+  **shell out to `keygen_core.exe` / `sign_core.exe`** (themselves Sentinel programs) which exist
+  only beside `target\debug\`:
+
+  | | `verify` | `keygen` | `sign` |
+  |---|---|---|---|
+  | `target\release\` | works | **fails** — ``signing tool `keygen_core` not found`` | **fails** |
+  | `target\debug\` | works | works | works |
+
+  So **`snc help` is not evidence that signing works** — that mistake shipped a Signing panel whose
+  Generate Key / Sign errored at runtime (fixed in phase 30). `core/Signing.h::sncSigningCaps`
+  reports `{verify, sign}` separately and checks for the helpers on disk; `findSnc` ranks by
+  capability rather than list order and lands on the debug build.
+- **`snc build --lib`/`--shared` skip the trust gate entirely.** `run_trust_gate` is called only
+  from snc's *executable* build path; the library path discards `--require-signatures`/`--trust`
+  without an error. **Library and Shared targets display "signing: strict" in the IDE and enforce
+  nothing.** Upstream (Sentinel-lang), not fixable here.
 - **No tier/opt flag:** `snc` always builds `-O0` (TIERED_RELEASES is post-1.0). Tiers only set
   the output dir today.
 
@@ -292,7 +330,7 @@ See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–29 are done** (all screenshot-verified): themed dark/coral shell with **dark popup +
+> **Phases 1–30 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
@@ -326,12 +364,17 @@ See `docs/prototype.md` and `docs/sentinel-project.md` for detail.
 > build's LOC step uses **debug**. Remaining language/toolchain gap: `snc` has no tier/opt flag (tiers
 > only choose the output dir; always `-O0`).
 >
-> **Trust manifest — keep three things in lockstep.** snc's parser is `deny_unknown_fields` over
+> **Trust manifest — keep FOUR things in lockstep.** snc's parser is `deny_unknown_fields` over
 > `[[keys]]` tables with a **bare 64-hex `pubkey`** (optional `name`, `grants`). `[dependencies.x]`,
 > `sig`, `policy`, `forbids` are **hard parse errors that abort the build in warn *and* strict**, and
-> an `ed25519:` prefix parses but silently never matches (→ `UNTRUSTED`). `examples/sentinel-trust.toml`,
-> `core/Signing.h::loadTrust`, and `SigningDialog`'s importer all speak that schema now — change one,
-> change all three. Verified: strict gate accepts the demo key, a one-nibble change refuses the build.
+> an `ed25519:` prefix parses but silently never matches (→ `UNTRUSTED`). The four sites are
+> `examples/sentinel-trust.toml`, `core/Signing.h::loadTrust`, `SigningDialog`'s importer, **and
+> `docs/sentinel-project.md`** — the docs were missed the first time and spent a while publishing a
+> schema that broke the build for anyone who copied it. Change one, change all four.
+> `examples/sentinel.toml` now ships `require = "warn"` **on purpose**, so an ordinary build of
+> `examples/` re-tests the schema (a malformed manifest fails in warn too); `strict` would refuse the
+> deliberately-unsigned `hello` target. Verified: signed target verifies, unsigned warns, old schema
+> → exit 1 with no artifact.
 >
 > **Git.** It's a repo (`main`, GPL-3.0 `LICENSE`, `README.md`, `.gitignore`, `.gitattributes`)
 > pushed to the **private** GitHub repo **`arcanii/Sentinel-IDE`**; `main` tracks `origin/main`, and
