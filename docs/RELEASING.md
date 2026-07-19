@@ -61,14 +61,20 @@ To activate:
    ```
    → `build\installer\Sentinel-IDE-0.1.0-setup.exe`
 
-   Note the version the build reported (`BUILD_NUMBER n`); the full version string is
-   `0.1.0.<n>`, matching `SENTINEL_FILEVERSION_STR`.
+   → `build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe`
 
-   > **Known wart:** `packaging/Sentinel-IDE.iss` hard-codes `AppVersion 0.1.0`, so the
-   > installer *filename* never changes between builds. Two different binaries can ship
-   > under one name. Fix is one line — `#define AppVersion GetFileVersionString("..\build\" + AppExe)`
-   > — and should land before the first real release. Use `GetFileVersionString`, **not**
-   > `GetFileProductVersion`: `SentinelIDE.rc` hard-codes `PRODUCTVERSION 0,1,0,0`.
+   The installer reads its version from the built exe's **FileVersion** resource
+   (`GetVersionNumbersString`), so the filename, the setup's own version, and
+   `SENTINEL_FILEVERSION_STR` cannot disagree — which is what `-Version` below must match.
+   If `build\Sentinel-IDE.exe` is missing, ISCC stops with an explicit `#error` rather than
+   producing a mis-versioned installer.
+
+   > **Caveat on the build number.** It now names a shipped artifact, but it is *not*
+   > reproducible: `build.bat` increments `packaging/build_number.txt` **before** compiling,
+   > so a failed build still burns a number, and nothing ties a number to a commit. You
+   > cannot rebuild a given `Sentinel-IDE-0.1.0.<n>-setup.exe` after the fact. Before relying
+   > on these as release identities, consider deriving the number from
+   > `git rev-list --count HEAD` or moving the increment after `BUILD_OK`.
 
 3. **Sign the installer** with the private key:
    ```cmd

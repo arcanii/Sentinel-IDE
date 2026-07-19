@@ -9,10 +9,27 @@
 ; scripts\make-installer.bat → build\installer\Sentinel-IDE-<ver>-setup.exe.
 
 #define AppName "Sentinel-IDE"
-#define AppVersion "0.1.0"
 #define AppExe "Sentinel-IDE.exe"
 #define AppPublisher "Anie"
-#define AppUrl "https://github.com/"
+#define AppUrl "https://github.com/arcanii/Sentinel-IDE"
+
+; Version is READ FROM THE BUILT EXE, not hard-coded, so the installer and its
+; filename can never disagree with the binary inside it. scripts\build.bat stamps
+; the exe's FileVersion as 0.1.0.<build> from packaging\build_number.txt.
+;
+; This matters more now that auto-update ships: WinSparkle compares the running
+; build's SENTINEL_FILEVERSION_STR against the appcast's sparkle:version, and
+; docs\RELEASING.md requires -Version to equal it. Deriving both from the same
+; resource removes the chance of hand-typing a mismatch.
+;
+; MUST be the FileVersion, NOT the ProductVersion: packaging\SentinelIDE.rc
+; hard-codes PRODUCTVERSION 0,1,0,0, so reading ProductVersion would silently pin
+; every installer to 0.1.0.0 — precisely the bug this change exists to remove.
+#define AppExePath SourcePath + "\..\build\" + AppExe
+#if !FileExists(AppExePath)
+  #error Build the app first (scripts\build.bat) - the installer reads its version from build\Sentinel-IDE.exe
+#endif
+#define AppVersion GetVersionNumbersString(AppExePath)
 
 [Setup]
 AppId={{9C3E7A14-2B6D-4F09-AE81-5D2C7B3F8A60}
@@ -51,7 +68,13 @@ Source: "..\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; NB: *.sig is deliberately NOT excluded — examples\crypto.sentinel.sig is what makes
 ; the installed demo show a real "Signed" trust chip. Dropping it would silently
 ; downgrade the example that exists to demonstrate ADR-0061.
-Source: "..\examples\*";      DestDir: "{app}\examples"; Excludes: "target\*,*.o,*.obj,*.exe,*.sealed"; Flags: ignoreversion recursesubdirs createallsubdirs
+;
+; "crypto" and "hello" are EXTENSIONLESS PE binaries that `snc build` drops beside
+; the source (examples\crypto is an MZ image, not a folder), so the *.exe rule above
+; does not catch them — the same trap that made .gitignore miss them. Without these
+; two names the installer ships whatever build artifacts happen to be lying around
+; in the developer's examples\ directory.
+Source: "..\examples\*";      DestDir: "{app}\examples"; Excludes: "target\*,*.o,*.obj,*.exe,*.sealed,crypto,hello"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}";            Filename: "{app}\{#AppExe}"

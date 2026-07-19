@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–32 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–33 built and verified.
 
 ---
 
@@ -139,7 +139,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–32 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–33 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -180,7 +180,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 
 27. **Rename to "Sentinel-IDE" + git/repo prep.** Display name → **Sentinel-IDE** (titlebar/`kAppName`, About box + caption, `.rc` ProductName/FileDescription/InternalName/OriginalFilename, `app.manifest` identity) and the **exe → `Sentinel-IDE.exe`** via CMake `OUTPUT_NAME` (the CMake target id, window class `SentinelIDEMainWindow`, `sentinelide` namespace, `%LOCALAPPDATA%\SentinelIDE` settings dir, and the `G:\SentinelIDE` folder stay "SentinelIDE" — so saved settings + the `-Class` capture path keep working). `launch.ps1`/`capture.ps1` now match the **process name** `Sentinel-IDE`; the file associations were re-registered to the new exe. **Repo prepped (to stay private initially):** added `LICENSE` (verbatim GPL-3.0, from SQLTerminal-Win32), a public `README.md`, `.gitignore` (excludes `build/`, `target/`, `*.o`/`*.obj`/`*.exe`/`*.pdb`/`*.lib`, `*.sealed`/`*.key`, `.claude/`, `_bmad/`), and `.gitattributes` (`* text=auto eol=crlf` so the signed demo keeps CRLF; `*.sig`/`*.ico`/`*.png` `binary` so the committed signature isn't mangled). `git init -b main` → clean initial commit **`e5f8386`, 85 files** (source/docs/examples/packaging/scripts/art/tools + the `_bmad-output` design docs; **no build artifacts, secrets, or tooling**). Gotchas handled: the repo sits on a network share (git needed `safe.directory`), and a first attempt committed `examples/target/**` build artifacts — history was rebuilt clean before any push. **Pushed 2026-07-19** to the private repo **`arcanii/Sentinel-IDE`** via `gh repo create Sentinel-IDE --private --source=. --remote=origin --push` (`gh` 2.96.0 *is* installed now — the earlier "not installed" note is stale). 87 files, history verified free of key material and build artifacts. The local folder stays `G:\SentinelIDE`; only the GitHub repo + product/exe are "Sentinel-IDE".
 
-28. **Windows installer (Inno Setup).** `packaging/Sentinel-IDE.iss` + `scripts/make-installer.bat` → a **per-user `setup.exe`** (no admin): the exe + `examples/` + README/LICENSE, a Start-Menu shortcut (optional desktop icon), the `.sntproject`/`.sentinel` associations declared in `[Registry]` under `HKA` (mirroring `FileAssoc.h`, icons by negative resource id `-100`/`-101`), and a full uninstall that reverses them. `ChangesAssociations=yes` refreshes the shell. **Built and verified**: Inno Setup 6 installed per-user via winget → `ISCC` compiled it → `build/installer/Sentinel-IDE-0.1.0-setup.exe` (~2.6 MB). `make-installer.bat` probes `Program Files (x86)`, then `%LOCALAPPDATA%\Programs\Inno Setup 6`, then bare `ISCC.exe`. Caveat: the `.iss` hard-codes `AppVersion 0.1.0` (it does *not* pick up the build number), and `AppUrl` is still a placeholder. WiX/MSI or MSIX (Store) remain the heavier alternatives.
+28. **Windows installer (Inno Setup).** `packaging/Sentinel-IDE.iss` + `scripts/make-installer.bat` → a **per-user `setup.exe`** (no admin): the exe + `examples/` + README/LICENSE, a Start-Menu shortcut (optional desktop icon), the `.sntproject`/`.sentinel` associations declared in `[Registry]` under `HKA` (mirroring `FileAssoc.h`, icons by negative resource id `-100`/`-101`), and a full uninstall that reverses them. `ChangesAssociations=yes` refreshes the shell. **Built and verified**: Inno Setup 6 installed per-user via winget → `ISCC` compiled it → `build/installer/Sentinel-IDE-0.1.0-setup.exe` (~2.6 MB). `make-installer.bat` probes `Program Files (x86)`, then `%LOCALAPPDATA%\Programs\Inno Setup 6`, then bare `ISCC.exe`. ~~Caveat: the `.iss` hard-codes `AppVersion 0.1.0` (it does *not* pick up the build number), and `AppUrl` is still a placeholder.~~ **Both fixed in phase 33** — the version is now read from the built exe's FileVersion resource and `AppUrl` points at the repo. WiX/MSI or MSIX (Store) remain the heavier alternatives.
 
 29. **Trust manifest wired to a real fingerprint — and a real schema bug fixed.** Investigating "put the real key in `sentinel-trust.toml`" uncovered that **the shipped schema was fiction**: snc's parser (`crates/sentinel-trust/src/trust_model.rs`, `#[serde(deny_unknown_fields)]`) accepts only `[[keys]]` tables with a **bare 64-hex `pubkey`** (plus optional `name`, `grants`). The old `[dependencies.<name>]` / `sig` / `policy` / `forbids` shape is a **hard TOML parse error that aborts the build in BOTH `warn` and `strict`** — and since `MainWindow.cpp` passes `--require-signatures --trust` whenever `[signing] require != "off"`, the example would have broken IDE-driven builds the moment anyone changed that setting. Worse, an `ed25519:` prefix *parses* but never matches, silently yielding `UNTRUSTED` (configured-looking, enforcing nothing). Fixed all three sides so the IDE and the compiler agree: `examples/sentinel-trust.toml` rewritten to `[[keys]]` with the demo's real key `58ad2d8c…`; `core/Signing.h` (`TrustDep`→**`TrustedKey`**, `deps`→`keys`, parses `[[keys]]`/`pubkey`/`name`/`grants`); and `SigningDialog`'s importer now **writes** that schema (bare hex, dedup by key) with the viewer's columns reduced to **Name · Trusted key · Grants (ceiling)** (`policy`/`forbids` don't exist in v1). **Verified end-to-end**: `snc build … --require-signatures strict --trust …` → `trust: 'crypto.sentinel' verified — key 58ad2d8cf5294de1…` (exit 0), a one-nibble-altered key → `UNTRUSTED … build refused` (exit 1), and the Signing panel now lists the trusted key next to the matching file signature. **Honest scope:** identity + byte-integrity are genuinely enforced; the `grants` ceiling is parsed and intersected for real but v1's capability extractor only ever detects `ffi` (from `extern` blocks), so `secret`/`constant_time`/`alloc` are recorded intent, not an enforced gate, and `forbids` is unimplemented.
 
@@ -255,6 +255,23 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     check performed a real HTTPS fetch and surfaced WinSparkle's error UI for the unpublished
     appcast. Temporary key reverted; absence re-confirmed by searching the tree **and the built exe**.
     (WinSparkle's own UI is native/light — it does not follow the dark theme. Cosmetic.)
+
+33. **Installer version derived from the build.** `packaging/Sentinel-IDE.iss` hard-coded
+    `AppVersion "0.1.0"`, so `Sentinel-IDE-0.1.0-setup.exe` was the filename for *every* build —
+    two different binaries shipping under one name, which matters much more now that WinSparkle
+    compares versions. It now reads the built exe's **FileVersion** via
+    `GetVersionNumbersString(SourcePath + "\..\build\" + AppExe)` → `Sentinel-IDE-0.1.0.28-setup.exe`,
+    with a `#if !FileExists` → `#error` guard so a forgotten build stops ISCC instead of yielding a
+    mis-versioned installer. **It must be FileVersion, not ProductVersion:** `SentinelIDE.rc`
+    hard-codes `PRODUCTVERSION 0,1,0,0`, so `GetFileProductVersion` would have silently pinned every
+    installer to `0.1.0.0` — the same bug wearing a fix's clothes. Verified: exe `0.1.0.28` →
+    filename `0.1.0.28` → setup's own ProductVersion `0.1.0.28`. `AppUrl` also now points at the repo.
+    **Found while testing:** the installer was shipping `examples\crypto` and `examples\hello` — the
+    *extensionless* PE binaries `snc` drops beside the source, which `Excludes: *.exe` misses for
+    exactly the reason `.gitignore` missed them. Added to `Excludes` (−52 KB). `*.sig` stays
+    deliberately **un**excluded, or the installed demo loses its ✓ Signed chip.
+    ⚠ **Consequence to resolve:** the build number now names a shipped artifact but is not
+    reproducible — see *Installer follow-ons*.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
@@ -331,9 +348,14 @@ sessions but no image was committed — treat their screenshots as absent, not l
   path to an existing instance (named pipe / `WM_COPYDATA` to a `FindWindow` of the app class) so the
   open project gains a file/tab instead. Also: drag-drop files onto the window; a shell "New ▸ Sentinel
   Project" entry.
-- **Installer follow-ons** (the installer itself shipped — phase 28): make the `.iss` pick up the
-  build number instead of hard-coding `AppVersion 0.1.0`; set a real `AppUrl`; consider code-signing
-  the `setup.exe`; WiX/MSI or MSIX (Store) if enterprise/Store distribution is ever needed.
+- **Installer follow-ons** (installer shipped phase 28; ~~build-number pickup~~ + ~~real `AppUrl`~~
+  done phase 33): **the build number now names shipped artifacts, which makes its semantics a
+  problem** — `build.bat` increments `packaging/build_number.txt` *before* compiling, so failed
+  builds burn numbers and nothing ties a number to a commit, meaning a given
+  `Sentinel-IDE-0.1.0.<n>-setup.exe` **can never be rebuilt**. Fix by deriving from
+  `git rev-list --count HEAD`, or by moving the increment after `BUILD_OK`. Also still open:
+  code-signing the `setup.exe` (needs a cert — see `docs/RELEASING.md`); WiX/MSI or MSIX (Store)
+  if enterprise/Store distribution is ever needed.
 - **Trust/signing follow-ons** (phase 29 wired the manifest): v1 only ever detects the `ffi`
   capability, so `grants` ceilings are recorded intent rather than an enforced gate and `forbids` is
   unimplemented — revisit when snc's capability extractor grows. Also still open: surfacing
@@ -411,7 +433,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–32 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–33 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
