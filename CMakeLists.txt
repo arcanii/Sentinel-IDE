@@ -64,3 +64,15 @@ target_link_libraries(SentinelIDE PRIVATE
 if(MSVC)
   target_link_options(SentinelIDE PRIVATE /MANIFEST:NO)
 endif()
+
+# ---- tests ------------------------------------------------------------------
+# Console test for the .sealed container format (src/core/Seal.h). Not built by
+# scripts\build.bat — build it explicitly:
+#     cmake --build build --target seal_test  &&  build\seal_test.exe
+# or via ctest:  ctest --test-dir build
+enable_testing()
+add_executable(seal_test tests/seal_test.cpp)
+target_include_directories(seal_test PRIVATE src/core)
+target_link_libraries(seal_test PRIVATE bcrypt cabinet shell32 advapi32)
+set_target_properties(seal_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME seal_format COMMAND seal_test)

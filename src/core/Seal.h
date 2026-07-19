@@ -13,13 +13,39 @@
 // machine-verified constant-time ChaCha20-Poly1305 + SHA-256); the on-disk format
 // records algorithm ids so a future ChaCha slot/payload coexists with AES files.
 //
-// .sealed layout (all integers little-endian):
-//   "SNTSEAL1"(8) | version:u32(=1) | aead_alg:u32(1=AES-256-GCM) |
-//   archive_size:u64 | slot_count:u32 |
-//   slots[slot_count]:  slot_type:u32(1=password)
-//                       password slot body: salt(16) | iters:u64 | wrap_nonce(12) |
-//                                            wrapped_dek(32) | wrap_tag(16)
+// .sealed layout v2 (all integers little-endian):
+//   "SNTSEAL2"(8) | version:u32(=2) | aead_alg:u32(1=AES-256-GCM) |   <-- AAD prefix (24 B)
+//   archive_size:u64 |                                                <-- ...ends here
+//   slot_count:u32 |
+//   slots[slot_count]:  slot_type:u32(1=password) | slot_len:u32 | slot_body(slot_len)
+//                       password body (type 1, len 84): salt(16) | iters:u64 |
+//                                            wrap_nonce(12) | wrapped_dek(32) | wrap_tag(16)
 //   payload_nonce(12) | payload_len:u64 | payload(payload_len) | payload_tag(16)
+//
+// Two properties the v1 layout got wrong, both fixed here:
+//
+//   * `slot_len` makes slots SKIPPABLE. v1 had no length, so a reader hitting an
+//     unknown slot_type could not step over it and had to abort — which flatly
+//     contradicted the extensibility promise above. A v2 reader skips slot types
+//     it does not understand and keeps looking for one it does.
+//
+//   * The 24-byte prefix is bound into the payload AEAD as ADDITIONAL AUTHENTICATED
+//     DATA. In v1 `archive_size` was unauthenticated yet fed straight to
+//     `sealDecompress` as the output-buffer size, so flipping those 8 bytes in a
+//     file you could not decrypt still steered a multi-gigabyte allocation in the
+//     victim's process. Binding it makes tampering fail as an auth error instead.
+//
+// AAD deliberately covers ONLY that fixed prefix — NOT slot_count and NOT the slot
+// bodies. Authenticating the slot table would tie the payload tag to the current set
+// of slots, so adding an unlock method would force re-encrypting the whole payload
+// and destroy the LUKS-style property this format exists to have. Slots defend
+// themselves instead: each wrapped DEK carries its own GCM tag, so a tampered slot
+// simply fails to unlock. The one field that is neither authenticated nor
+// self-checking is the per-slot `iters`, which is why it is range-checked below
+// before being handed to PBKDF2.
+//
+// v1 files ("SNTSEAL1") are still READ, so anything sealed before this change keeps
+// opening; only the writer moved to v2.
 #pragma once
 #include <windows.h>
 #include <bcrypt.h>
@@ -95,8 +121,11 @@ inline bool sealPbkdf2(const Bytes& pw, const uint8_t* salt, ULONG saltLen, ULON
     BCryptCloseAlgorithmProvider(h, 0);
     return s == 0;
 }
-// AES-256-GCM one-shot. enc: tag is OUT; dec: tag is IN (mismatch → false = wrong key/tamper).
-inline bool sealAesGcm(bool enc, const uint8_t key[32], const uint8_t nonce[12], const Bytes& in, Bytes& out, uint8_t tag[16]) {
+// AES-256-GCM one-shot. enc: tag is OUT; dec: tag is IN (mismatch → false = wrong
+// key/tamper). `aad`/`aadLen` are optional additional authenticated data: covered by
+// the tag but not encrypted. Pass nullptr/0 for none (the DEK key-wrap does).
+inline bool sealAesGcm(bool enc, const uint8_t key[32], const uint8_t nonce[12], const Bytes& in, Bytes& out, uint8_t tag[16],
+                       const uint8_t* aad = nullptr, ULONG aadLen = 0) {
     BCRYPT_ALG_HANDLE hAlg = nullptr; BCRYPT_KEY_HANDLE hKey = nullptr; bool ok = false;
     if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) return false;
     if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0) == 0 &&
@@ -104,6 +133,7 @@ inline bool sealAesGcm(bool enc, const uint8_t key[32], const uint8_t nonce[12],
         BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info; BCRYPT_INIT_AUTH_MODE_INFO(info);
         info.pbNonce = (PUCHAR)nonce; info.cbNonce = 12;
         info.pbTag = tag; info.cbTag = 16;
+        info.pbAuthData = (PUCHAR)aad; info.cbAuthData = aadLen;
         uint8_t iv[16] = {};                 // GCM working IV buffer (per CNG sample)
         out.resize(in.size()); ULONG outLen = 0;
         NTSTATUS s = enc
@@ -168,20 +198,39 @@ inline Bytes sealPackArchive(const std::vector<std::pair<std::wstring, Bytes>>& 
     }
     return a;
 }
+// Is this archive-relative path unsafe to write under destRoot?
+// The ".." test is PER COMPONENT: a substring search also rejects perfectly ordinary
+// names like "notes..txt" or "v1..2.md", which would abort the whole unseal over a
+// file that was never a traversal attempt.
+inline bool sealUnsafeRelPath(const std::wstring& p) {
+    if (p.empty()) return true;
+    if (p[0] == L'\\' || p[0] == L'/') return true;                   // rooted
+    if (p.size() > 1 && p[1] == L':') return true;                    // drive-qualified
+    for (size_t start = 0; start <= p.size(); ) {
+        const size_t sep = p.find(L'\\', start);
+        const size_t end = (sep == std::wstring::npos) ? p.size() : sep;
+        if (p.compare(start, end - start, L"..") == 0) return true;   // exactly ".."
+        if (sep == std::wstring::npos) break;
+        start = sep + 1;
+    }
+    return false;
+}
+
 inline bool sealExtractArchive(const Bytes& a, const std::wstring& destRoot) {
     if (a.size() < 4) return false;
     size_t pos = 0; uint32_t n = getU32(&a[pos]); pos += 4;
+    // Bounds are written as `remaining < want` rather than `pos + want > size`:
+    // data_len is a u64 straight off disk, so the additive form can wrap and pass.
     for (uint32_t i = 0; i < n; i++) {
-        if (pos + 4 > a.size()) return false;
+        if (a.size() - pos < 4) return false;
         uint32_t pl = getU32(&a[pos]); pos += 4;
-        if (pos + pl > a.size()) return false;
+        if (a.size() - pos < pl) return false;
         std::wstring rel = sealWide((const char*)&a[pos], pl); pos += pl;
-        if (pos + 8 > a.size()) return false;
+        if (a.size() - pos < 8) return false;
         uint64_t dl = getU64(&a[pos]); pos += 8;
-        if (pos + dl > a.size()) return false;
+        if (dl > (uint64_t)(a.size() - pos)) return false;
         for (auto& ch : rel) if (ch == L'/') ch = L'\\';                 // → native separators
-        if (rel.find(L"..") != std::wstring::npos || rel.empty() ||
-            rel[0] == L'\\' || (rel.size() > 1 && rel[1] == L':')) return false;   // reject traversal / absolute
+        if (sealUnsafeRelPath(rel)) return false;
         std::wstring full = destRoot + L"\\" + rel;
         size_t s = full.find_last_of(L'\\');
         if (s != std::wstring::npos) SHCreateDirectoryExW(nullptr, full.substr(0, s).c_str(), nullptr);
@@ -194,6 +243,23 @@ inline bool sealExtractArchive(const Bytes& a, const std::wstring& destRoot) {
 // ---- seal / unseal --------------------------------------------------------
 constexpr uint64_t kSealPbkdf2Iters = 600000;   // OWASP-class for PBKDF2-HMAC-SHA256
 
+constexpr uint32_t kSealVersion1 = 1;           // legacy: no slot_len, no AAD (still read)
+constexpr uint32_t kSealVersion2 = 2;           // current writer
+constexpr uint32_t kAeadAesGcm   = 1;           // aead_alg id (2 = ChaCha20-Poly1305, reserved)
+constexpr uint32_t kSlotPassword = 1;           // slot_type id
+constexpr uint32_t kPasswordSlotLen = 16 + 8 + 12 + 32 + 16;   // salt|iters|nonce|wrapped|tag = 84
+constexpr size_t   kSealAadLen   = 24;          // magic(8) + version(4) + aead_alg(4) + archive_size(8)
+
+// `iters` lives in the slot body, which is neither covered by the AAD nor checked by
+// the slot's own GCM tag (that tag only authenticates the wrapped DEK). So a crafted
+// file can name any iteration count and we would obediently run it. Bound it: below
+// the floor is a weakened KDF, above the ceiling is a hang dressed up as a password
+// prompt. Both are rejected rather than clamped — a real file is always in range, so
+// out-of-range means the file is lying, and silently "fixing" it would just fail the
+// unwrap later with a misleading "wrong password".
+constexpr uint64_t kMinPbkdf2Iters = 1000;
+constexpr uint64_t kMaxPbkdf2Iters = 10000000;
+
 inline SealResult sealProject(const std::wstring& projectDir, const std::wstring& sealedPath, const Bytes& password) {
     SealResult r;
     std::vector<std::pair<std::wstring, Bytes>> files;
@@ -205,21 +271,31 @@ inline SealResult sealProject(const std::wstring& projectDir, const std::wstring
 
     uint8_t dek[32], payloadNonce[12], payloadTag[16], salt[16], kek[32], wrapNonce[12], wrapTag[16];
     if (!sealRng(dek, 32) || !sealRng(payloadNonce, 12) || !sealRng(salt, 16) || !sealRng(wrapNonce, 12)) { r.message = L"RNG failed."; return r; }
-    Bytes payload; if (!sealAesGcm(true, dek, payloadNonce, comp, payload, payloadTag)) { r.message = L"Encrypt failed."; return r; }
+
+    // Build the AAD prefix FIRST — the payload tag has to commit to it, so it must
+    // exist before the payload is encrypted, and the bytes written to disk must be
+    // the very same ones fed to the AEAD.
+    Bytes out;
+    const char magic[8] = { 'S','N','T','S','E','A','L','2' };
+    out.insert(out.end(), magic, magic + 8);
+    putU32(out, kSealVersion2);
+    putU32(out, kAeadAesGcm);
+    putU64(out, archiveSize);
+    // out.size() == kSealAadLen here; everything after this point is outside the AAD.
+
+    Bytes payload;
+    if (!sealAesGcm(true, dek, payloadNonce, comp, payload, payloadTag, out.data(), (ULONG)kSealAadLen)) {
+        SecureZeroMemory(dek, 32); r.message = L"Encrypt failed."; return r;
+    }
     if (!sealPbkdf2(password, salt, 16, kSealPbkdf2Iters, kek, 32)) { SecureZeroMemory(dek, 32); r.message = L"Key derivation failed."; return r; }
     Bytes dekIn(dek, dek + 32), wrapped;
     bool wrapOk = sealAesGcm(true, kek, wrapNonce, dekIn, wrapped, wrapTag);
     SecureZeroMemory(dek, 32); SecureZeroMemory(kek, 32); SecureZeroMemory(dekIn.data(), dekIn.size());
     if (!wrapOk || wrapped.size() != 32) { r.message = L"Key wrap failed."; return r; }
 
-    Bytes out;
-    const char magic[8] = { 'S','N','T','S','E','A','L','1' };
-    out.insert(out.end(), magic, magic + 8);
-    putU32(out, 1);            // format version
-    putU32(out, 1);            // AEAD alg: 1 = AES-256-GCM
-    putU64(out, archiveSize);
-    putU32(out, 1);            // slot count
-    putU32(out, 1);            // slot 0 type: 1 = password (PBKDF2-HMAC-SHA256)
+    putU32(out, 1);                     // slot count
+    putU32(out, kSlotPassword);         // slot 0 type
+    putU32(out, kPasswordSlotLen);      // slot 0 length — lets a reader skip what it can't parse
     out.insert(out.end(), salt, salt + 16);
     putU64(out, kSealPbkdf2Iters);
     out.insert(out.end(), wrapNonce, wrapNonce + 12);
@@ -241,45 +317,83 @@ inline SealResult unsealProject(const std::wstring& sealedPath, const std::wstri
     SealResult r;
     Bytes f; if (!sealReadBytes(sealedPath, f)) { r.message = L"Cannot read the sealed file."; return r; }
     size_t pos = 0;
-    auto need = [&](size_t n) { return pos + n <= f.size(); };
-    if (f.size() < 8 || memcmp(f.data(), "SNTSEAL1", 8) != 0) { r.message = L"Not a sealed project (bad header)."; return r; }
+    // `remaining() < n` rather than `pos + n <= size`: lengths come off disk as u64
+    // and the additive form can wrap past the check.
+    auto remaining = [&]() -> size_t { return f.size() - pos; };
+    auto need = [&](size_t n) { return remaining() >= n; };
+
+    if (f.size() < 8) { r.message = L"Not a sealed project (bad header)."; return r; }
+    const bool v2 = memcmp(f.data(), "SNTSEAL2", 8) == 0;
+    const bool v1 = memcmp(f.data(), "SNTSEAL1", 8) == 0;
+    if (!v1 && !v2) { r.message = L"Not a sealed project (bad header)."; return r; }
     pos = 8;
     if (!need(20)) { r.message = L"Sealed file is truncated."; return r; }
     uint32_t ver = getU32(&f[pos]); pos += 4;
     uint32_t alg = getU32(&f[pos]); pos += 4;
     uint64_t archiveSize = getU64(&f[pos]); pos += 8;
     uint32_t slots = getU32(&f[pos]); pos += 4;
-    if (ver != 1 || alg != 1) { r.message = L"Unsupported sealed-file version/algorithm."; return r; }
+    if (ver != (v2 ? kSealVersion2 : kSealVersion1) || alg != kAeadAesGcm) {
+        r.message = L"Unsupported sealed-file version/algorithm."; return r;
+    }
 
     uint8_t dek[32]; bool unlocked = false;
-    for (uint32_t i = 0; i < slots && !unlocked; i++) {
-        if (!need(4)) { r.message = L"Sealed file is truncated (slots)."; return r; }
+    bool sawUnknownSlot = false;
+    for (uint32_t i = 0; i < slots; i++) {
+        if (!need(v2 ? 8u : 4u)) { r.message = L"Sealed file is truncated (slots)."; return r; }
         uint32_t type = getU32(&f[pos]); pos += 4;
-        if (type != 1) { r.message = L"Unsupported unlock-slot type (newer IDE?)."; return r; }   // can't skip unknown-length slots
-        if (!need(16 + 8 + 12 + 32 + 16)) { r.message = L"Sealed file is truncated (password slot)."; return r; }
-        const uint8_t* salt = &f[pos]; pos += 16;
-        uint64_t iters = getU64(&f[pos]); pos += 8;
-        const uint8_t* nonce = &f[pos]; pos += 12;
-        Bytes wrapped(&f[pos], &f[pos] + 32); pos += 32;
-        uint8_t tag[16]; memcpy(tag, &f[pos], 16); pos += 16;
-        uint8_t kek[32];
-        if (sealPbkdf2(password, salt, 16, iters, kek, 32)) {
-            Bytes dekOut;
-            if (sealAesGcm(false, kek, nonce, wrapped, dekOut, tag) && dekOut.size() == 32) { memcpy(dek, dekOut.data(), 32); unlocked = true; }
-            SecureZeroMemory(kek, 32);
+        // v1 has no slot_len, so its only navigable slot type is the password one.
+        uint32_t slen = kPasswordSlotLen;
+        if (v2) { slen = getU32(&f[pos]); pos += 4; }
+        else if (type != kSlotPassword) { r.message = L"Unsupported unlock-slot type (newer IDE?)."; return r; }
+        if (!need(slen)) { r.message = L"Sealed file is truncated (slot body)."; return r; }
+        const uint8_t* body = &f[pos];
+
+        // Try this slot only if we still need a DEK and we understand the shape.
+        // Everything else is stepped over via slen — that is the whole point of v2.
+        if (!unlocked && type == kSlotPassword && slen == kPasswordSlotLen) {
+            const uint8_t* salt = body;
+            uint64_t iters = getU64(body + 16);
+            const uint8_t* nonce = body + 24;
+            Bytes wrapped(body + 36, body + 68);
+            uint8_t tag[16]; memcpy(tag, body + 68, 16);
+            if (iters >= kMinPbkdf2Iters && iters <= kMaxPbkdf2Iters) {
+                uint8_t kek[32];
+                if (sealPbkdf2(password, salt, 16, iters, kek, 32)) {
+                    Bytes dekOut;
+                    if (sealAesGcm(false, kek, nonce, wrapped, dekOut, tag) && dekOut.size() == 32) {
+                        memcpy(dek, dekOut.data(), 32); unlocked = true;
+                    }
+                    SecureZeroMemory(kek, 32);
+                    SecureZeroMemory(dekOut.data(), dekOut.size());
+                }
+            }
+        } else if (!unlocked && type != kSlotPassword) {
+            sawUnknownSlot = true;
         }
+        pos += slen;   // ALWAYS advance, unlocked or not — v1 broke exactly here
     }
-    if (!unlocked) { r.message = L"Wrong password — could not unlock the project."; return r; }
+    if (!unlocked) {
+        r.message = sawUnknownSlot
+            ? L"Wrong password, and this file also carries unlock methods this build doesn't support (newer IDE?)."
+            : L"Wrong password — could not unlock the project.";
+        return r;
+    }
 
     if (!need(12 + 8)) { SecureZeroMemory(dek, 32); r.message = L"Sealed file is truncated (payload)."; return r; }
     const uint8_t* pnonce = &f[pos]; pos += 12;
     uint64_t plen = getU64(&f[pos]); pos += 8;
-    if (!need((size_t)plen + 16)) { SecureZeroMemory(dek, 32); r.message = L"Sealed file is truncated (payload body)."; return r; }
+    if (plen > (uint64_t)remaining() || remaining() - (size_t)plen < 16) {
+        SecureZeroMemory(dek, 32); r.message = L"Sealed file is truncated (payload body)."; return r;
+    }
     Bytes payload(&f[pos], &f[pos] + plen); pos += (size_t)plen;
     uint8_t ptag[16]; memcpy(ptag, &f[pos], 16); pos += 16;
 
+    // v2 binds the 24-byte header prefix into the payload tag, so a tampered
+    // archive_size fails here rather than steering the allocation below. v1 files
+    // have no AAD to check — read as-is; that exposure is why v2 exists.
     Bytes comp;
-    bool decOk = sealAesGcm(false, dek, pnonce, payload, comp, ptag);
+    bool decOk = sealAesGcm(false, dek, pnonce, payload, comp, ptag,
+                            v2 ? f.data() : nullptr, v2 ? (ULONG)kSealAadLen : 0);
     SecureZeroMemory(dek, 32);
     if (!decOk) { r.message = L"Payload failed authentication — the sealed file is corrupt or tampered."; return r; }
     Bytes archive; if (!sealDecompress(comp, (size_t)archiveSize, archive)) { r.message = L"Decompression failed."; return r; }
