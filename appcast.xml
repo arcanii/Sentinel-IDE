@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Sentinel-IDE Updates</title>
+    <link>https://raw.githubusercontent.com/arcanii/Sentinel-IDE/main/appcast.xml</link>
+    <description>Most recent updates to Sentinel-IDE</description>
+    <language>en</language>
+    <item>
+      <title>Version 0.1.0.127</title>
+      <sparkle:releaseNotesLink>https://github.com/arcanii/Sentinel-IDE/releases/tag/v0.1.0</sparkle:releaseNotesLink>
+      <pubDate>Sun, 19 Jul 2026 14:36:51 +0000</pubDate>
+      <enclosure url="https://github.com/arcanii/Sentinel-IDE/releases/download/v0.1.0/Sentinel-IDE-0.1.0.127-setup.exe"
+                 sparkle:version="0.1.0.127"
+                 sparkle:edSignature="MAGZc1KenKHNPmNXO8Fq8gUcEiXLvzWAo6p6aYEoibakbDlkCrlEo0fuD51p3TK/tCweBe77/o4/ZocvfjemCA=="
+                 length="3606090"
+                 type="application/octet-stream"/>
+    </item>
+  </channel>
+</rss>
