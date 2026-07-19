@@ -247,8 +247,10 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     **Ships inactive on purpose:** `kEdDsaPublicKey` is the placeholder `@@SENTINEL_IDE_…@@`, and
     while it is, the updater refuses to init, logs a warning, and the menu item is **hidden** (not
     greyed) — an updater that cannot verify a signature must not look like it works. Activate by
-    generating a **dedicated** key pair with WinSparkle's `generate_keys.exe` and pasting the public
-    half; the private half stays in the Windows credential store, never the repo.
+    generating a **dedicated** key pair with `winsparkle-tool.exe generate-key --file <path>` (from
+    the WinSparkle 0.9.3 zip — 0.9.3 no longer ships the older `generate_keys.exe`/`sign_update.exe`)
+    and pasting the public half. **The private key is a FILE**, not a credential-store entry — keep
+    it outside the repo; `.gitignore`'s `*.key` is only a backstop. See `docs/RELEASING.md`.
     **Also fixed a real hang in all five modal dialogs** (not just the one hosting the menu item):
     each ran `while (!st.done && GetMessageW(...) > 0)`, and `GetMessageW` returns 0 for `WM_QUIT`
     **and consumes it** — so when WinSparkle posts `WM_CLOSE` to install, the nested loop ate the

@@ -29,30 +29,45 @@ to work while being unable to verify a signature.
 
 To activate:
 
-1. **Get the tools.** They are **not** in `third_party/winsparkle/` — we vendored only the
-   DLL, import library and headers. `generate_keys.exe` and `sign_update.exe` ship in the
-   **WinSparkle release zip**: <https://github.com/vslavik/winsparkle/releases> (match the
-   version we vendor, **0.9.3**). Unpack somewhere outside the repo; they are release
-   tooling, not build inputs.
+1. **Get the tool.** It is **not** in `third_party/winsparkle/` — we vendored only the DLL,
+   import library and headers. Download the **WinSparkle release zip** matching the version we
+   vendor, **0.9.3** (<https://github.com/vslavik/winsparkle/releases> →
+   `WinSparkle-0.9.3.zip`, 27,194,631 bytes). The tool is `bin\winsparkle-tool.exe`. Unpack
+   outside the repo — it is release tooling, not a build input.
+
+   > Older WinSparkle shipped separate `generate_keys.exe` / `sign_update.exe`. **0.9.3 has
+   > neither**; everything is subcommands of the single `winsparkle-tool.exe`. Documentation
+   > elsewhere (including RabbitEars' `docs/RELEASING.md`) still names the old tools.
+   >
+   > Worth knowing: the zip's binaries are **not Authenticode-signed**. Verify the download by
+   > cross-checking a file you already trust — `x64\Release\WinSparkle.dll` in the zip is
+   > byte-identical (SHA-256 `A69ACFCB…8B37`) to `third_party/winsparkle/bin/x64/WinSparkle.dll`
+   > in this repo, which arrived independently. Confirmed 2026-07-19.
 
 2. **Generate a dedicated key pair.**
    ```
-   generate_keys.exe
+   winsparkle-tool.exe generate-key --file <path>\sentinel-ide.key
    ```
-   With no arguments it creates a new Ed25519 pair, stores the **private key in the Windows
-   credential store** (under the current user — it never touches the filesystem, so there is
-   no key file to leak or accidentally commit), and prints the **base64 public key** to
-   stdout. Run it again later with no arguments and it prints the existing public key rather
-   than overwriting — so it is safe to re-run to recover the public half.
+   This writes a **44-byte private key FILE** at the path you give and prints the base64 public
+   key, along with the exact `win_sparkle_set_eddsa_public_key("…")` line to paste.
+
+   > ⚠ **The private key is a file on disk** — it is *not* stored in the Windows credential
+   > store. Put it somewhere outside this repository. `.gitignore` covers `*.key`, so naming it
+   > `something.key` is protected if it ever lands in the tree, but a name like `mykey.txt`
+   > is **not** — do not rely on the ignore rule as the primary defence.
 
    Use a dedicated pair rather than the family key that signs RabbitEars and the macOS apps:
    a compromise here then cannot ship a malicious update for those products.
 
-3. **Back up the private key before doing anything else.** It lives in *your Windows user
-   profile's* credential store. If the machine dies or the profile is lost, **no existing
-   install can ever be updated again** — clients reject anything signed by a different key,
-   and the only recovery is a manual re-install by every user. Export it and store it
-   somewhere durable and offline.
+3. **Back up that key file before doing anything else**, offline and durably. If it is lost,
+   **no existing install can ever be updated again** — clients reject anything signed by a
+   different key, and the only recovery is a manual re-install by every user.
+
+   To recover just the public half later (the private key file is the only thing that matters
+   to keep):
+   ```
+   winsparkle-tool.exe public-key --private-key-file <path>\sentinel-ide.key
+   ```
 
 4. **Paste the public key** into `kEdDsaPublicKey` in `src/host/win32/Updater.cpp`, replacing
    `@@SENTINEL_IDE_ED25519_PUBLIC_KEY@@`. That value is *meant* to be public and committed —
@@ -75,9 +90,10 @@ To activate:
    Windows resource that this exe does not ship — leaving the updater running with **no trust
    anchor at all**. Verified by compiling a deliberately truncated key.
 
-**Never commit the private key.** `.gitignore` covers `*.key`, but the credential store is
-the intended home — `generate_keys.exe` writes no key file, so there should be nothing on disk
-to commit in the first place.
+**Never commit the private key.** It **is** a real file — `winsparkle-tool generate-key` writes
+one wherever `--file` points. Keep it outside this repository entirely. `.gitignore` covers
+`*.key` as a backstop (verified: `sentinel-ide.key` is ignored, `mykey.txt` is **not**), but
+treat that as a safety net, never as the plan.
 
 > **Alternative worth knowing:** WinSparkle can also read the public key from a Windows
 > resource named `EdDSAPub` of type `EDDSA` instead of a compile-time call. We use the explicit
@@ -96,8 +112,6 @@ to commit in the first place.
    ```cmd
    cmd /c scripts\make-installer.bat
    ```
-   → `build\installer\Sentinel-IDE-0.1.0-setup.exe`
-
    → `build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe`
 
    The installer is **x64-only** (`ArchitecturesAllowed=x64compatible`) and runs Setup in
@@ -119,17 +133,29 @@ to commit in the first place.
    > on these as release identities, consider deriving the number from
    > `git rev-list --count HEAD` or moving the increment after `BUILD_OK`.
 
-3. **Sign the installer** with the private key:
+3. **Sign the installer** with the private key. The tool prints one base64 line and nothing
+   else, so it is safe to capture directly:
    ```cmd
-   sign_update.exe build\installer\Sentinel-IDE-0.1.0-setup.exe
+   winsparkle-tool.exe sign --private-key-file <path>\sentinel-ide.key ^
+        build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe
    ```
-   (`sign_update.exe` ships in the same WinSparkle release zip.) Copy the printed
-   base64 signature.
+
+   Then **verify your own signature before publishing it** — this catches a wrong key file or
+   a stale installer path before any client ever sees the feed:
+   ```cmd
+   winsparkle-tool.exe verify --public-key <the base64 public key> ^
+        --signature <the signature just printed> ^
+        build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe
+   ```
+   `Valid signature.` and exit 0 is a pass; a wrong key gives `Failed: signature is invalid.`
+   and exit 1. (Both outcomes confirmed against a throwaway key on 2026-07-19.) The public key
+   here must be the same one compiled into `Updater.cpp`, so this also checks that the shipped
+   binary will actually accept what you are about to publish.
 
 4. **Generate the appcast:**
    ```cmd
    pwsh scripts\make-appcast.ps1 -Version 0.1.0.<n> ^
-        -SetupExe build\installer\Sentinel-IDE-0.1.0-setup.exe -Signature <base64>
+        -SetupExe build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe -Signature <base64>
    ```
    `-Version` **must** equal the running build's `SENTINEL_FILEVERSION_STR`. WinSparkle
    compares that string against `sparkle:version`; a mismatch either never offers the
@@ -181,6 +207,6 @@ the **About box** (next to the version it reports), or WinSparkle's periodic bac
   not suppress SmartScreen. Needs an OV/EV code-signing certificate (hardware token or a
   cloud signer such as Azure Trusted Signing). When one exists: sign the exe **before**
   packaging, re-pack, sign the installer, then take the Ed25519 signature over the final
-  signed bytes — Authenticode first, `sign_update` second, always with `/tr` timestamping.
+  signed bytes — Authenticode first, `winsparkle-tool sign` second, always with `/tr` timestamping.
 - **Delta updates** — WinSparkle downloads the full installer each time.
 - **Release channels** (beta/stable) — one feed today.

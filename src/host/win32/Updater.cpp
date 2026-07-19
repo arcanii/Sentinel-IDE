@@ -25,10 +25,11 @@ constexpr char kAppcastUrl[] =
 // between an update check and running an attacker's binary — the feed is plain
 // HTTPS off a CDN, so transport security alone is not the guarantee here.
 //
-// Generate with `generate_keys.exe` from the WinSparkle release zip
-// (https://github.com/vslavik/winsparkle/releases); it keeps the private key in the
-// Windows credential store and prints the public half. Paste that here.
-// The private key must never enter this repo.
+// Generate with `winsparkle-tool.exe generate-key --file <path>\sentinel-ide.key` from the
+// WinSparkle 0.9.3 release zip (https://github.com/vslavik/winsparkle/releases); it prints
+// the base64 public half to paste here. NOTE the private key is a FILE on disk (0.9.3 does
+// not use the Windows credential store, and no longer ships the older generate_keys.exe) —
+// keep it outside this repo. See docs/RELEASING.md.
 constexpr char kEdDsaPublicKey[] = "@@SENTINEL_IDE_ED25519_PUBLIC_KEY@@";
 
 // True once a real key has been pasted above. Until then we refuse to run any check
@@ -88,7 +89,8 @@ void initUpdater(HWND mainWnd) {
     if (!win_sparkle_set_eddsa_public_key(kEdDsaPublicKey)) {
         logMsg(LogLevel::Error,
                L"Updater: WinSparkle rejected the EdDSA public key — auto-update disabled. "
-               L"It must be the bare base64 line printed by generate_keys.exe. See docs/RELEASING.md.");
+               L"It must be the bare base64 line printed by `winsparkle-tool generate-key`. "
+               L"See docs/RELEASING.md.");
         return;
     }
     win_sparkle_set_can_shutdown_callback(onCanShutdown);
