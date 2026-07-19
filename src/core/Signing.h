@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SentinelIDE signing/trust model (ADR 0061). Parses the consumer trust manifest
-// (`sentinel-trust.toml` — [dependencies.<name>] with key/policy/grants/forbids)
-// and detached `.sig` carriers, and wraps `snc keygen/sign/verify`. The shipped
-// snc C1.0b release lacks these subcommands; the build dated 2026-06-28 (and the
-// debug build) has them — sncSupportsSigning() probes for it. Header-only.
+// and detached `.sig` carriers, and wraps `snc keygen/sign/verify`. Header-only.
+//
+// TRUST MANIFEST SCHEMA — this must match snc exactly, or builds break. snc's
+// parser (crates/sentinel-trust/src/trust_model.rs) is `deny_unknown_fields` over:
+//     [[keys]]
+//     name   = "label"                      # optional, diagnostics only
+//     pubkey = "<64 hex chars>"             # REQUIRED. Bare hex — an "ed25519:"
+//                                           # prefix parses but never matches,
+//                                           # silently yielding UNTRUSTED.
+//     grants = ["secret", "..."]            # optional capability ceiling
+// There is no [dependencies.<name>], no `sig`/`key`, no `policy`, no `forbids` —
+// those are hard parse errors that abort `snc build --require-signatures` in BOTH
+// warn and strict. Keep this parser and SigningDialog's writer in lockstep with it.
+//
+// sncSupportsSigning() probes `snc help` for the ADR-0061 subcommands (both the
+// release and debug snc builds carry them as of 2026-07).
 #pragma once
 #include <windows.h>
 #include <string>
@@ -16,13 +28,15 @@ namespace sentinelide {
 
 enum class SignState { Unknown, Unsigned, Checking, Signed, Invalid };
 
-struct TrustDep {
-    std::wstring name, key, policy = L"exact-key";
-    std::vector<std::wstring> grants, forbids;
+// One [[keys]] entry: a trusted Ed25519 public key (bare 64-hex), an optional
+// label, and an optional capability ceiling intersected with the signature's grants.
+struct TrustedKey {
+    std::wstring name, pubkey;
+    std::vector<std::wstring> grants;
 };
 struct TrustManifest {
     bool loaded = false;
-    std::vector<TrustDep> deps;
+    std::vector<TrustedKey> keys;
 };
 
 // Detached-signature fields (the human-readable `.sig` carrier).
@@ -41,32 +55,28 @@ inline TrustManifest loadTrust(const std::wstring& path) {
     TrustManifest m;
     std::wstring text = readUtf8(path);
     if (text.empty()) return m;
-    TrustDep* cur = nullptr;
+    TrustedKey* cur = nullptr;
     auto handle = [&](std::wstring l) {
         std::wstring t = projTrim(l);
         if (t.empty() || t[0] == L'#') return;
-        if (t[0] == L'[') {
-            size_t e = t.find(L']');
-            std::wstring sec = projTrim(t.substr(1, (e == std::wstring::npos ? t.size() : e) - 1));
-            const std::wstring pre = L"dependencies.";
-            if (sec.size() > pre.size() && sec.compare(0, pre.size(), pre) == 0) {
-                m.deps.push_back(TrustDep{}); cur = &m.deps.back(); cur->name = sec.substr(pre.size());
-            } else cur = nullptr;
+        if (t.size() >= 2 && t[0] == L'[' && t[1] == L'[') {          // [[keys]] array-of-tables
+            if (t.find(L"keys") != std::wstring::npos) { m.keys.push_back(TrustedKey{}); cur = &m.keys.back(); }
+            else cur = nullptr;
             return;
         }
+        if (t[0] == L'[') { cur = nullptr; return; }                  // any other table closes the block
         if (!cur) return;
         size_t eq = t.find(L'=');
         if (eq == std::wstring::npos) return;
         std::wstring k = projTrim(t.substr(0, eq)), v = t.substr(eq + 1);
-        if (k == L"sig" || k == L"key")   cur->key = projUnq(v);
-        else if (k == L"policy")          cur->policy = projUnq(v);
-        else if (k == L"grants")          cur->grants = parseInlineArr(v);
-        else if (k == L"forbids")         cur->forbids = parseInlineArr(v);
+        if (k == L"pubkey")      cur->pubkey = projUnq(v);
+        else if (k == L"name")   cur->name = projUnq(v);
+        else if (k == L"grants") cur->grants = parseInlineArr(v);
     };
     std::wstring line;
     for (wchar_t c : text) { if (c == L'\n') { if (!line.empty() && line.back() == L'\r') line.pop_back(); handle(line); line.clear(); } else line += c; }
     if (!line.empty()) handle(line);
-    m.loaded = !m.deps.empty();
+    m.loaded = !m.keys.empty();
     return m;
 }
 

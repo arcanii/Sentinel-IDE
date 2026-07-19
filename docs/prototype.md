@@ -1,4 +1,4 @@
-# SentinelIDE — Win32 prototype
+# Sentinel-IDE — Win32 prototype
 
 Native Windows IDE for the Sentinel language, built from the UX spines
 (`_bmad-output/planning-artifacts/ux-designs/ux-SentinelIDE-2026-06-27/DESIGN.md` +
@@ -7,34 +7,38 @@ Win32 + Common Controls v6, MSVC/Ninja, C++17.
 
 ## Build & run
 - `scripts\build.bat` — configures + builds with the VS-bundled CMake/Ninja + MSVC.
-- Output: `build\SentinelIDE.exe`.
+- Output: `build\Sentinel-IDE.exe`.
 - Requires Visual Studio 2026 (MSVC) at the path set in `scripts\build.bat`.
 
 ## Layout
 - `CMakeLists.txt` — build (links comctl32, dwmapi, uxtheme, gdi32, …).
 - `packaging/app.manifest` + `SentinelIDE.rc` — Common Controls v6, per-monitor-v2 DPI, UTF-8.
-- `src/ui/Theme.h` — the palette: **code embodiment of DESIGN.md** (dark/coral, OS light/dark
+- `src/host/win32/Theme.h` — the palette: **code embodiment of DESIGN.md** (dark/coral, OS light/dark
   follow, `diag-*` + `trust-verified` tokens). Change colors here.
-- `src/WinMain.cpp` — entry point.
-- `src/ui/MainWindow.{h,cpp}` — the window: DWM dark titlebar, owner-drawn toolbar with the
+- `src/host/win32/WinMain.cpp` — entry point.
+- `src/host/win32/MainWindow.{h,cpp}` — the window: DWM dark titlebar, owner-drawn toolbar with the
   `≡` popup menu, three regions (tree | editor | bottom dock), status bar + signing chip.
-- `src/ui/SettingsDialog.{h,cpp}` / `src/ui/ProjectSettingsDialog.{h,cpp}` / `src/ui/SigningDialog.{h,cpp}` / `src/ui/AboutDialog.{h,cpp}`
+- `src/host/win32/SettingsDialog.{h,cpp}` / `src/host/win32/ProjectSettingsDialog.{h,cpp}` / `src/host/win32/SigningDialog.{h,cpp}` / `src/host/win32/AboutDialog.{h,cpp}`
   — the themed modal dialogs (app Settings; the structured Project Settings form; the Signing & Trust panel; the About box).
 - `src/core/Project.h` — `sentinel.toml` model (incl. `[[target]]`) + `loadProject`/`saveProject`
   (the writer rewrites only managed values and preserves comments + unmodeled keys, including target blocks).
+- `src/core/Seal.h` — sealed projects: archive → LZMS → AES-256-GCM under a random DEK, LUKS-style unlock slots.
+- `src/core/Settings.h` — `settings.ini` (font/theme/log/toolchain + the `[recents]` project list).
+- `src/core/FileAssoc.h` — per-user `.sntproject`/`.sentinel` file associations.
+- `src/core/Logger.h` — thread-safe append logfile.
 - `src/core/Proc.h` — synchronous `runCapture` + `stripAnsi`.
 - `src/core/Signing.h` — ADR-0061 trust-manifest + `.sig` parsers, `verifyFile`, `sncSupportsSigning`.
 - `src/core/Toolchain.h` — `findVcvars` (auto-detect MSVC env) + `captureMsvcEnv` (vcvars → build env block).
 
-## Status — Phase 5: DONE · prototype roadmap (1–5) complete
+## Status — phases 1–29 complete (1–17 detailed below; 18–29 in [HANDOVER.md](HANDOVER.md))
 A real, native Win32 IDE built from the UX spines + `Theme.h`:
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar (signing chip).
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project.
 3. **Syntax highlighting** — Sentinel keywords (incl. `secret`/`declassify`), strings, numbers, comments per `Theme.h`.
-4. **Build/Run loop** — `snc.exe` on a worker thread; live-streamed Output (ANSI-stripped) with the exact command + exit code; miette diagnostics (`file:line:col`) parsed into a clickable Problems list. Building `examples\crypto.sentinel` reproduces the real Windows link gap (PRD §14 / gap #1 / UJ-3).
+4. **Build/Run loop** — `snc.exe` on a worker thread; live-streamed Output (ANSI-stripped) with the exact command + exit code; miette diagnostics (`file:line:col`) parsed into a clickable Problems list. Building `examples\crypto.sentinel` originally reproduced the real Windows link gap (PRD §14 / gap #1 / UJ-3) — **resolved in phase 13** by injecting the auto-detected MSVC env.
 5. **Logging + Settings** — a configurable logfile (level + location) under `%LOCALAPPDATA%\SentinelIDE\logs\`; a themed Settings dialog (editor font, theme follow/light/dark, log level + location + Reveal) persisted to `settings.ini` and applied live.
 
-6. **Project model + app icon** — a Sentinel **project** (`sentinel.toml`): executable/library (later shared/dll), `lib_paths`/`links`, signing via `sentinel-trust.toml` (native ADR-0061 Ed25519 trust), and an **Xcode-style scheme selector** at the top: target · **tier** ▾ · output path. Tiers are Sentinel's **release tiers** (TIERED_RELEASES.md) — **Development / Experimental / Stable / Hardened** — selecting one sets `target/<tier>/`. Open Folder auto-detects a project; Build composes the right `snc` command per type+tier. App icon from `art/S_icon.png` (→ `packaging/app.ico`). See [sentinel-project.md](sentinel-project.md).
+6. **Project model + app icon** — a Sentinel **project** (`sentinel.toml`): executable/library (later shared/dll), `lib_paths`/`links`, signing via `sentinel-trust.toml` (native ADR-0061 Ed25519 trust), and an **Xcode-style scheme selector** at the top: target · **tier** ▾ · output path. Tiers are Sentinel's **release tiers** (TIERED_RELEASES.md) — **Development / Experimental / Stable / Hardened** — selecting one sets `target/<tier>/`. Open Folder auto-detects a project; Build composes the right `snc` command per type+tier. App icon from `art/S_icon.png` (→ `packaging/app.ico`) — *replaced by `art/S2_icon.png` in phase 12*. See [sentinel-project.md](sentinel-project.md).
 
 7. **Tier scheme selector** — Xcode-style top selector (target · tier ▾ · output); tiers set `target/<tier>/`.
 8. **Explorer views** — **Project** + **Files** tabs over a themed `WC_TREEVIEW`.
@@ -61,13 +65,11 @@ A real, native Win32 IDE built from the UX spines + `Theme.h`:
     a toggleable **line-number gutter** (Ctrl+L, persisted); **error lines** tinted after a build; a real accelerator table.
 
 Each phase verified by build + run + screenshot (`docs/screenshots/phase1..15*.png`).
-CLI: `SentinelIDE.exe <file|folder> [--build] [--settings] [--project-settings] [--signing] [--tier <name>]`.
+CLI: `Sentinel-IDE.exe <file|folder> [--build] [--settings] [--project-settings] [--signing] [--tier <name>]`.
 
 ## Follow-ups (beyond the prototype roadmap)
-- **Signing** — gate Build on `require = strict` end-to-end; sign the *built artifact* once the link gap closes; editable trust policy/grants beyond add+import; a default-key setting.
-- **Targets** — per-target editing in the Project Settings form (today it edits project-level fields and preserves `[[target]]`); per-target `lib_paths`; a definable output dir.
+- **Signing** — editable trust grants beyond add+import; a default-key setting; surface capability-bound verify failures as Problems. (Build gating on `require` and post-build artifact signing shipped — phases 13 + 23; the trust manifest was wired to the real `[[keys]]` schema in phase 29.)
+- **Targets** — per-target `lib_paths`; a definable output dir; add/remove `[[target]]` blocks from the form. (Per-target editing shipped — phase 22.)
 - **Project Settings polish** — `entry`-exists validation; surface `icon`/`authors` in the form.
-- **Dark popup menu** — the `≡` menu is the OS-light popup; theme it dark.
-- **Clickable Output `file:line`** — currently navigation is via the Problems list (double-click); add direct Output-line clicks.
 - **Direct2D editor** — swap RichEdit for a GPU text editor (the native-perf target, as in the SQLTerminal reference).
 - **Accessibility** — backlogged per the UX decision; add the Settings build-command field.

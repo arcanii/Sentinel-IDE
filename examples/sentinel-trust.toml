@@ -1,9 +1,20 @@
 # sentinel-trust.toml — the consumer trust manifest (ADR 0061).
-# The "signing confirmations": which keys are trusted, under what policy, and
-# bounded to which capabilities. snc --require-signatures gates the build against it.
+#
+# Which Ed25519 keys this project trusts, and the capability ceiling each one is
+# bounded to. Consumed by:
+#     snc build <entry> --require-signatures warn|strict --trust <this file>
+# The IDE passes both flags automatically whenever [signing] require != "off".
+#
+# Schema is exactly what snc's parser accepts (crates/sentinel-trust/src/trust_model.rs,
+# which is deny_unknown_fields): an array of [[keys]] tables, each with a REQUIRED
+# `pubkey` of 64 bare hex chars, plus optional `name` and `grants`.
+#   - Do NOT prefix the key with "ed25519:" — it parses, then never matches, and the
+#     unit reads as UNTRUSTED (configured-looking but enforcing nothing).
+#   - There is no `policy` or `forbids` key in v1; they are hard parse errors that
+#     abort the build in BOTH warn and strict.
 
-[dependencies.std-security]
-sig     = "ed25519:RWQexampleFingerprintReplaceWithRealKey00000="
-policy  = "exact-key"
-grants  = ["secret", "constant_time", "alloc"]
-forbids = ["network", "filesystem", "subprocess"]
+# The key that signed crypto.sentinel (see crypto.sentinel.sig).
+[[keys]]
+name   = "Sentinel-IDE demo key"
+pubkey = "58ad2d8cf5294de180a25c2cb8046f422d114dbb5c8a3a91f6483b0b9c476ca5"
+grants = ["secret", "constant_time", "alloc"]

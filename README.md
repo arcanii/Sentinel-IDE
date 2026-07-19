@@ -1,6 +1,6 @@
 # Sentinel-IDE
 
-A native, **Windows-first IDE for the [Sentinel](https://github.com/) language** — built, increasingly, *in* Sentinel. The long-term thesis: a thin native host that shrinks over time as more of the IDE is rewritten in Sentinel itself.
+A native, **Windows-first IDE for the Sentinel language** — built, increasingly, *in* Sentinel. The long-term thesis: a thin native host that shrinks over time as more of the IDE is rewritten in Sentinel itself.
 
 > **Status: early prototype / work in progress.** It builds and runs, with a real feature set (below), but it's Windows-only, depends on a local `snc` (the Sentinel compiler) to build Sentinel code, and the build script has machine-specific paths. Treat it as a working spike, not a release.
 
@@ -45,9 +45,9 @@ scripts\make-installer.bat   :: → build\installer\Sentinel-IDE-0.1.0-setup.exe
 
 | Path | What |
 |---|---|
-| `src/ui/MainWindow.cpp` | The app (window, toolbar, tree, editor, dock, build/run, project) |
-| `src/ui/*Dialog.{h,cpp}` | Themed modal dialogs (Settings, Project Settings, Signing, About, Password) |
-| `src/ui/Theme.h` | Dark/coral palette + dark-mode helpers |
+| `src/host/win32/MainWindow.cpp` | The app (window, toolbar, tree, editor, dock, build/run, project) |
+| `src/host/win32/*Dialog.{h,cpp}` | Themed modal dialogs (Settings, Project Settings, Signing, About, Password) |
+| `src/host/win32/Theme.h` | Dark/coral palette + dark-mode helpers |
 | `src/core/*.h` | Project model, signing, sealing, toolchain detection, settings, logging |
 | `tools/loc.sentinel` | Lines-of-code counter, written in Sentinel |
 | `examples/` | A sample Sentinel project (signed demo) |

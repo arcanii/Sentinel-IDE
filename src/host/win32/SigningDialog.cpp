@@ -67,14 +67,13 @@ void fillTrustList(HWND list, const std::wstring& trustPath) {
     ListView_DeleteAllItems(list);
     TrustManifest m = loadTrust(trustPath);
     int row = 0;
-    for (auto& d : m.deps) {
-        LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = row; it.pszText = const_cast<LPWSTR>(d.name.c_str());
+    for (auto& k : m.keys) {
+        std::wstring label = k.name.empty() ? L"(unnamed)" : k.name;
+        LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = row; it.pszText = const_cast<LPWSTR>(label.c_str());
         ListView_InsertItem(list, &it);
-        std::wstring key = shortKey(d.key), grants = joinCsv(d.grants), forbids = joinCsv(d.forbids);
+        std::wstring key = shortKey(k.pubkey), grants = joinCsv(k.grants);
         ListView_SetItemText(list, row, 1, const_cast<LPWSTR>(key.c_str()));
-        ListView_SetItemText(list, row, 2, const_cast<LPWSTR>(d.policy.c_str()));
-        ListView_SetItemText(list, row, 3, const_cast<LPWSTR>(grants.c_str()));
-        ListView_SetItemText(list, row, 4, const_cast<LPWSTR>(forbids.c_str()));
+        ListView_SetItemText(list, row, 2, const_cast<LPWSTR>(grants.c_str()));
         row++;
     }
 }
@@ -157,22 +156,30 @@ void doImport(HWND hwnd, SignDlg& st) {
     if (!si.present || si.key.empty()) { MessageBoxW(hwnd, L"This file has no signature to trust — sign it first.", L"Import", MB_OK | MB_ICONINFORMATION); return; }
     std::wstring name = stem(st.file);
     TrustManifest m = loadTrust(st.trustPath);
-    for (auto& d : m.deps) if (d.name == name) { MessageBoxW(hwnd, (L"'" + name + L"' is already in the trust manifest.").c_str(), L"Import", MB_OK | MB_ICONINFORMATION); return; }
+    for (auto& k : m.keys)
+        if (_wcsicmp(k.pubkey.c_str(), si.key.c_str()) == 0) {
+            MessageBoxW(hwnd, L"That key is already in the trust manifest.", L"Import", MB_OK | MB_ICONINFORMATION); return;
+        }
 
-    std::wstring block = L"\n[dependencies." + name + L"]\n";
-    block += L"sig     = \"ed25519:" + si.key + L"\"\n";
-    block += L"policy  = \"exact-key\"\n";
+    // snc's schema (deny_unknown_fields): [[keys]] with a BARE 64-hex pubkey. An
+    // "ed25519:" prefix parses but never matches — it would silently read as UNTRUSTED.
+    std::wstring block = L"\n[[keys]]\n";
+    block += L"name   = \"" + name + L"\"\n";
+    block += L"pubkey = \"" + si.key + L"\"\n";
     auto grants = splitCsv(si.grants);
-    if (!grants.empty()) { std::wstring g; for (size_t i = 0; i < grants.size(); ++i) { if (i) g += L", "; g += L"\"" + grants[i] + L"\""; } block += L"grants  = [" + g + L"]\n"; }
+    if (!grants.empty()) { std::wstring g; for (size_t i = 0; i < grants.size(); ++i) { if (i) g += L", "; g += L"\"" + grants[i] + L"\""; } block += L"grants = [" + g + L"]\n"; }
 
     std::wstring text = readUtf8(st.trustPath);
-    if (text.empty()) text = L"# sentinel-trust.toml — consumer trust manifest (ADR 0061).\n";
+    if (text.empty())
+        text = L"# sentinel-trust.toml — consumer trust manifest (ADR 0061).\n"
+               L"# Schema: [[keys]] with a bare 64-hex `pubkey` (no \"ed25519:\" prefix).\n"
+               L"# Consumed by: snc build --require-signatures warn|strict --trust <this file>\n";
     text += block;
     std::wstring crlf; for (wchar_t c : text) { if (c == L'\r') continue; if (c == L'\n') crlf += L"\r\n"; else crlf += c; }
     if (!writeUtf8(st.trustPath, crlf)) { MessageBoxW(hwnd, L"Could not write the trust manifest.", L"Import", MB_OK | MB_ICONERROR); return; }
-    logMsg(LogLevel::Info, L"Trust: added dependency '" + name + L"' (exact-key) to " + st.trustPath);
+    logMsg(LogLevel::Info, L"Trust: added key " + shortKey(si.key) + L" ('" + name + L"') to " + st.trustPath);
     fillTrustList(st.list, st.trustPath);
-    MessageBoxW(hwnd, (L"Added '" + name + L"' to the trust manifest as an exact-key dependency.").c_str(), L"Trust updated", MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(hwnd, (L"Added the key for '" + name + L"' to the trust manifest.").c_str(), L"Trust updated", MB_OK | MB_ICONINFORMATION);
 }
 
 LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
@@ -272,8 +279,8 @@ void showSigningDialog(HWND owner, const std::wstring& sncPath, bool sncSigns,
     { const Theme& th = currentTheme();
       SetWindowTheme(st.list, th.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
       ListView_SetBkColor(st.list, th.panelBg); ListView_SetTextColor(st.list, th.textPrimary); ListView_SetTextBkColor(st.list, th.panelBg); }
-    struct { const wchar_t* t; int w; } cols[] = { { L"Dependency", S(120) }, { L"Key", S(150) }, { L"Policy", S(80) }, { L"Grants", S(110) }, { L"Forbids", S(110) } };
-    for (int i = 0; i < 5; i++) { LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = (LPWSTR)cols[i].t; c.cx = cols[i].w; ListView_InsertColumn(st.list, i, &c); }
+    struct { const wchar_t* t; int w; } cols[] = { { L"Name", S(160) }, { L"Trusted key", S(210) }, { L"Grants (ceiling)", S(200) } };
+    for (int i = 0; i < 3; i++) { LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = (LPWSTR)cols[i].t; c.cx = cols[i].w; ListView_InsertColumn(st.list, i, &c); }
     fillTrustList(st.list, st.trustPath);
     yy += listH + S(8);
 

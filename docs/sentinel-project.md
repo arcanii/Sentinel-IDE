@@ -19,7 +19,7 @@ Source files, libraries, metadata, and signing confirmations live in / under the
   `src/`, else the project/root folder), writes a one-line header, then opens it and refreshes the
   tree so it appears under **Sources**.
 
-## `sentinel.toml`
+## The manifest (`*.sntproject`, else legacy `sentinel.toml`)
 
 ```toml
 [project]
@@ -27,7 +27,7 @@ name    = "crypto-lib"
 version = "0.1.0"
 type    = "executable"          # executable | library   (later: shared/dll)
 entry   = "crypto.sentinel"     # main module (exe) / root module (lib)
-icon    = "../art/S_icon.png"
+icon    = "../art/S2_icon.png"
 authors = ["Bryan"]
 
 [build]
@@ -97,14 +97,14 @@ Sentinel's build configurations are **release tiers**, not just debug/release:
 | S | **Stable** | selective check elision via a signed trust profile; mature code |
 | H | **Hardened** | *extra* checks: memory-poison, anti-tamper, ct-audit, CFI — security-critical |
 
-Opening a folder with `sentinel.toml` loads the project. The **top of the window** is an
+Opening a folder with a manifest (`*.sntproject`, else legacy `sentinel.toml`) loads the project. The **top of the window** is an
 Xcode-style **scheme selector** — two zones, **`target ▾ · tier ▾`**, plus the active
 target's output path — and the titlebar shows `project › target (type) · <Tier>`. The
 target dropdown lists all `[[target]]`s (also reachable from the **Targets** tree group);
 the tier picker offers all four tiers and sets the output dir (`target/<tier>/`). `snc` has
 **no tier flag yet** (TIERED_RELEASES is post-1.0), so every tier currently builds at `-O0`
 into its own dir — another forcing-function gap the IDE surfaces (FR-16).
-CLI: `SentinelIDE.exe <folder> --tier <name> [--build]`.
+CLI: `Sentinel-IDE.exe <folder> --tier <name> [--build]`.
 
 ## Explorer views
 
@@ -122,7 +122,7 @@ Both use a themed `WC_TREEVIEW` with an image list (project / folder / file / to
 
 ## Project Settings editor
 
-A themed modal form (`src/ui/ProjectSettingsDialog.cpp`) edits `sentinel.toml` without the
+A themed modal form (`src/host/win32/ProjectSettingsDialog.cpp`) edits `sentinel.toml` without the
 raw TOML: **Project** (name, version, type radios, entry combo populated from the project's
 `.sentinel` files), **Build** (source, lib_paths/links as comma-separated lists, default tier),
 and **Signing** (require off/warn/strict radios, trust path, sign checkbox). Opened from the
@@ -139,7 +139,7 @@ trailing newline.
 
 A status-bar **trust chip** reflects the open file's signature (✓ Signed / ⊘ Unsigned / ⚠
 Signature invalid), computed by an async `snc verify`. Clicking it (or `≡ ▸ Signing & Trust…`,
-or `--signing`) opens a panel (`src/ui/SigningDialog.cpp`) that runs the *real* ADR-0061
+or `--signing`) opens a panel (`src/host/win32/SigningDialog.cpp`) that runs the *real* ADR-0061
 subcommands — **`snc keygen`** (Generate Key), **`snc sign … --grant <cap>`** (Sign File),
 **`snc verify`** (Verify) — and views the consumer trust manifest (dependency · key · policy ·
 grants · forbids), with **Import current key as trusted** appending an `exact-key` dependency.
