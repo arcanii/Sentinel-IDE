@@ -30,7 +30,11 @@ constexpr char kAppcastUrl[] =
 // the base64 public half to paste here. NOTE the private key is a FILE on disk (0.9.3 does
 // not use the Windows credential store, and no longer ships the older generate_keys.exe) —
 // keep it outside this repo. See docs/RELEASING.md.
-constexpr char kEdDsaPublicKey[] = "@@SENTINEL_IDE_ED25519_PUBLIC_KEY@@";
+//
+// ⚠ THIS VALUE IS NOW LOAD-BEARING FOR EVERY INSTALLED COPY. Changing it orphans every
+// client already in the field: they will reject updates signed by any other key, and the
+// only recovery is a manual re-install by each user. Rotate only with a deliberate plan.
+constexpr char kEdDsaPublicKey[] = "rngndWCYiDprBlzu6ZkzEfnGL1gI0s7k8QwttQuakVQ=";
 
 // True once a real key has been pasted above. Until then we refuse to run any check
 // rather than run one that cannot verify a signature — an unconfigured updater that
