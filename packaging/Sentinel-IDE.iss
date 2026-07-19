@@ -71,6 +71,21 @@ ChangesAssociations=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
+; --- upgrade path (WinSparkle runs this installer over a live install) --------
+; WinSparkle launches setup with NO silent flags, so an auto-update walks the user
+; through the normal wizard. Two consequences handled here:
+;
+; CloseApplications/RestartApplications let Setup shut a running Sentinel-IDE down
+; rather than failing on a locked exe. The updater already posts WM_CLOSE before
+; handing over, but a second instance (or a hung one) would otherwise abort the
+; install with "cannot replace file" — the exact failure the shutdown coordination
+; in Updater.cpp exists to avoid, arriving by a different route.
+CloseApplications=yes
+RestartApplications=yes
+; Fewer pages to click through on an update; the group name never changes anyway.
+DisableProgramGroupPage=yes
+DisableReadyPage=yes
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 Name: "assoc"; Description: "Associate .sntproject and .sentinel files with {#AppName}"
