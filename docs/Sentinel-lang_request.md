@@ -8,6 +8,18 @@ _Every claim below was reproduced on this machine; the method is in section 1._
 > each item states what we tried, what we measured, what we did instead, and what "done"
 > would look like. Where we were wrong, we say so — four of our own initial conclusions were
 > refuted by an adversarial pass and have been removed rather than filed.
+>
+> **Update 2026-07-19 — the first port shipped.** We moved the IDE's build-diagnostic parser
+> (`src/sentinel/diag.sentinel`) into Sentinel and linked it as a C-ABI static lib. It runs on
+> the host's hot path in the shipped binary. This exercised the C-ABI path for real and confirms
+> the "what already works" section below is accurate, not aspirational. Two findings from it that
+> refine the requests: **R3** was sidestepped rather than hit — using the owned `-> [u8]` return
+> ABI instead of `&mut [u8]` out-params avoids the const-header bug entirely, so R3 only bites
+> code that genuinely needs in-place writes. And **R8 is real and load-bearing**: our link needed
+> exactly `legacy_stdio_definitions ntdll userenv ws2_32 dbghelp`, discovered by link failure as
+> described. One number worth adding: a *referenced* export pulls in the runtime — our exe grew
+> ~1.05 MB (Debug), where an unreferenced lib added +512 bytes. Both figures are honest; they
+> measure different things.
 
 ---
 
