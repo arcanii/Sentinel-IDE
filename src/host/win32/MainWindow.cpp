@@ -23,6 +23,7 @@
 #include "host/win32/SigningDialog.h"
 #include "host/win32/AboutDialog.h"
 #include "host/win32/PasswordDialog.h"
+#include "host/win32/SaveChangesDialog.h"
 #include "host/win32/Updater.h"
 
 #include <windows.h>
@@ -83,6 +84,7 @@ struct AppState {
     bool  folderOpen = false, fileOpen = false, dragV = false, highlighting = false, building = false;
     bool  dirty = false, loadingFile = false, lineNumbers = false, errorMarks = false;
     bool  tbCanUndo = false, tbCanRedo = false;   // last-painted undo/redo button state (repaint on change)
+    bool  restoringTreeSel = false;   // re-selecting after a cancelled open — ignore the TVN_SELCHANGED it raises
     int   gutterW = 0;          // line-number gutter width (0 = off / no file)
     int   dockTab = 0;  // 0 = Problems, 1 = Output
     SentinelProject project;
@@ -602,7 +604,9 @@ void refreshSignState(HWND hwnd) {
     }).detach();
 }
 
-void openFile(HWND hwnd, const std::wstring& path) {
+// Load `path` into the editor, discarding whatever is there. Callers that a user
+// can reach must go through openFile() instead, which asks about unsaved edits first.
+void loadFileIntoEditor(HWND hwnd, const std::wstring& path) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) { g.statusMsg = L"Could not open " + baseName(path); InvalidateRect(hwnd, &g.rStatus, FALSE); return; }
     DWORD size = GetFileSize(f, nullptr), read = 0;
@@ -622,6 +626,30 @@ void openFile(HWND hwnd, const std::wstring& path) {
     refreshSignState(hwnd);
     ShowWindow(g.hEdit, SW_SHOW);
     layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+bool saveFile(HWND hwnd);   // defined just below; confirmSaveIfDirty needs it
+
+// Ask about an unsaved file before something discards it. Returns true when it is safe
+// to proceed (nothing dirty, saved on request, or the user chose to discard) and false
+// when the user cancelled — in which case the CALLER MUST ABORT, changing nothing.
+// `action` completes "…if you continue <action> without saving".
+bool confirmSaveIfDirty(HWND hwnd, const std::wstring& action) {
+    if (!g.fileOpen || !g.dirty) return true;
+    switch (showSaveChangesDialog(hwnd, g.curFileName, action)) {
+        case SaveChoice::Save:    return saveFile(hwnd);   // a failed write must not discard the buffer
+        case SaveChoice::Discard: logMsg(LogLevel::Info, L"Discarded unsaved changes to " + g.curFileName); return true;
+        default:                  return false;
+    }
+}
+
+// Open a file in the editor, first offering to save whatever is open. Returns false if
+// the user cancelled, so callers that already moved UI state (a tree selection, the
+// active target) can put it back.
+bool openFile(HWND hwnd, const std::wstring& path) {
+    if (!confirmSaveIfDirty(hwnd, L"opening another file")) return false;
+    loadFileIntoEditor(hwnd, path);
+    return true;
 }
 
 // Write the editor's text back to the open file (UTF-8, CRLF). Clears the dirty flag.
@@ -690,7 +718,14 @@ void setProjectTitle(HWND hwnd) {
     SetWindowTextW(hwnd, t.c_str());
 }
 
-void openFolderPath(HWND hwnd, const std::wstring& folder) {
+// Load `folder` as the project/folder root, discarding whatever is open. Callers a user
+// can reach go through openFolderPath() instead — or, when they must ask earlier than this
+// because they write to disk first, call confirmSaveIfDirty() themselves and then come here.
+// Asking twice is NOT harmless: "Don't Save" deliberately leaves g.dirty set (the buffer is
+// still unsaved until something replaces it), so a second guard re-prompts for the same file
+// after the disk work is already done — and a Cancel there aborts a command that has already
+// half-happened.
+void loadFolderPath(HWND hwnd, const std::wstring& folder) {
     g.rootPath = folder; g.folderOpen = true; ShowWindow(g.hTree, SW_SHOW);
     logMsg(LogLevel::Info, L"Opened folder: " + folder);
     g.project = SentinelProject{};
@@ -708,10 +743,18 @@ void openFolderPath(HWND hwnd, const std::wstring& folder) {
     if (g.project.loaded) {   // land in the active target's entry source; the project node opens the settings form
         const Target& t = activeTarget();
         std::wstring e = g.project.dir + L"\\" + t.entry;
-        if (!t.entry.empty() && GetFileAttributesW(e.c_str()) != INVALID_FILE_ATTRIBUTES) openFile(hwnd, e);
+        if (!t.entry.empty() && GetFileAttributesW(e.c_str()) != INVALID_FILE_ATTRIBUTES) loadFileIntoEditor(hwnd, e);
     }
     setProjectTitle(hwnd);
     g.statusMsg = folder; layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// Open a folder as the project root, first offering to save whatever is open.
+// Returns false if the user cancelled, in which case nothing has changed.
+bool openFolderPath(HWND hwnd, const std::wstring& folder) {
+    if (!confirmSaveIfDirty(hwnd, L"opening another project")) return false;
+    loadFolderPath(hwnd, folder);
+    return true;
 }
 // Open Project: pick the project manifest (*.sntproject / sentinel.toml) and load its folder.
 void openProject(HWND hwnd) {
@@ -753,10 +796,13 @@ void newFile(HWND hwnd) {
     pfd->Release();
     if (path.empty()) return;
     if (path.size() < 9 || _wcsicmp(path.c_str() + path.size() - 9, L".sentinel") != 0) path += L".sentinel";
+    // Ask before writing anything: cancelling here aborts the whole command rather than
+    // leaving a created-but-unopened file behind a "Created …" status message.
+    if (!confirmSaveIfDirty(hwnd, L"creating a file")) return;
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) writeUtf8(path, L"// " + baseName(path) + L"\r\n\r\n");
     logMsg(LogLevel::Info, L"New file: " + path);
     populateTree();
-    openFile(hwnd, path);
+    loadFileIntoEditor(hwnd, path);   // asked above
     g.statusMsg = L"Created " + baseName(path);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -808,12 +854,16 @@ void newProject(HWND hwnd) {
     pfd->Release();
     if (path.empty()) return;
 
+    // Ask before createNewProject, not inside openFolderPath below: a cancel there
+    // would leave a scaffolded project on disk that we never opened.
+    if (!confirmSaveIfDirty(hwnd, L"creating a project")) return;
+
     std::wstring dir = dirName(path), name = baseName(path);
     size_t dot = name.find_last_of(L'.'); if (dot != std::wstring::npos) name = name.substr(0, dot);
     if (name.empty()) name = projBase(dir);
     if (!createNewProject(dir, name)) { g.statusMsg = L"Could not create project at " + dir; InvalidateRect(hwnd, &g.rStatus, FALSE); return; }
     logMsg(LogLevel::Info, L"New project: " + name + L" → " + dir + L"\\" + name + L".sntproject");
-    openFolderPath(hwnd, dir);
+    loadFolderPath(hwnd, dir);   // asked above, before the scaffold — don't ask again
     g.statusMsg = L"Created project " + name;
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -1075,7 +1125,9 @@ void runRun(HWND hwnd) {
     std::thread(worker, hwnd, L"\"" + exe + L"\"", dirName(g.curFilePath), /*useMsvcEnv=*/false).detach();
 }
 void gotoLineCol(HWND hwnd, const std::wstring& file, int line, int col) {
-    if (!file.empty() && file != g.curFilePath && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) openFile(hwnd, file);
+    if (!file.empty() && file != g.curFilePath && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (!openFile(hwnd, file)) return;   // cancelled — jumping now would scroll the wrong file
+    }
     LONG ci = (LONG)SendMessageW(g.hEdit, EM_LINEINDEX, line - 1, 0);
     if (ci < 0) ci = 0; ci += (col > 0 ? col - 1 : 0);
     CHARRANGE cr{ ci, ci }; SendMessageW(g.hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
@@ -1089,7 +1141,7 @@ void gotoLineCol(HWND hwnd, const std::wstring& file, int line, int col) {
 void openPathArg(HWND hwnd, const std::wstring& arg) {
     DWORD attr = GetFileAttributesW(arg.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) return;
-    if (attr & FILE_ATTRIBUTE_DIRECTORY) { openFolderPath(hwnd, arg); return; }
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) { openFolderPath(hwnd, arg); return; }   // guarded inside
     std::wstring root = dirName(arg), d = root;
     for (int i = 0; i < 16 && !d.empty(); i++) {        // walk up to the nearest project root
         if (hasProject(d)) { root = d; break; }
@@ -1099,8 +1151,8 @@ void openPathArg(HWND hwnd, const std::wstring& arg) {
     std::wstring name = baseName(arg); size_t dot = name.find_last_of(L'.');
     bool isManifest = _wcsicmp(name.c_str(), L"sentinel.toml") == 0 ||
                       (dot != std::wstring::npos && _wcsicmp(name.c_str() + dot, L".sntproject") == 0);
-    openFolderPath(hwnd, root);
-    if (!isManifest) openFile(hwnd, arg);
+    if (!openFolderPath(hwnd, root)) return;   // cancelled — openFile would just ask again
+    if (!isManifest) loadFileIntoEditor(hwnd, arg);
 }
 
 void showTierMenu(HWND hwnd) {
@@ -1123,21 +1175,31 @@ void showTargetMenu(HWND hwnd) {
 }
 
 // Switch the active build target: open its entry source, refresh the title + toolbar.
-void setActiveTarget(HWND hwnd, int idx) {
-    if (idx == g.target || idx < 0 || idx >= (int)g.project.targets.size()) return;
+// Returns false ONLY when the user cancelled at the unsaved-changes prompt. A no-op
+// (already active, out of range) returns true: there is nothing for the caller to undo.
+bool setActiveTarget(HWND hwnd, int idx) {
+    if (idx == g.target || idx < 0 || idx >= (int)g.project.targets.size()) return true;
+    // Ask first: g.target and the entry file move together, so a prompt after the
+    // assignment would leave the selector on a target whose source never opened.
+    if (!confirmSaveIfDirty(hwnd, L"switching target")) return false;
     g.target = idx;
     const Target& t = g.project.targets[g.target];
     logMsg(LogLevel::Info, L"Target → " + (t.name.empty() ? g.project.name : t.name) + L" (" + typeName(t.type) + L")");
     std::wstring e = g.project.dir + L"\\" + t.entry;
-    if (!t.entry.empty() && GetFileAttributesW(e.c_str()) != INVALID_FILE_ATTRIBUTES) openFile(hwnd, e);
+    if (!t.entry.empty() && GetFileAttributesW(e.c_str()) != INVALID_FILE_ATTRIBUTES) loadFileIntoEditor(hwnd, e);
     setProjectTitle(hwnd);
     InvalidateRect(hwnd, nullptr, FALSE);
+    return true;
 }
 
 // Open the structured Project Settings form over sentinel.toml; on Save, persist
 // (preserving comments + unmodeled keys), reload, and refresh the UI.
 void openProjectSettings(HWND hwnd) {
     if (!g.project.loaded) { g.statusMsg = L"Open a Sentinel project first"; InvalidateRect(hwnd, &g.rStatus, FALSE); return; }
+    // Saving the form rewrites the manifest from the model, so raw edits to that same
+    // file are lost the moment it writes — ask now, not after the damage.
+    if (g.fileOpen && g.dirty && _wcsicmp(g.curFilePath.c_str(), (g.project.dir + L"\\" + g.project.manifest).c_str()) == 0 &&
+        !confirmSaveIfDirty(hwnd, L"editing project settings")) return;
     SentinelProject p = g.project;
     if (!showProjectSettingsDialog(hwnd, p)) return;
     if (!saveProject(p)) {
@@ -1149,7 +1211,7 @@ void openProjectSettings(HWND hwnd) {
     populateTree();
     setProjectTitle(hwnd);
     if (g.fileOpen && _wcsicmp(g.curFilePath.c_str(), (g.project.dir + L"\\" + g.project.manifest).c_str()) == 0)
-        openFile(hwnd, g.curFilePath);   // refresh the raw manifest if it's the open file
+        loadFileIntoEditor(hwnd, g.curFilePath);   // internal refresh of the raw manifest — never prompts
     logMsg(LogLevel::Info, L"Project settings saved — " + g.project.name + L" (" + typeName(g.project.type) +
            L"), tier=" + tierName(g.tier) + L", signing require=" + g.project.signRequire);
     g.statusMsg = L"Project settings saved";
@@ -1167,11 +1229,12 @@ void openSigning(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-// Close the open project/folder: return to the empty welcome state. Auto-saves a
-// dirty file first (mirrors Build's behavior) so edits aren't silently lost.
+// Close the open project/folder: return to the empty welcome state. Asks about a dirty
+// file first — this used to auto-save silently, which never lost data but wrote to disk
+// on a command that says nothing about saving.
 void closeProject(HWND hwnd) {
     if (!g.folderOpen) return;
-    if (g.fileOpen && g.dirty) { saveFile(hwnd); logMsg(LogLevel::Info, L"Auto-saved " + g.curFileName + L" before closing project"); }
+    if (!confirmSaveIfDirty(hwnd, L"closing the project")) return;
     logMsg(LogLevel::Info, L"Closed: " + g.rootPath);
     g.folderOpen = false; g.fileOpen = false;
     g.project = SentinelProject{};
@@ -1207,7 +1270,8 @@ void openRecent(HWND hwnd, int idx) {
 // plaintext project is left in place — sealing is non-destructive.
 void sealCurrentProject(HWND hwnd) {
     if (!g.project.loaded) { g.statusMsg = L"Open a project to seal it"; InvalidateRect(hwnd, &g.rStatus, FALSE); return; }
-    if (g.fileOpen && g.dirty) saveFile(hwnd);   // capture unsaved edits into the seal
+    // The seal archives what is on DISK, so an unsaved buffer would be sealed stale.
+    if (!confirmSaveIfDirty(hwnd, L"sealing the project")) return;
     std::wstring pw;
     std::wstring prompt = L"Set a password to seal “" + g.project.name + L"”.\nEnter it twice — you'll need it to open the project again.";
     if (!showPasswordDialog(hwnd, L"Seal Project", prompt, true, pw)) return;
@@ -1251,6 +1315,10 @@ void openSealedProject(HWND hwnd) {
     std::wstring pw;
     if (!showPasswordDialog(hwnd, L"Open Sealed Project", L"Enter the password for “" + baseName(sealed) + L"”.", false, pw)) return;
 
+    // Ask before we create the unsealed directory — cancelling inside openFolderPath
+    // afterwards would leave a decrypted copy on disk that the IDE never opened.
+    if (!confirmSaveIfDirty(hwnd, L"opening a sealed project")) return;
+
     std::wstring stem = baseName(sealed); size_t dot = stem.find_last_of(L'.'); if (dot != std::wstring::npos) stem = stem.substr(0, dot);
     std::wstring base = dirName(sealed) + L"\\" + stem + L"-unsealed", dest = base;
     for (int i = 2; GetFileAttributesW(dest.c_str()) != INVALID_FILE_ATTRIBUTES; ++i) dest = base + L" (" + std::to_wstring(i) + L")";
@@ -1263,7 +1331,7 @@ void openSealedProject(HWND hwnd) {
     if (!pw.empty()) SecureZeroMemory(pw.data(), pw.size() * sizeof(wchar_t));
     if (ur.ok) {
         logMsg(LogLevel::Info, L"Unsealed " + sealed + L" → " + dest);
-        openFolderPath(hwnd, dest);
+        loadFolderPath(hwnd, dest);   // asked above, before the unseal — don't ask again
         g.dockTab = 1; showDock(); outAppend(L"[unsealed]  " + ur.message, currentTheme().trustVerified);
         g.statusMsg = L"Unsealed → " + dest;
     } else {
@@ -1483,9 +1551,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (nm->idFrom == IDC_TREE && nm->code == TVN_SELCHANGEDW) {
+            if (g.restoringTreeSel) return 0;   // our own put-it-back below, not a user click
             auto* tv = reinterpret_cast<NMTREEVIEWW*>(lParam); LPARAM data = tv->itemNew.lParam;
-            if (data <= kTargetNodeBase) { setActiveTarget(hwnd, (int)(kTargetNodeBase - data)); return 0; }   // a target node
-            if (data >= 0 && (size_t)data < g.nodePaths.size()) openFile(hwnd, g.nodePaths[data]);
+            // The selection has already moved by the time this fires, so a cancelled open
+            // would leave the tree highlighting a file that isn't in the editor. itemOld
+            // is exactly the node to put it back to.
+            bool ok = true;
+            if (data <= kTargetNodeBase) ok = setActiveTarget(hwnd, (int)(kTargetNodeBase - data));   // a target node
+            else if (data >= 0 && (size_t)data < g.nodePaths.size()) ok = openFile(hwnd, g.nodePaths[data]);
+            if (!ok) {
+                // NOT `&& itemOld.hItem`: populateTree() deletes every item, so the first
+                // click after opening a project / saving Project Settings / New File / a
+                // sidebar tab switch has no previous selection. Selecting NULL restores
+                // "nothing selected", which is the true prior state; skipping the call
+                // would leave the tree highlighting a file that never opened.
+                g.restoringTreeSel = true;
+                TreeView_SelectItem(g.hTree, tv->itemOld.hItem);
+                g.restoringTreeSel = false;
+            }
             return 0;
         }
         if (nm->idFrom == IDC_PROBLEMS && nm->code == NM_DBLCLK) {
@@ -1580,7 +1663,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g.tier = LOWORD(wParam) - ID_TIER_DEV; setProjectTitle(hwnd);
             logMsg(LogLevel::Info, std::wstring(L"Tier → ") + tierName(g.tier));
             InvalidateRect(hwnd, nullptr, FALSE); break;
-        case ID_EXIT: DestroyWindow(hwnd); break;
+        case ID_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;   // via WM_CLOSE, so it asks about unsaved edits
         }
         return 0;
     case WM_GETMINMAXINFO: { auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam); mmi->ptMinTrackSize.x = sc(820); mmi->ptMinTrackSize.y = sc(560); return 0; }
@@ -1592,6 +1675,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetWindowPos(hwnd, nullptr, nr->left, nr->top, nr->right - nr->left, nr->bottom - nr->top, SWP_NOZORDER | SWP_NOACTIVATE);
         layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
     }
+    case WM_CLOSE:
+        // Not always a user closing the window: WinSparkle posts WM_CLOSE to install an
+        // update and then force-exits after 3s, so a prompt there would go unanswered and
+        // the watchdog would kill the process with the edits still only in the buffer.
+        // Save without asking in that case; ask in every other.
+        if (updaterShutdownPending()) {
+            if (g.fileOpen && g.dirty) { saveFile(hwnd); logMsg(LogLevel::Info, L"Auto-saved " + g.curFileName + L" before update install"); }
+        } else if (!confirmSaveIfDirty(hwnd, L"closing Sentinel-IDE")) {
+            return 0;   // cancelled — stay open
+        }
+        break;   // -> DefWindowProc -> WM_DESTROY
+
     case WM_DESTROY:
         destroyFonts(); if (g.himl) ImageList_Destroy(g.himl);
         if (g.textDoc) { g.textDoc->Release(); g.textDoc = nullptr; }

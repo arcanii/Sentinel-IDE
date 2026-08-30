@@ -29,4 +29,11 @@ void shutdownUpdater();
 // is hidden when false, so we never present a check that cannot verify anything.
 bool updaterAvailable();
 
+// True once WinSparkle has asked us to quit so it can install an update. The WM_CLOSE
+// that arrives then is NOT a user closing the window: WinSparkle is waiting on our
+// process handle behind a 3-second force-exit watchdog, so the close path must not stop
+// to ask a question it would never get an answer to. Set on a WinSparkle worker thread,
+// read on the UI thread.
+bool updaterShutdownPending();
+
 }  // namespace sentinelide

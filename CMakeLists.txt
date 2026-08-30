@@ -28,6 +28,7 @@ add_executable(SentinelIDE WIN32
   src/host/win32/SigningDialog.cpp
   src/host/win32/AboutDialog.cpp
   src/host/win32/PasswordDialog.cpp
+  src/host/win32/SaveChangesDialog.cpp
   src/host/win32/Updater.cpp
   packaging/SentinelIDE.rc)
 

@@ -3,6 +3,7 @@
 
 #ifdef SENTINELIDE_HAVE_WINSPARKLE
 
+#include <atomic>
 #include <thread>
 #include <winsparkle.h>
 
@@ -45,6 +46,10 @@ bool haveSigningKey() {
 
 HWND g_mainWnd = nullptr;
 bool g_started = false;
+// Set before the WM_CLOSE below is posted, so the main window can tell an update
+// install apart from a user close and skip the unsaved-changes prompt (it would sit
+// unanswered until the watchdog killed the process, losing the very edits it asked about).
+std::atomic<bool> g_shutdownPending{false};
 
 // WinSparkle asks the app to quit so it can run the downloaded installer, and waits
 // on our process handle before starting it. If we do not actually exit, the
@@ -59,6 +64,7 @@ bool g_started = false;
 // Ugly, but the alternative failure is a half-applied update.
 void onShutdownRequest() {
     logMsg(LogLevel::Info, L"Updater: shutdown requested — closing for update install");
+    g_shutdownPending = true;
     if (g_mainWnd) PostMessageW(g_mainWnd, WM_CLOSE, 0, 0);
     std::thread([] {
         Sleep(3000);
@@ -72,6 +78,7 @@ int onCanShutdown() { return 1; }
 }  // namespace
 
 bool updaterAvailable() { return haveSigningKey(); }
+bool updaterShutdownPending() { return g_shutdownPending.load(); }
 
 void initUpdater(HWND mainWnd) {
     g_mainWnd = mainWnd;
@@ -126,6 +133,7 @@ void shutdownUpdater() {
 
 namespace sentinelide {
 bool updaterAvailable() { return false; }
+bool updaterShutdownPending() { return false; }
 void initUpdater(HWND) {}
 void checkForUpdates(HWND) {}
 void shutdownUpdater() {}
