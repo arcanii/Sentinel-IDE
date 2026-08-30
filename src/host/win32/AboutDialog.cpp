@@ -25,7 +25,17 @@ namespace {
 enum { IDC_TITLE = 201, IDC_VER, IDC_TAG, IDC_LINE1, IDC_LINE2, IDC_COPY, IDC_CLOSE, IDC_UPDATE };
 
 struct AboutState { bool done = false; HICON icon = nullptr; int pad = 20, iconSz = 72;
-                    int capY = 0, badgeY = 0, badgeH = 0; HFONT badgeFont = nullptr; };
+                    int capY = 0, badgeY = 0, badgeH = 0, barY = 0, barW = 0, barH = 0; HFONT badgeFont = nullptr; };
+
+// Share of the program's own code (not build tooling) that is Sentinel rather than
+// C++ — the thin-host thesis as a number. Denominator is Sentinel + C++ deliberately:
+// build scripts aren't the host being shrunk. Returns tenths of a percent (49 = 4.9%).
+inline int sentinelPermille10() {
+    long long snt = (long long)SENTINEL_LOC_SENTINEL, cpp = (long long)SENTINEL_LOC_CPP;
+    long long denom = snt + cpp;
+    if (denom <= 0) return 0;
+    return (int)((snt * 1000 + denom / 2) / denom);   // rounded tenths-of-a-percent
+}
 
 // Draw a shields.io-style flat badge [ label | value ] at (x,y). The whole pill is
 // rounded (clip region), the label half is dark, the value half is colored, white
@@ -82,6 +92,26 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 x += drawBadge(hdc, x, st->badgeY, h, L"Sentinel", s.c_str(), lbl, th.accent,        st->badgeFont) + gap;
                 x += drawBadge(hdc, x, st->badgeY, h, L"Build",    b.c_str(), lbl, RGB(0x5a,0x63,0x6e), st->badgeFont) + gap;
                 x += drawBadge(hdc, x, st->badgeY, h, L"Total",    t.c_str(), lbl, th.trustVerified, st->badgeFont) + gap;
+
+                // "Built in Sentinel" progress — the thin-host thesis as a bar. Coral
+                // fill = Sentinel's share of Sentinel+C++; the rest is the shrinking host.
+                if (st->barY && st->barW && st->barH) {
+                    const int p10 = sentinelPermille10();
+                    SelectObject(hdc, st->badgeFont); SetTextColor(hdc, th.textMuted);
+                    std::wstring pct = std::to_wstring(p10 / 10) + L"." + std::to_wstring(p10 - (p10 / 10) * 10) + L"%";
+                    std::wstring capline = pct + L" written in Sentinel — the native host is a shrinking debt";
+                    RECT lr{ st->pad, st->barY - st->badgeH, st->pad + st->barW, st->barY };
+                    DrawTextW(hdc, capline.c_str(), -1, &lr, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
+
+                    const int bh = st->barH, r = bh;
+                    HPEN oldPen = (HPEN)SelectObject(hdc, (HPEN)GetStockObject(NULL_PEN));
+                    HGDIOBJ oldBr = SelectObject(hdc, themeBrush(th.panelElevBg));   // track
+                    RoundRect(hdc, st->pad, st->barY, st->pad + st->barW, st->barY + bh, r, r);
+                    int fw = (int)((long long)st->barW * p10 / 1000);
+                    if (fw < bh && p10 > 0) fw = bh;                                 // keep a sliver visible
+                    if (fw > 0) { SelectObject(hdc, themeBrush(th.accent)); RoundRect(hdc, st->pad, st->barY, st->pad + fw, st->barY + bh, r, r); }
+                    SelectObject(hdc, oldBr); SelectObject(hdc, oldPen);
+                }
             }
             EndPaint(hwnd, &ps); return 0;
         }
@@ -147,7 +177,11 @@ void showAboutDialog(HWND owner) {
     st.capY   = contentBottom + S(8);                        // LOC caption + badge row (drawn in WM_PAINT)
     st.badgeH = S(20);
     st.badgeY = st.capY + S(20);
-    const int by = st.badgeY + st.badgeH + S(16), bw = S(96);
+    // "Built in Sentinel" progress bar (its caption sits one badgeH above it).
+    st.barW   = clientW - 2 * M;
+    st.barH   = S(10);
+    st.barY   = st.badgeY + st.badgeH + S(16) + st.badgeH;    // room for the % caption line
+    const int by = st.barY + st.barH + S(18), bw = S(96);
     HWND ok = CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
                               clientW - M - bw, by, bw, S(28), hwnd, (HMENU)(INT_PTR)IDC_CLOSE, hi, nullptr);
     SendMessageW(ok, WM_SETFONT, (WPARAM)ui, TRUE);
