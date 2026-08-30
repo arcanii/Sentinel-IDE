@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–38 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–39 built and verified.
 
 ---
 
@@ -29,6 +29,8 @@ exist so far:
   **New / Open / Close Project + Recent Projects + New File**, a **structured Project Settings
   editor with per-target editing**, and a **Signing & Trust panel** driving *real* ADR-0061
   `snc keygen`/`sign`/`verify` with a live status-bar trust chip.
+- Unsaved edits are **never discarded silently**: closing a file, the project, the window, or an
+  update install all route through one **Save / Don't Save / Cancel** prompt (phase 39).
 - Also: **sealed projects** (password-encrypted, `core/Seal.h`), **file associations**
   (double-click `.sntproject`/`.sentinel`), an **About box with lines-of-code badges** whose
   total is counted by **`tools/loc.sentinel`** — the first piece written *in* Sentinel — and a
@@ -62,6 +64,7 @@ exist so far:
 | `src/host/win32/SigningDialog.{h,cpp}` | Themed modal **Signing & Trust** panel (ADR-0061 keygen/sign/verify + trust viewer) |
 | `src/host/win32/AboutDialog.{h,cpp}` | Themed modal **About** box (S2 shield + name/version/tagline + lines-of-code shields.io badges) |
 | `src/host/win32/PasswordDialog.{h,cpp}` | Themed modal password prompt (one field, or two with a match check for sealing) |
+| `src/host/win32/SaveChangesDialog.{h,cpp}` | Themed modal **Save / Don't Save / Cancel** prompt for unsaved edits (class `SentinelSaveDlg`). Driven by `MainWindow.cpp::confirmSaveIfDirty` — the single choke point every discarding path goes through (phase 39). |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
 | `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38). `parsers.sentinel` = four parsers (diagnostic, trust manifest, `.sig` carrier, project manifest), built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject`. Every file reader in the IDE. About box shows the % in Sentinel. |
@@ -152,7 +155,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–38 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–39 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -402,11 +405,78 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     **`&"literal"` is rejected** ("cannot borrow a non-lvalue") — bind literals to a `let` first,
     then borrow.
 
+39. **Unsaved-changes guard — the editor stops discarding work silently.** Three paths threw away
+    the editor buffer with no prompt, and a fourth wrote to disk without being asked.
+    (a) `openFile` overwrote the RichEdit contents unconditionally, so clicking another file in the
+    tree (or a Problems entry, or a `file:line:col` link in Output) lost every unsaved edit;
+    (b) **there was no `WM_CLOSE` handler at all** — closing the window discarded the buffer, and
+    `≡ ▸ Exit` called `DestroyWindow` directly, bypassing even that; (c) **an auto-update install did
+    the same, unattended** — WinSparkle's shutdown request posts `WM_CLOSE`, which fell straight
+    through `DefWindowProc`; (d) Build, Close Project and Seal each *silently auto-saved*, which
+    never lost data but wrote the user's file on commands that say nothing about saving.
+    Now a themed three-answer modal (`src/host/win32/SaveChangesDialog.{h,cpp}`, window class
+    `SentinelSaveDlg`, built from `PasswordDialog`'s shape — a MessageBox would be light-themed, cf.
+    phase 15) asks **Save / Don't Save / Cancel**, and `confirmSaveIfDirty(hwnd, action)` is the one
+    choke point: it returns false only on Cancel, and **every caller must then abort changing nothing**.
+    `openFile` was split — `loadFileIntoEditor` is the raw loader, `openFile` = guard + load — so
+    internal reloads (the project's entry source, the raw-manifest refresh after Project Settings)
+    never prompt while every user-reachable path does. `openFolderPath`, `openFile` and
+    `setActiveTarget` now return `bool`.
+    Ordering matters in three places, each a bug if done the obvious way: `setActiveTarget` asks
+    **before** assigning `g.target`, or a cancel would leave the selector on a target whose source
+    never opened; New Project and Open Sealed ask **after** their picker but **before**
+    `createNewProject` / the unseal writes, or a cancel would strand a scaffolded project or a
+    decrypted copy on disk; and `openProjectSettings` asks when the dirty file *is* the manifest,
+    because the form's Save rewrites that file from the model and the raw edits are gone the moment
+    it writes. `TVN_SELCHANGEDW` fires **after** the tree selection has already moved, so a cancelled
+    open would leave the tree highlighting a file that isn't in the editor — the handler puts it back
+    via `itemOld.hItem`, guarded by `g.restoringTreeSel` against the re-entrant notification.
+    **The updater is the subtle one.** `onShutdownRequest` posts `WM_CLOSE` and arms a 3-second
+    `ExitProcess` watchdog, so prompting there would show a dialog nobody answers and then get killed
+    *with the edits still only in the buffer* — worse than the old behaviour. `Updater` now exposes
+    **`updaterShutdownPending()`** (an `std::atomic<bool>` set on the WinSparkle worker thread), and
+    `WM_CLOSE` auto-saves without asking in that case only. `ID_EXIT` was rerouted to `WM_CLOSE` so
+    there is a single exit path. **Build keeps its silent auto-save on purpose** — "save before build"
+    is the conventional behaviour and the build is meaningless without it.
+    **Verified live** by driving the running window: the prompt appears for close / close-project /
+    target-switch / tree-click / seal with the right per-action wording; **Cancel** leaves the app
+    open, the file still dirty, and the tree selection restored; **Don't Save** exits with the file
+    byte-identical on disk; **Save** writes then exits; and Cancel at the Seal prompt aborts before
+    the password dialog, writing no `.sealed`. All 5 tests still pass.
+    `docs/screenshots/phase39-save-changes.png`.
+    Like every other modal here the new dialog re-posts `WM_QUIT` in its loop (phase 32's rule — a
+    nested `GetMessageW` that swallows the quit wedges `runApp` forever); it is now the **sixth**
+    dialog that has to.
+    **Four defects an adversarial review of the first cut found, all fixed before commit** — worth
+    keeping because three of them are the same trap in different clothes: *a guard that runs twice
+    is not idempotent*. (i) **"Don't Save" deliberately does NOT clear `g.dirty`** (the buffer really
+    is still unsaved until something replaces it), so the early guards in `newProject` /
+    `openSealedProject` did not stop `openFolderPath`'s own guard from re-prompting for the same file
+    *after* the scaffold or the decrypt had already hit disk — and both callers dropped the `false`
+    return, so cancelling the second prompt left a stranded project / plaintext copy while the status
+    bar still read "Created project X" / "[unsealed]". Fixed structurally, not by clearing the flag:
+    `openFolderPath` was split into **`loadFolderPath`** (raw) + `openFolderPath` (guard + load), the
+    same shape as `loadFileIntoEditor`/`openFile`, so **every user command asks exactly once**.
+    Clearing `g.dirty` on Discard would have been the tempting fix and is wrong — after Seal or a
+    failed New Project the buffer is still modified, and it would have dropped the `●` that is the
+    only thing standing between those edits and a later silent loss. (ii) `newFile` wrote the file
+    and rebuilt the tree *before* prompting, then ignored the cancel and reported "Created …"; it now
+    asks straight after the picker. (iii) The tree-selection restore was gated on
+    `tv->itemOld.hItem`, which is **NULL after every `populateTree()`** (project open, Project
+    Settings save, New File, sidebar tab switch) — so the very case it was written for, the first
+    click in a fresh tree, was the one it skipped. Restoring to `NULL` (= no selection) is the
+    correct prior state. (iv) The header static lacked **`SS_NOPREFIX`**, so a file called
+    `notes & drafts.sentinel` was shown as `notes  drafts.sentinel` — the *same* `&`-as-mnemonic bug
+    phase 24 hit in the ≡ menu. All four re-verified live.
+    (Harness note for next time: a cross-process `SendMessage(WM_COMMAND)` to one of these dialogs
+    sets `done` but leaves its `GetMessageW` blocked — sent messages don't wake a queue wait. **Post**
+    the message instead, or the dialog looks wedged when the code is fine.)
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
 **Screenshot coverage is partial, despite "screenshot-verified" above:** `docs/screenshots/` holds
-13 PNGs covering phases 1–11, 13 and 15. Phases 12, 14 and 16–29 were verified live during their
+14 PNGs covering phases 1–11, 13, 15 and 39. Phases 12, 14 and 16–38 were verified live during their
 sessions but no image was committed — treat their screenshots as absent, not lost.
 
 ## Releases
@@ -493,11 +563,17 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - ~~Undo / redo memory~~ (phase 18), ~~dark popup menus + right-click New File~~ (phase 19),
   ~~clickable `file:line` in Output~~ (phase 20), ~~LOC dogfood + About badges~~ (phase 21),
   ~~per-target editing~~ (phase 22), ~~sign the built artifact~~ (phase 23), ~~recents + close project~~
-  (phase 24), ~~sealed projects (password)~~ (phase 25), ~~file associations~~ (phase 26) — all **done**.
+  (phase 24), ~~sealed projects (password)~~ (phase 25), ~~file associations~~ (phase 26),
+  ~~unsaved-changes guard~~ (phase 39) — all **done**.
 - **Single-instance / IPC:** a double-click (or a 2nd launch) currently spawns a new window; route the
   path to an existing instance (named pipe / `WM_COPYDATA` to a `FindWindow` of the app class) so the
   open project gains a file/tab instead. Also: drag-drop files onto the window; a shell "New ▸ Sentinel
-  Project" entry.
+  Project" entry. **Unblocked now** — both swap the open file, and phase 39 landed the dirty-guard
+  they needed (`confirmSaveIfDirty`; route any new open through `openFile`, not `loadFileIntoEditor`).
+- **Unsaved-changes follow-ons** (guard shipped phase 39): RichEdit doesn't track a saved point, so
+  undoing back to the original text still leaves `●` set and will still prompt (phase 18's known
+  wart, now user-visible); and there is no "reload from disk" prompt when a file changes underneath
+  the editor.
 - **Installer follow-ons** (installer shipped phase 28; ~~build-number pickup~~ + ~~real `AppUrl`~~
   done phase 33; ~~non-reproducible build number~~ done phase 34 — now `git rev-list --count HEAD`
   + `BUILDBASE`, so a released `Sentinel-IDE-0.1.0.<n>-setup.exe` can be rebuilt from its tag).
@@ -572,143 +648,41 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 
 ## Seed prompt for a new session
 
-> You're continuing **Sentinel-IDE** in `G:\SentinelIDE` — a native, Windows-first IDE for the
-> **Sentinel** language, intended to be built increasingly *in* Sentinel (a thin native host that
-> shrinks over time). **Read `docs/HANDOVER.md` first** for full state; also `docs/prototype.md`
-> and `docs/sentinel-project.md`.
+_Keep this SHORT. It is the agent's first message, not a second copy of the handover — its only
+jobs are to point at the reference, and to pre-empt the mistakes and wrong priors that would happen
+in the first few tool calls, before the handover has been read. Everything look-up-able once you've
+read the handover belongs in the handover body, not here._
+
+> You're continuing **Sentinel-IDE** (`G:\SentinelIDE`) — a native Win32 IDE for the **Sentinel**
+> language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It's a
+> **released** product (latest **v0.1.3**, on GitHub, with live WinSparkle auto-update), and real
+> Sentinel code now runs in the shipped binary (the four file parsers). **Read `docs/HANDOVER.md`
+> first — it is the full, current state** (phase list 1–39, the Releases table, What's next, and the
+> per-area detail). Then, as needed: `docs/RELEASING.md` (how to cut a release), and
+> `docs/Sentinel-lang_request.md` (what the Sentinel language/toolchain can and can't do — measured,
+> not folklore). `docs/prototype.md` + `docs/sentinel-project.md` are older narrative detail.
 >
-> **Naming (important):** the product and exe are **`Sentinel-IDE`** (`build\Sentinel-IDE.exe`), but
-> **internal identifiers deliberately stay `SentinelIDE`** — the window class
-> `SentinelIDEMainWindow`, the `sentinelide` C++ namespace, the settings dir
-> `%LOCALAPPDATA%\SentinelIDE`, the CMake target id, `packaging/SentinelIDE.rc`, and the folder
-> `G:\SentinelIDE`. So `Get-Process` uses **`Sentinel-IDE`**, but `-Class SentinelIDEMainWindow` is
-> unchanged. Don't "fix" the internal names.
+> **Before you touch anything, five things that bite in the first five minutes** (the handover
+> explains each; these just need to land before you act):
+> 1. **Don't "fix" the naming.** Product/exe = `Sentinel-IDE`; internal identifiers (window class
+>    `SentinelIDEMainWindow`, `sentinelide` namespace, `%LOCALAPPDATA%\SentinelIDE`, `SentinelIDE.rc`,
+>    the CMake target, the folder) deliberately stay `SentinelIDE`. Changing them breaks saved
+>    settings and the `-Class` capture path.
+> 2. **Build through `cmd /c scripts\build.bat`**, never raw `cmake` (the batch stamps the version and
+>    builds the Sentinel parser lib). It's a git-derived build number; `BUILD_DIRTY` in the output
+>    means the tree doesn't match HEAD — never ship such a build.
+> 3. **Commit/push only when asked.** The repo is **public and must stay public** (auto-update fetches
+>    the appcast over anonymous HTTPS). `main` is shippable; treat it that way.
+> 4. **Never edit a `.bat` with `sed` or any tool that writes LF** — `cmd` needs CRLF and dies with
+>    `'t' is not recognized`. Use `Edit`. (Same reason `.gitattributes` forces CRLF; and don't let any
+>    tool rewrite `examples/crypto.sentinel` to LF — it invalidates the committed `.sig`.)
+> 5. **Don't trust your priors about Sentinel's limits.** Much "Sentinel can't do X" folklore is false
+>    (argv, non-capturing closures, dir-walk via FFI all work); the crypto-core port is *blocked*
+>    (R1, secure-zero) despite older notes calling it the top candidate. `docs/Sentinel-lang_request.md`
+>    is the measured truth. If you write Sentinel, `src/sentinel/parsers.sentinel` is the worked
+>    example for the language's quirks (no `%`, `if` is an expression, no early `return`, `[u8]` params
+>    move in loops so pass `&[u8]`, `&"literal"` is illegal).
 >
-> **Layout:** `src/core/` = portable-*intended* logic (Project, Signing, Seal, Settings, Toolchain,
-> FileAssoc, Proc, Logger — all header-only, still Win32-coupled today); `src/host/win32/` = the thin
-> Win32 host (WinMain, MainWindow ~1650 lines, five themed dialogs, `Updater.{h,cpp}`, Theme.h);
-> **`src/sentinel/` = product logic written *in* Sentinel** (`parsers.sentinel` — four parsers,
-> compiled to one C-ABI lib the host links; see below); `tests/` = `seal_test` + the four
-> `*_xcheck.cpp` parser-parity tests. A macOS/Linux port adds `src/host/<os>/` against the same core —
-> **do not scaffold empty platform trees** until a port starts.
->
-> **Phases 1–38 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
-> right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
-> error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
-> stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
-> Output (**clickable `file:line:col`**) + Problems, builds link *and* run (the IDE injects the
-> auto-detected MSVC env); a project model (`*.sntproject`, else legacy `sentinel.toml`) with multiple
-> `[[target]]`s, an Xcode-style `target ▾ · tier ▾` selector, Project Settings with **per-target
-> editing**, New/Open/**Close** Project + **Recent Projects** + New File; **ADR-0061 signing** (real
-> `snc keygen`/`sign`/`verify`, live trust chip, post-build artifact signing); **sealed projects**
-> (password → AES-256-GCM over an LZMS-compressed archive, LUKS-style unlock slots in `core/Seal.h`);
-> **file associations** (double-click `.sntproject`/`.sentinel`); an **About box with LOC badges**
-> whose total is counted by **`tools/loc.sentinel`**; and a **Windows installer**
-> (Inno Setup → `build/installer/Sentinel-IDE-<ver>.<build>-setup.exe`).
->
-> **The thesis is now live in the binary (phases 35–38).** Four parsers were ported from C++ into
-> **Sentinel** — the build-diagnostic parser (`parseDiag`), the trust-manifest parser (`loadTrust`),
-> the `.sig`-carrier parser (`readSig`), and the project-manifest reader (`loadProject`) — compiled to
-> **one** C-ABI static lib (`src/sentinel/parsers.sentinel` → `build/generated/parsers.lib`, ADR 0059)
-> that the host links and calls into. **Every file reader/parser in the IDE is now Sentinel**; only
-> the comment-preserving manifest *writer* (`saveProject`) stays C++ (a surgical structure-preserving
-> TOML rewrite, deliberately native). Each has a byte-identical C++ `#else` fallback (used when
-> `snc` is absent, gate `SENTINELIDE_SENTINEL`) held in lockstep by a `tests/*_xcheck.cpp`. The About
-> box shows a **"built in Sentinel" progress bar** (~14.5%, moves with each port). One-lib-on-purpose:
-> each Sentinel lib bundles the whole runtime, so the first port cost ~1 MB and every port since ~8 KB.
->
-> **Auto-update (phase 32):** WinSparkle (vendored `third_party/winsparkle/`, x64, MIT) reads an
-> **Ed25519-signed appcast** off `main`; ≡ ▸ Check for Updates… + an About-box button + background
-> checks. The signing key is real and compiled into `Updater.cpp` (public half — the private key is at
-> `%SENTINEL_SIGN_KEY%`, outside the repo).
->
-> **Released:** latest **v0.1.3 (build 145)** on GitHub; four releases so far (see the **Releases**
-> table above). Auto-update verified end-to-end (a 0.1.0 client offered a later version across a
-> marketing bump). `docs/RELEASING.md` is the cut procedure.
->
-> **Build / run / screenshot**
-> ```
-> cmd /c scripts\build.bat                    :: → build\Sentinel-IDE.exe   (BUILD_NUMBER n, BUILD_OK)
-> powershell -File scripts\launch.ps1 "G:\SentinelIDE\examples" --build   :: path + flags are SEPARATE args
-> powershell -File scripts\capture.ps1                       :: → build\shot.png, then Read that PNG
-> powershell -File scripts\capture.ps1 -Class SentinelSigningDlg
-> cmd /c scripts\make-installer.bat           :: builds, then ISCC → build\installer\
-> pwsh scripts\sign-release.ps1 -Appcast      :: sign the installer + verify + write appcast.xml
-> ctest --test-dir build                      :: seal + 4 parser-parity tests (build the targets first)
-> ```
-> `build.bat` now also compiles `src/sentinel/parsers.sentinel` to `build/generated/parsers.lib` via
-> **release `snc`** (`SENTINEL_PARSERS_OK`); if `snc` is absent it prints `SENTINEL_PARSERS_FALLBACK`
-> and CMake uses the C++ parsers instead — the build never breaks, but the default build now depends on
-> the Sentinel toolchain. Releases: see `docs/RELEASING.md` (bump `MKT`/`MKTRC` → clean commit →
-> `make-installer.bat` → `sign-release.ps1 -Appcast` → tag the build commit → `gh release create` →
-> commit+push `appcast.xml` → verify the feed + enclosure resolve). Key path is in `%SENTINEL_SIGN_KEY%`.
-> The app isn't installed, so the screenshot MCP can't see it — always go through `capture.ps1`
-> (it overwrites the same `build\shot.png`). Window classes for `-Class`: `SentinelIDEMainWindow`,
-> `SentinelSettingsDlg`, `SentinelProjectDlg`, `SentinelSigningDlg`, `SentinelAboutDlg`,
-> `SentinelPwDlg`. `launch.ps1` **kills any running instance first**. CLI flags: `<file|folder>`,
-> `--build --settings --project-settings --signing --about --tier <name>`.
->
-> **Toolchain.** VS 2026 path is hard-coded at the top of `build.bat`; `scripts\loc.ps1` hard-codes
-> `G:\Sentinel-lang\target\debug\snc.exe`. **Both** snc binaries (release *and* debug) now carry the
-> ADR-0061 subcommands, and `findSnc()` tries release first — so the IDE uses **release** while the
-> build's LOC step uses **debug**. Remaining language/toolchain gap: `snc` has no tier/opt flag (tiers
-> only choose the output dir; always `-O0`).
->
-> **Trust manifest — keep FOUR things in lockstep.** snc's parser is `deny_unknown_fields` over
-> `[[keys]]` tables with a **bare 64-hex `pubkey`** (optional `name`, `grants`). `[dependencies.x]`,
-> `sig`, `policy`, `forbids` are **hard parse errors that abort the build in warn *and* strict**, and
-> an `ed25519:` prefix parses but silently never matches (→ `UNTRUSTED`). The four sites are
-> `examples/sentinel-trust.toml`, `core/Signing.h::loadTrust`, `SigningDialog`'s importer, **and
-> `docs/sentinel-project.md`** — the docs were missed the first time and spent a while publishing a
-> schema that broke the build for anyone who copied it. Change one, change all four.
-> `examples/sentinel.toml` now ships `require = "warn"` **on purpose**, so an ordinary build of
-> `examples/` re-tests the schema (a malformed manifest fails in warn too); `strict` would refuse the
-> deliberately-unsigned `hello` target. Verified: signed target verifies, unsigned warns, old schema
-> → exit 1 with no artifact.
->
-> **Git.** It's a repo (`main`, GPL-3.0 `LICENSE`, `README.md`, `.gitignore`, `.gitattributes`)
-> pushed to **`arcanii/Sentinel-IDE`**, **PUBLIC since phase 32 and it must stay public** —
-> WinSparkle fetches the update appcast over unauthenticated HTTPS, so going private 404s every
-> client's update check silently. `main` tracks `origin/main`; `gh` (2.96.0) is installed + authed.
-> Commit and push only when asked. **Before any `git add -A`,
-> check `git status --untracked-files=all`:** `snc build` drops an *extensionless* PE beside the
-> source (`examples/crypto` is an MZ binary, not a folder) that `*.exe` does not catch — it is now
-> explicitly ignored, but new targets will reproduce the trap.
->
-> **Gotchas that will bite you**
-> - `G:` is a mapped network share; git needs `safe.directory` (already configured globally).
-> - **The build number no longer changes per build** — it's the git commit count (+`BUILDBASE`), so
->   it moves only when you commit, and builds no longer dirty the tree. `build.bat` prints
->   `BUILD_DIRTY <n>` if the tree doesn't match HEAD; don't ship such a build.
-> - `.gitattributes` forces `eol=crlf` on text and marks `*.sig` **binary** so the signed demo stays
->   byte-exact. **Any tool that rewrites `examples/crypto.sentinel` with LF breaks its signature.**
-> - A raw `cmake --build` without `build.bat` silently yields "0.1.3 (build 0)" + zeroed LOC badges,
->   and no `parsers.lib` → the C++ parser fallbacks. Always build through `build.bat`.
-> - A `Remove-Item` in the *same* PowerShell call as a `cmd /c` is rejected by a sandbox guard —
->   keep them in separate calls.
-> - Writing Sentinel (the four parsers in `src/sentinel/parsers.sentinel` are the worked examples):
->   **no `%` operator** (use `v - (v/10)*10`); `if` is an *expression*, so a side-effecting `if` needs
->   an `else` and both arms end in a dummy `0` (`if c { ...; 0 } else { 0 };`); no early `return` (thread
->   a flag, encode once at the end); void helpers are `-> i64` returning `0`; `&&` short-circuits (relied
->   on for bounds-guarded indexing); a **by-value `[u8]` param is MOVED on first use inside a loop** —
->   pass `&[u8]` for anything reused across iterations; **`&"literal"` is rejected** ("cannot borrow a
->   non-lvalue") — bind the literal to a `let` first, then borrow; and char-literal compares are `u8`
->   but numeric literals are `i64` (cast: `(c as i64) >= 128`). No `for` loops, tuples, or *capturing*
->   closures. **Do NOT trust the older, longer gap list** — argv exists (`arg_count()`/`arg(i)`),
->   non-capturing `Fn<T,R>` works, and dir traversal / `stat` / streaming / recoverable I/O errors are
->   reachable through `extern "C" link("kernel32")`. See **`docs/Sentinel-lang_request.md`** (R1–R15,
->   re-measured 2026-07-19; several long-standing entries in this file turned out to be false).
-> - Editing a `.bat` file with a tool that writes **LF** breaks it: `cmd.exe` needs CRLF and fails
->   with nonsense like `'t' is not recognized`. Convert back to CRLF after any programmatic edit.
->
-> **Pick a next task** from "What's next". Note what's already done and what's blocked:
-> the four *file readers* are ported to Sentinel (phases 35–38); the natural remaining Sentinel work is
-> the manifest *writer* `saveProject` (hard — structure-preserving TOML rewrite; deliberately deferred)
-> and the **Seal.h AEAD+KDF core**, which is **BLOCKED upstream on R1** (no secure-zero for `[secret u8]`
-> — porting key material would be a net security regression; see `docs/Sentinel-lang_request.md`), not a
-> quick win despite older notes calling it the top candidate. Genuinely open and unblocked: the
-> **Direct2D editor** (SQLTerminal's `SqlEditorControl.cpp` is GPL-3.0, same lineage), **single-instance
-> /IPC + drag-drop** (land `openFile`'s missing dirty-guard first — see What's next), reconciling the
-> draft BMad spines/PRD (still Authenticode-framed), and Argon2id (also blocked — no Argon2/BLAKE2
-> anywhere). The IDE is released with live auto-update, so treat `main` as shippable and cut releases
-> per `docs/RELEASING.md` when asked.
+> That's the seed. Everything else — the phase history, the build/screenshot commands and window
+> classes, the trust-manifest four-site lockstep rule, the release procedure, the full gotcha list —
+> is in `docs/HANDOVER.md` and the docs it points to. Read there; don't expect it duplicated here.

@@ -20,6 +20,10 @@ Win32 + Common Controls v6, MSVC/Ninja, C++17.
   `≡` popup menu, three regions (tree | editor | bottom dock), status bar + signing chip.
 - `src/host/win32/SettingsDialog.{h,cpp}` / `src/host/win32/ProjectSettingsDialog.{h,cpp}` / `src/host/win32/SigningDialog.{h,cpp}` / `src/host/win32/AboutDialog.{h,cpp}`
   — the themed modal dialogs (app Settings; the structured Project Settings form; the Signing & Trust panel; the About box).
+- `src/host/win32/SaveChangesDialog.{h,cpp}` — the themed **Save / Don't Save / Cancel** prompt for
+  unsaved edits, behind `MainWindow.cpp::confirmSaveIfDirty` (phase 39). Every path that would discard
+  the editor buffer — opening a file/project, switching target, closing the project or the window —
+  goes through it; `loadFileIntoEditor` is the unguarded loader for internal reloads only.
 - `src/core/Project.h` — `sentinel.toml` model (incl. `[[target]]`) + `loadProject`/`saveProject`
   (the writer rewrites only managed values and preserves comments + unmodeled keys, including target blocks).
 - `src/core/Seal.h` — sealed projects: archive → LZMS → AES-256-GCM under a random DEK, LUKS-style
@@ -35,7 +39,7 @@ Win32 + Common Controls v6, MSVC/Ninja, C++17.
   `keygen_core.exe`/`sign_core.exe` beside the snc binary).
 - `src/core/Toolchain.h` — `findVcvars` (auto-detect MSVC env) + `captureMsvcEnv` (vcvars → build env block).
 
-## Status — phases 1–29 complete (1–17 detailed below; 18–29 in [HANDOVER.md](HANDOVER.md))
+## Status — phases 1–39 complete (1–17 detailed below; 18–39 in [HANDOVER.md](HANDOVER.md))
 A real, native Win32 IDE built from the UX spines + `Theme.h`:
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar (signing chip).
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project.
