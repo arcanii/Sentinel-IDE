@@ -19,8 +19,8 @@ REM BUILDBASE keeps the sequence above the retired counter's high-water mark (38
 REM the version never goes backwards across the switch. Nothing had been released when
 REM this changed, so the offset is cosmetic continuity, not a correctness requirement —
 REM but a version that regresses is exactly the bug WinSparkle cannot recover from.
-set "MKT=0.1.1"
-set "MKTRC=0,1,1"
+set "MKT=0.1.2"
+set "MKTRC=0,1,2"
 set "BUILDBASE=100"
 set "BUILDNO="
 for /f %%i in ('git -C "%~dp0.." rev-list --count HEAD 2^>nul') do set "BUILDNO=%%i"
