@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–39 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–40 built and verified.
 
 ---
 
@@ -42,7 +42,8 @@ exist so far:
   disables auto-update for every installed client.
 - **Released.** Latest is **v0.1.3 (build 145)** — every file reader/parser in the IDE now runs
   in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`); the offer path was
-  verified end-to-end (a 0.1.0 client offered 0.1.1, across a marketing bump). See **Releases** below
+  verified end-to-end **as of 0.1.5 only** — before that the *offer* worked and the **install never did**
+  (see phase 40; v0.1.0–v0.1.4 could not auto-install anything). See **Releases** below
   and `docs/RELEASING.md` for the cut procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
@@ -155,7 +156,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–39 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–40 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -472,6 +473,49 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     sets `done` but leaves its `GetMessageW` blocked — sent messages don't wake a queue wait. **Post**
     the message instead, or the dialog looks wedged when the code is fine.)
 
+40. **Auto-update actually installs — it never had.** Every release v0.1.0–v0.1.4 offered updates,
+    downloaded them, verified the Ed25519 signature, shut the app down, and then installed **nothing**.
+    On next launch the user was on the old version and was offered the same update again, forever. It
+    was invisible because **WinSparkle reports failures only through callbacks we had never
+    registered**, so not one line was ever logged. The prior "verified end-to-end" claim was true only
+    of the *offer* path, which is all anyone had ever tested.
+    **Diagnosis (measured, not inferred).** Wiring `win_sparkle_set_error_callback` plus the lifecycle
+    callbacks showed the error callback **never fires**. `win_sparkle_set_user_run_installer_callback`
+    — which runs immediately before WinSparkle would execute the payload, and is handed its path — was
+    the hook that cracked it: on the `check_update_with_ui()` (prompt-then-install) path it is called
+    **~0.5 s after "update found"**, far too fast to have fetched 3.5 MB, with an **empty path**, and
+    is never called again. WinSparkle's own launch therefore had nothing to launch. Ruled out along the
+    way: **Mark-of-the-Web** (no `Zone.Identifier` on the payload), SmartScreen/Defender/AppLocker (no
+    block events), and **our own shutdown logic** — WinSparkle's header states the installer is
+    launched *before* the shutdown callback, so neither `shutdownUpdater()` nor the 3-second watchdog
+    was implicated. The artifact was never at fault: the downloaded payload is **byte-identical
+    (SHA-256)** to the published installer, and running it by hand from WinSparkle's own temp dir
+    installs perfectly.
+    **The fix needs both halves.** (a) We **run the installer ourselves** from
+    `onUserRunInstaller`, returning 1 for "handled" — WinSparkle's broken execute step is out of the
+    loop. *No security cost:* WinSparkle verifies the signature against the compiled-in public key
+    **before** calling us and does not call us if it fails; an empty path returns 0 and logs an error
+    rather than pretending. (b) `checkForUpdates` uses **`win_sparkle_check_update_with_ui_and_install()`**,
+    because only that variant downloads first and passes a real path. It skips the "do you want to
+    update?" prompt — acceptable, since the user got there by choosing Check for Updates.
+    **Two traps found the hard way, both now in comments.** The install **scope must be explicit**:
+    `Sentinel-IDE.iss` sets `PrivilegesRequiredOverridesAllowed=dialog`, so a bare `/SILENT` stops dead
+    on Inno's *"Select Setup Install Mode"* dialog — a silent launch sitting on a modal question, i.e.
+    a hang, which is exactly where the first cut of this fix stalled. We now pass `/CURRENTUSER` or
+    `/ALLUSERS` based on whether the running exe lives under `%LOCALAPPDATA%`, which also stops an
+    update installing a *second* copy into the other scope. And `SEE_MASK_NOASYNC` is required, because
+    WinSparkle asks us to quit the instant the callback returns and the shell call would otherwise be
+    abandoned as the process dies.
+    **Verified end-to-end:** a `0.1.2.153` client with the cache cleared was offered `0.1.4.151` from
+    the live feed, downloaded it, launched it per-user, and was running `0.1.4.151` **within ten
+    seconds** — the first completed auto-update in the project's history. The published 0.1.5 artifact
+    was then downloaded from GitHub, installed, and confirmed to launch and report *no update
+    available* against the live feed.
+    **The diagnostic callbacks stay in.** An updater that fails silently is indistinguishable from one
+    that works, which is precisely how this survived four releases.
+    ⚠ **Clients on v0.1.4 or older cannot auto-install 0.1.5** — the broken updater is the thing being
+    fixed. They need one manual install; updates work from then on.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -492,6 +536,7 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.2` | 140 | `Sentinel-IDE-0.1.2.140-setup.exe` | Patch. The `.sig`-carrier parser (`readSig`) now runs in Sentinel too — every signing/trust-path parser is Sentinel. About figure 8.3% → 9.5%. Behavior-identical to 0.1.1 otherwise. |
 | `v0.1.3` | 145 | `Sentinel-IDE-0.1.3.145-setup.exe` | Patch. The project-manifest reader (`loadProject`) now runs in Sentinel — **every file reader/parser in the IDE is Sentinel**; only the manifest writer (`saveProject`) remains C++. About figure 9.5% → 14.5%. |
 | `v0.1.4` | 151 | `Sentinel-IDE-0.1.4.151-setup.exe` | Patch. The **unsaved-changes guard** (phase 39), and — found by a pre-flight audit of this very release — **the first build that runs on a machine without Visual Studio**: v0.1.0–v0.1.3 all shipped a Debug `/MDd` binary importing the non-redistributable debug CRT. Now Release + static CRT; exe 2.65 → 0.78 MB. |
+| `v0.1.5` | 154 | `Sentinel-IDE-0.1.5.154-setup.exe` | Patch. **The first release whose auto-update actually installs** — v0.1.0–v0.1.4 offered, downloaded and verified updates, then silently installed nothing (phase 40). The app now runs the verified payload itself, and the updater logs what it does. **Clients ≤0.1.4 must install this one by hand.** |
 
 **Every release before 0.1.4 was dead on arrival for anyone without Visual Studio.** `scripts/build.bat`
 is the only build script and it configured `-DCMAKE_BUILD_TYPE=Debug`, so v0.1.0–v0.1.3 shipped a
@@ -670,7 +715,7 @@ read the handover belongs in the handover body, not here._
 > language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It's a
 > **released** product (latest **v0.1.3**, on GitHub, with live WinSparkle auto-update), and real
 > Sentinel code now runs in the shipped binary (the four file parsers). **Read `docs/HANDOVER.md`
-> first — it is the full, current state** (phase list 1–39, the Releases table, What's next, and the
+> first — it is the full, current state** (phase list 1–40, the Releases table, What's next, and the
 > per-area detail). Then, as needed: `docs/RELEASING.md` (how to cut a release), and
 > `docs/Sentinel-lang_request.md` (what the Sentinel language/toolchain can and can't do — measured,
 > not folklore). `docs/prototype.md` + `docs/sentinel-project.md` are older narrative detail.
