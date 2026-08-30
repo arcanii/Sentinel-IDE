@@ -491,6 +491,19 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.1` | 135 | `Sentinel-IDE-0.1.1.135-setup.exe` | **First release with Sentinel in the binary** — the diagnostic + trust-manifest parsers run in Sentinel; About-box "built in Sentinel" progress bar; installer x64/`Program Files` fix; git-derived build number. |
 | `v0.1.2` | 140 | `Sentinel-IDE-0.1.2.140-setup.exe` | Patch. The `.sig`-carrier parser (`readSig`) now runs in Sentinel too — every signing/trust-path parser is Sentinel. About figure 8.3% → 9.5%. Behavior-identical to 0.1.1 otherwise. |
 | `v0.1.3` | 145 | `Sentinel-IDE-0.1.3.145-setup.exe` | Patch. The project-manifest reader (`loadProject`) now runs in Sentinel — **every file reader/parser in the IDE is Sentinel**; only the manifest writer (`saveProject`) remains C++. About figure 9.5% → 14.5%. |
+| `v0.1.4` | 151 | `Sentinel-IDE-0.1.4.151-setup.exe` | Patch. The **unsaved-changes guard** (phase 39), and — found by a pre-flight audit of this very release — **the first build that runs on a machine without Visual Studio**: v0.1.0–v0.1.3 all shipped a Debug `/MDd` binary importing the non-redistributable debug CRT. Now Release + static CRT; exe 2.65 → 0.78 MB. |
+
+**Every release before 0.1.4 was dead on arrival for anyone without Visual Studio.** `scripts/build.bat`
+is the only build script and it configured `-DCMAKE_BUILD_TYPE=Debug`, so v0.1.0–v0.1.3 shipped a
+`/MDd` binary importing `MSVCP140D.dll` / `VCRUNTIME140D.dll` / `VCRUNTIME140_1D.dll` / `ucrtbased.dll`
+— DLLs that ship **only with Visual Studio** and are **not licensed for redistribution**, against an
+installer that bundles no CRT. Install succeeded; launch failed with *"VCRUNTIME140D.dll was not
+found"*. It went unnoticed for four releases because every machine that ever ran it had VS installed.
+Fixed in 0.1.4 with `Release` + `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` (static — the installer is
+per-user and needs no admin, so bundling the VC redist would have meant elevation or a merge module).
+`dumpbin /DEPENDENTS` is the check, and it is now worth running on any release candidate. The
+Sentinel `parsers.lib` links fine under `/MT /O2` (`SENTINEL_PARSERS_OK`), and `seal_test`'s 25
+assertions over the real AEAD/KDF path pass under the optimizer.
 
 To cut the next one: `docs/RELEASING.md` (bump `MKT`/`MKTRC` in `build.bat` if the marketing version
 moves → clean commit → `make-installer.bat` → `sign-release.ps1 -Appcast` → tag the build commit →

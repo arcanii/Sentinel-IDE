@@ -128,6 +128,26 @@ treat that as a safety net, never as the plan.
    ```cmd
    cmd /c scripts\make-installer.bat
    ```
+
+   > **Check the CRT before you ship.** `build.bat` configures **Release** with
+   > `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` (static CRT) so the per-user installer is
+   > self-contained — no VC redistributable, no admin rights. This is load-bearing and was
+   > *wrong* for four releases: it configured `Debug` through v0.1.3, producing a `/MDd`
+   > binary that imports `MSVCP140D.dll`, `VCRUNTIME140D.dll`, `VCRUNTIME140_1D.dll` and
+   > `ucrtbased.dll`. Those ship only with Visual Studio and are **not redistributable**, so
+   > every one of those installers failed to launch on a machine without VS
+   > (*"VCRUNTIME140D.dll was not found"*) — invisible here, because the dev machine has VS.
+   >
+   > Verify the actual artifact, not the intent:
+   > ```
+   > dumpbin /DEPENDENTS build\Sentinel-IDE.exe
+   > ```
+   > Any `*D.dll` or `ucrtbased.dll` in that list is a **stop**. A correct build lists only
+   > Windows system DLLs plus `WinSparkle.dll`.
+   >
+   > Because Release changes codegen, a release candidate is also worth running `ctest` against
+   > (`seal_test` covers the real AEAD/KDF path, which is what `/O2` is most likely to disturb)
+   > and smoke-testing Build/Run once — see the v0.1.4 entry in HANDOVER.md.
    → `build\installer\Sentinel-IDE-0.1.0.<n>-setup.exe`
 
    The installer is **x64-only** (`ArchitecturesAllowed=x64compatible`) and runs Setup in
