@@ -339,3 +339,74 @@ export "C" fn parse_trust(text: &[u8]) -> [u8] {
     push(&mut out, i64_to_u8(0));
     vec_to_array(out)
 }
+
+// ---- detached-signature (.sig) carrier parser -------------------------------
+//
+// A faithful port of Signing.h::readSig. The `.sig` carrier is flat `key: value`
+// lines; each line is split on the FIRST ':', both halves projTrim'd (note: plain
+// trim, no quote stripping). Recognised keys (last-wins): algorithm, key, grants.
+//
+// Result record the host unpacks:
+//   byte 0: present (1 iff the input was non-empty — matches `!text.empty()`)
+//   then three length-prefixed fields, in order: algorithm, key, grants
+//   ([len i64 LE][bytes]; len 0 if that key never appeared).
+export "C" fn parse_sig(text: &[u8]) -> [u8] {
+    let n: i64 = len(*text);
+
+    let mut hasA: bool = false; let mut aA: i64 = 0; let mut aB: i64 = 0;
+    let mut hasK: bool = false; let mut kA: i64 = 0; let mut kB: i64 = 0;
+    let mut hasG: bool = false; let mut gA: i64 = 0; let mut gB: i64 = 0;
+
+    let mut ls: i64 = 0;
+    let mut i: i64 = 0;
+    while i <= n {
+        if i == n || (*text)[i] == '\n' {
+            // projTrim the line [ls, i) -> [ts, te)
+            let mut ts: i64 = ls;
+            while ts < i && is_ws((*text)[ts]) { ts = ts + 1; }
+            let mut te: i64 = i;
+            while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+            // first ':'
+            let mut cp: i64 = ts;
+            let mut hasc: bool = false;
+            while cp < te && hasc == false {
+                if (*text)[cp] == ':' { hasc = true; 0 } else { cp = cp + 1; 0 };
+            }
+            if hasc {
+                // key = projTrim [ts, cp); value = projTrim [cp+1, te)
+                let mut ka: i64 = ts;
+                while ka < cp && is_ws((*text)[ka]) { ka = ka + 1; }
+                let mut kb: i64 = cp;
+                while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                let mut va: i64 = cp + 1;
+                while va < te && is_ws((*text)[va]) { va = va + 1; }
+                let mut vb: i64 = te;
+                while vb > va && is_ws((*text)[vb - 1]) { vb = vb - 1; }
+                if lit_eq(text, ka, kb, "algorithm") {
+                    aA = va; aB = vb; hasA = true; 0
+                } else {
+                    if lit_eq(text, ka, kb, "key") {
+                        kA = va; kB = vb; hasK = true; 0
+                    } else {
+                        if lit_eq(text, ka, kb, "grants") {
+                            gA = va; gB = vb; hasG = true; 0
+                        } else { 0 };
+                        0
+                    };
+                    0
+                };
+                0
+            } else { 0 };
+            ls = i + 1;
+            0
+        } else { 0 };
+        i = i + 1;
+    }
+
+    let mut out: Vec<u8> = vec_new();
+    if n > 0 { push(&mut out, i64_to_u8(1)); 0 } else { push(&mut out, i64_to_u8(0)); 0 };
+    if hasA { push_lenpref(&mut out, text, aA, aB); 0 } else { push_le8(&mut out, 0); 0 };
+    if hasK { push_lenpref(&mut out, text, kA, kB); 0 } else { push_le8(&mut out, 0); 0 };
+    if hasG { push_lenpref(&mut out, text, gA, gB); 0 } else { push_le8(&mut out, 0); 0 };
+    vec_to_array(out)
+}

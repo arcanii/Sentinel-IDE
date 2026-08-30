@@ -94,7 +94,7 @@ target_link_libraries(SentinelIDE PRIVATE
 
 # Sentinel-native parsers (src/sentinel/parsers.sentinel — the diagnostic + trust
 # parsers). scripts\build.bat compiles them to build/generated/parsers.lib via
-# `snc build --lib`; when that lib is present the host's parseDiag and loadTrust call
+# `snc build --lib`; when that lib is present the host's parseDiag / loadTrust / readSig call
 # INTO Sentinel (SENTINELIDE_SENTINEL), otherwise they use the C++ fallbacks. Linking a
 # Sentinel static lib additionally requires these Windows system libs (they satisfy the
 # Rust runtime the lib pulls in — undocumented upstream, filed as R8 in
@@ -105,9 +105,9 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
   target_link_libraries(SentinelIDE PRIVATE
     "${SENTINEL_PARSERS_LIB}"
     legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
-  message(STATUS "SentinelIDE: diagnostic + trust parsers = Sentinel (parsers.lib linked)")
+  message(STATUS "SentinelIDE: diagnostic + trust + sig parsers = Sentinel (parsers.lib linked)")
 else()
-  message(STATUS "SentinelIDE: diagnostic + trust parsers = C++ fallback (parsers.lib absent)")
+  message(STATUS "SentinelIDE: diagnostic + trust + sig parsers = C++ fallback (parsers.lib absent)")
 endif()
 
 # The .rc embeds app.manifest; stop the linker generating a competing one.
@@ -133,7 +133,7 @@ add_test(NAME seal_format COMMAND seal_test)
 #     cmake --build build --target diag_xcheck  &&  build\diag_xcheck.exe
 #     cmake --build build --target trust_xcheck &&  build\trust_xcheck.exe
 if(EXISTS "${SENTINEL_PARSERS_LIB}")
-  foreach(_xc diag_xcheck trust_xcheck)
+  foreach(_xc diag_xcheck trust_xcheck sig_xcheck)
     add_executable(${_xc} tests/${_xc}.cpp)
     target_link_libraries(${_xc} PRIVATE
       "${SENTINEL_PARSERS_LIB}"
@@ -142,4 +142,5 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
   endforeach()
   add_test(NAME diag_parity  COMMAND diag_xcheck)
   add_test(NAME trust_parity COMMAND trust_xcheck)
+  add_test(NAME sig_parity   COMMAND sig_xcheck)
 endif()

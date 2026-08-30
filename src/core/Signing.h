@@ -129,6 +129,37 @@ inline TrustManifest loadTrust(const std::wstring& path) {
 }
 #endif
 
+#ifdef SENTINELIDE_SENTINEL
+// The .sig carrier parser is also Sentinel now — parse_sig in parsers.sentinel (the
+// header is already included above under this same guard). Byte-identical to the C++
+// #else fallback; held in lockstep by tests/sig_xcheck.cpp.
+inline SigInfo readSig(const std::wstring& sigPath) {
+    SigInfo s;
+    std::wstring text = readUtf8(sigPath);
+    if (text.empty()) return s;                 // empty/missing file → not present (as the oracle)
+    int un = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string u8((size_t)un, 0);
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), u8.data(), un, nullptr, nullptr);
+    uint8_t* out = nullptr; int64_t olen = 0;
+    parse_sig((const uint8_t*)u8.data(), (int64_t)u8.size(), &out, &olen);
+    size_t pos = 0;
+    s.present = (olen >= 1 && out && out[0] == 1); pos = 1;
+    auto rd8 = [](const uint8_t* p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v; };
+    auto readLP = [&]() -> std::wstring {
+        uint64_t len = rd8(out + pos); pos += 8;
+        std::wstring w;
+        if (len > 0) {
+            int fw = MultiByteToWideChar(CP_UTF8, 0, (const char*)out + pos, (int)len, nullptr, 0);
+            w.resize((size_t)fw);
+            MultiByteToWideChar(CP_UTF8, 0, (const char*)out + pos, (int)len, w.data(), fw);
+        }
+        pos += (size_t)len; return w;
+    };
+    s.algorithm = readLP(); s.key = readLP(); s.grants = readLP();
+    if (out) sentinel_free_bytes(out);
+    return s;
+}
+#else
 inline SigInfo readSig(const std::wstring& sigPath) {
     SigInfo s;
     std::wstring text = readUtf8(sigPath);
@@ -148,6 +179,7 @@ inline SigInfo readSig(const std::wstring& sigPath) {
     if (!line.empty()) handle(line);
     return s;
 }
+#endif
 
 // Short fingerprint for display (snc prints the first 16 hex chars + ellipsis).
 inline std::wstring shortKey(const std::wstring& key) {
