@@ -38,6 +38,10 @@ exist so far:
   `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
   fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
   disables auto-update for every installed client.
+- **Released.** Latest is **v0.1.1 (build 135)** — the first release carrying Sentinel code in the
+  binary. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`); a 0.1.0 client was
+  verified end-to-end being offered 0.1.1. See **Releases** below and `docs/RELEASING.md` for the cut
+  procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
 
@@ -124,7 +128,8 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   (The old `[string]$Args` param collided with PowerShell's automatic `$Args` and silently
   dropped every argument — that's why a launch could come up with no folder open.)
 
-- **Versioning:** marketing version is **fixed at `0.1.0`**; the build number is
+- **Versioning:** marketing version is **`0.1.1`** (`MKT`/`MKTRC` at the top of `build.bat`; was
+  `0.1.0` through the first release, bumped for v0.1.1). The build number is
   **`git rev-list --count HEAD` + `BUILDBASE`** (phase 34). Same commit → same version, so any
   released artifact can be rebuilt from its tag. It only advances when you **commit**, so repeated
   builds of one commit are indistinguishable by version — deliberate. `build.bat` prints
@@ -134,11 +139,12 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   `BUILDBASE` (=100) exists only to stay above the **retired** `packaging/build_number.txt`
   counter's high-water mark of 38 — the commit count was 26 at the switch, so a raw count would
   have moved the version *backwards*, which WinSparkle can never recover from. Don't lower it.
-  `build.bat` composes `build/generated/Version.h` (`SENTINEL_VERSION_DISPLAY_W` = `L"0.1.0 (build N)"`,
-  `SENTINEL_FILEVERSION` = `0,1,0,N`, etc.), included by `MainWindow.cpp` (status bar), `AboutDialog.cpp`,
-  and `SentinelIDE.rc` (the exe's **FileVersion** = `0.1.0.N`; **ProductVersion** stays the marketing
-  `0.1.0.0`). CMake writes a fallback `Version.h` (build 0) so a raw `cmake --build` without `build.bat`
-  still compiles.
+  `build.bat` composes `build/generated/Version.h` (`SENTINEL_VERSION_DISPLAY_W` = `L"0.1.1 (build N)"`,
+  `SENTINEL_FILEVERSION` = `0,1,1,N`, etc.), included by `MainWindow.cpp` (status bar), `AboutDialog.cpp`,
+  and `SentinelIDE.rc` (the exe's **FileVersion** = `0.1.1.N`; **ProductVersion** stays hard-coded
+  `0.1.0.0` in the `.rc` — which is why the installer reads FileVersion, not ProductVersion; see
+  phase 33). CMake writes a fallback `Version.h` (build 0) so a raw `cmake --build` without
+  `build.bat` still compiles.
 - **Build env:** Visual Studio 2026 Community (MSVC + bundled CMake/Ninja). The exact path is
   hard-coded in `scripts\build.bat` — change it if VS moves. Drive builds through `cmd /c
   scripts\build.bat` (it calls `vcvars64.bat`). Note: a sandbox guard rejects `Remove-Item`
@@ -368,6 +374,25 @@ release + update-signing procedure.
 13 PNGs covering phases 1–11, 13 and 15. Phases 12, 14 and 16–29 were verified live during their
 sessions but no image was committed — treat their screenshots as absent, not lost.
 
+## Releases
+
+Public releases on GitHub (`arcanii/Sentinel-IDE/releases`), each an EdDSA-signed Inno installer that
+WinSparkle auto-updates to. Every release is **built from a clean tree and tagged at the build
+commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build number exactly.
+
+| Tag | Build | Installer | Carries |
+|---|---|---|---|
+| `v0.1.0` | 127 | `Sentinel-IDE-0.1.0.127-setup.exe` | First release. The whole phase 1–32 IDE + live auto-update. **No Sentinel in the binary yet** (C++ parsers). |
+| `v0.1.1` | 135 | `Sentinel-IDE-0.1.1.135-setup.exe` | **First release with Sentinel in the binary** — the diagnostic + trust-manifest parsers run in Sentinel; About-box "built in Sentinel" progress bar; installer x64/`Program Files` fix; git-derived build number. |
+
+To cut the next one: `docs/RELEASING.md` (bump `MKT`/`MKTRC` in `build.bat` if the marketing version
+moves → clean commit → `make-installer.bat` → `sign-release.ps1 -Appcast` → tag the build commit →
+`gh release create` with the installer → commit+push `appcast.xml` → verify the feed + enclosure
+resolve). **Verified for v0.1.1:** signature validates against the compiled-in key, the feed serves
+`0.1.1.135`, the enclosure resolves, and a live `0.1.0.126` client was offered the update across the
+marketing bump. **Known cosmetic:** WinSparkle's release-notes panel renders the GitHub page with
+full site chrome — a standalone HTML notes file per release would fix it (unbuilt).
+
 ## Key decisions
 
 - **Identity:** dark-primary Claude-desktop coral, OS light/dark follow, sourced verbatim from
@@ -538,7 +563,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > (password → AES-256-GCM over an LZMS-compressed archive, LUKS-style unlock slots in `core/Seal.h`);
 > **file associations** (double-click `.sntproject`/`.sentinel`); an **About box with LOC badges**
 > whose total is counted by **`tools/loc.sentinel`** (the first piece written *in* Sentinel); and a
-> **Windows installer** (Inno Setup → `build/installer/Sentinel-IDE-0.1.0-setup.exe`).
+> **Windows installer** (Inno Setup → `build/installer/Sentinel-IDE-<ver>.<build>-setup.exe`).
 >
 > **Build / run / screenshot**
 > ```
@@ -588,7 +613,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 >   `BUILD_DIRTY <n>` if the tree doesn't match HEAD; don't ship such a build.
 > - `.gitattributes` forces `eol=crlf` on text and marks `*.sig` **binary** so the signed demo stays
 >   byte-exact. **Any tool that rewrites `examples/crypto.sentinel` with LF breaks its signature.**
-> - A raw `cmake --build` without `build.bat` silently yields "0.1.0 (build 0)" + zeroed LOC badges.
+> - A raw `cmake --build` without `build.bat` silently yields "0.1.1 (build 0)" + zeroed LOC badges.
 > - A `Remove-Item` in the *same* PowerShell call as a `cmd /c` is rejected by a sandbox guard —
 >   keep them in separate calls.
 > - Writing Sentinel: **no `%` operator** (use `v - (v/10)*10`), `if` is an *expression* so a bare

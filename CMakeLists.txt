@@ -63,15 +63,18 @@ endif()
 set(SENTINEL_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${SENTINEL_GENERATED_DIR}")
 if(NOT EXISTS "${SENTINEL_GENERATED_DIR}/Version.h")
+  # Fallback marketing version must track MKT in scripts\build.bat (0.1.1). This is
+  # only used for a raw `cmake --build` without build.bat — a degenerate "you forgot
+  # the build script" case that yields build 0 — but keep it consistent, not stale.
   file(WRITE "${SENTINEL_GENERATED_DIR}/Version.h"
     "#pragma once\n"
     "#define SENTINEL_BUILD_NUMBER 0\n"
-    "#define SENTINEL_VERSION_MARKETING \"0.1.0\"\n"
-    "#define SENTINEL_VERSION_DISPLAY \"0.1.0 (build 0)\"\n"
-    "#define SENTINEL_VERSION_DISPLAY_W L\"0.1.0 (build 0)\"\n"
-    "#define SENTINEL_FILEVERSION 0,1,0,0\n"
-    "#define SENTINEL_FILEVERSION_STR \"0.1.0.0\"\n"
-    "#define SENTINEL_FILEVERSION_STR_W L\"0.1.0.0\"\n")
+    "#define SENTINEL_VERSION_MARKETING \"0.1.1\"\n"
+    "#define SENTINEL_VERSION_DISPLAY \"0.1.1 (build 0)\"\n"
+    "#define SENTINEL_VERSION_DISPLAY_W L\"0.1.1 (build 0)\"\n"
+    "#define SENTINEL_FILEVERSION 0,1,1,0\n"
+    "#define SENTINEL_FILEVERSION_STR \"0.1.1.0\"\n"
+    "#define SENTINEL_FILEVERSION_STR_W L\"0.1.1.0\"\n")
 endif()
 if(NOT EXISTS "${SENTINEL_GENERATED_DIR}/Loc.h")
   file(WRITE "${SENTINEL_GENERATED_DIR}/Loc.h"
