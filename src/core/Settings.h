@@ -22,6 +22,7 @@ struct Settings {
     std::wstring sncPath;                         // optional snc.exe override (else auto-detected)
     std::wstring vcvarsPath;                      // optional vcvars64.bat override (MSVC linker env; else auto-detected)
     bool         lineNumbers = false;             // show the editor line-number gutter
+    std::wstring updateSkipVersion;               // appcast version the user chose to skip (never re-offer it)
     std::vector<std::wstring> recents;            // recently-opened project folders (most-recent first)
 };
 
@@ -60,6 +61,7 @@ inline void loadSettings(Settings& s) {
     GetPrivateProfileStringW(L"build", L"snc", L"", buf, 1024, path.c_str()); s.sncPath = buf;
     GetPrivateProfileStringW(L"build", L"vcvars", L"", buf, 1024, path.c_str()); s.vcvarsPath = buf;
     s.lineNumbers = GetPrivateProfileIntW(L"editor", L"line_numbers", s.lineNumbers ? 1 : 0, path.c_str()) != 0;
+    GetPrivateProfileStringW(L"update", L"skip_version", L"", buf, 1024, path.c_str()); s.updateSkipVersion = buf;
     s.recents.clear();
     int rc = GetPrivateProfileIntW(L"recents", L"count", 0, path.c_str());
     for (int i = 0; i < rc && i < kMaxRecents; ++i) {
@@ -76,6 +78,7 @@ inline void saveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"build", L"snc", s.sncPath.c_str(), path.c_str());
     WritePrivateProfileStringW(L"build", L"vcvars", s.vcvarsPath.c_str(), path.c_str());
     WritePrivateProfileStringW(L"editor", L"line_numbers", s.lineNumbers ? L"1" : L"0", path.c_str());
+    WritePrivateProfileStringW(L"update", L"skip_version", s.updateSkipVersion.c_str(), path.c_str());
     WritePrivateProfileStringW(L"recents", nullptr, nullptr, path.c_str());   // clear stale itemN first
     WritePrivateProfileStringW(L"recents", L"count", std::to_wstring((int)s.recents.size()).c_str(), path.c_str());
     for (size_t i = 0; i < s.recents.size(); ++i)

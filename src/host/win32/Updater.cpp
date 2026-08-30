@@ -3,7 +3,8 @@
 
 #ifdef SENTINELIDE_HAVE_WINSPARKLE
 
-#include <shellapi.h>   // ShellExecuteExW — we launch the update installer ourselves
+#include <shellapi.h>   // ShellExecuteExW
+#include <wininet.h>    // our own appcast poll (see startOwnUpdateTimer) — we launch the update installer ourselves
 
 #include <atomic>
 #include <string>
@@ -77,6 +78,89 @@ void onShutdownRequest() {
 }
 
 int onCanShutdown() { return 1; }
+
+// ---- our own periodic check ------------------------------------------------
+// WinSparkle's built-in periodic check is disabled in initUpdater, because when it finds
+// something it raises WinSparkle's own prompt — the flow that hands user_run_installer an
+// empty path and installs nothing. So we poll the appcast ourselves and, if it names a newer
+// version, ask the main window to offer it. Accepting routes into checkForUpdates(), i.e.
+// win_sparkle_check_update_with_ui_and_install(), which is the path that actually works.
+//
+// This does NOT weaken anything: the only decision made here is whether to OFFER an update.
+// The download, the Ed25519 signature check against the compiled-in public key, and the
+// install are all still WinSparkle's. A tampered feed can at worst make us offer an update
+// that WinSparkle then refuses to install.
+
+// Parse "a.b.c.d" into four numbers. Missing components read as 0, so "0.1.6" == "0.1.6.0".
+void parseVersion(const char* v, int out[4]) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    int i = 0;
+    while (v && *v && i < 4) {
+        while (*v >= '0' && *v <= '9') { out[i] = out[i] * 10 + (*v - '0'); ++v; }
+        if (*v == '.') { ++v; ++i; } else break;
+    }
+}
+bool versionIsNewer(const char* candidate, const char* mine) {
+    int a[4], b[4];
+    parseVersion(candidate, a);
+    parseVersion(mine, b);
+    for (int i = 0; i < 4; ++i) { if (a[i] != b[i]) return a[i] > b[i]; }
+    return false;
+}
+
+// GET the appcast. Small, plain, and failure just means "try again next tick".
+bool fetchAppcast(std::string& body) {
+    HINTERNET net = InternetOpenW(L"Sentinel-IDE", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!net) return false;
+    // RELOAD/NO_CACHE_WRITE or WinINet will happily serve us a cached feed forever.
+    const DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                        INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_UI;
+    HINTERNET url = InternetOpenUrlA(net, kAppcastUrl, nullptr, 0, flags, 0);
+    if (!url) { InternetCloseHandle(net); return false; }
+    char buf[2048];
+    DWORD got = 0;
+    while (InternetReadFile(url, buf, sizeof(buf), &got) && got > 0) {
+        body.append(buf, got);
+        if (body.size() > 256 * 1024) break;   // a sane cap; the real feed is well under 1 KB
+    }
+    InternetCloseHandle(url);
+    InternetCloseHandle(net);
+    return !body.empty();
+}
+
+// Pull sparkle:version="..." out of the feed. We publish this file, so a targeted match
+// beats dragging in an XML parser.
+std::string appcastVersion(const std::string& body) {
+    const std::string key = "sparkle:version=\"";
+    const size_t a = body.find(key);
+    if (a == std::string::npos) return {};
+    const size_t b = body.find('"', a + key.size());
+    if (b == std::string::npos) return {};
+    return body.substr(a + key.size(), b - (a + key.size()));
+}
+
+std::atomic<bool> g_timerRunning{false};
+
+void startOwnUpdateTimer(HWND mainWnd) {
+    if (g_timerRunning.exchange(true)) return;
+    std::thread([mainWnd] {
+        // Let the app finish starting before touching the network.
+        Sleep(90 * 1000);
+        for (;;) {
+            std::string body;
+            if (fetchAppcast(body)) {
+                const std::string ver = appcastVersion(body);
+                if (!ver.empty() && versionIsNewer(ver.c_str(), SENTINEL_FILEVERSION_STR)) {
+                    logMsg(LogLevel::Info, L"Updater: periodic check found a newer version in the appcast");
+                    const std::wstring w(ver.begin(), ver.end());   // ASCII version string
+                    PostMessageW(mainWnd, WM_APP_UPDATE_AVAILABLE, 0, (LPARAM)_wcsdup(w.c_str()));
+                    return;   // offered once per run; the user decides from here
+                }
+            }
+            Sleep(24 * 60 * 60 * 1000);   // daily thereafter
+        }
+    }).detach();
+}
 
 // ---- diagnostics ----------------------------------------------------------
 // WinSparkle reports failures ONLY through these callbacks. Without them a failed
@@ -197,8 +281,15 @@ void initUpdater(HWND mainWnd) {
     win_sparkle_set_update_cancelled_callback(onUpdateCancelled);
     win_sparkle_set_update_dismissed_callback(onUpdateDismissed);
     win_sparkle_set_user_run_installer_callback(onUserRunInstaller);
-    win_sparkle_init();   // also runs the periodic background check
+    // Turn WinSparkle's own periodic check OFF. When it finds an update it raises its own
+    // prompt, and that prompt's install path is the broken one (empty payload path, installs
+    // nothing). We replace it with startOwnUpdateTimer below, which routes an accepted offer
+    // through the working entry point instead. Without this the user gets two update prompts,
+    // one of which silently does nothing.
+    win_sparkle_set_automatic_check_for_updates(0);
+    win_sparkle_init();
     g_started = true;
+    startOwnUpdateTimer(mainWnd);
     logMsg(LogLevel::Info, std::wstring(L"Updater: initialised (") + SENTINEL_FILEVERSION_STR_W + L")");
 }
 

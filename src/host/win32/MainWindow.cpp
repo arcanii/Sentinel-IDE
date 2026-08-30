@@ -24,6 +24,7 @@
 #include "host/win32/AboutDialog.h"
 #include "host/win32/PasswordDialog.h"
 #include "host/win32/SaveChangesDialog.h"
+#include "host/win32/UpdateDialog.h"
 #include "host/win32/Updater.h"
 
 #include <windows.h>
@@ -54,6 +55,7 @@ constexpr wchar_t kAppName[]   = L"Sentinel-IDE";
 constexpr wchar_t kVersion[]   = SENTINEL_VERSION_DISPLAY_W;
 constexpr UINT WM_APP_LINE = WM_APP + 1;   // lParam = heap wchar_t* (UI frees)
 constexpr UINT WM_APP_DONE = WM_APP + 2;   // wParam = exit code
+constexpr UINT_PTR kUpdateOfferTimer = 1;   // retry the background update offer once no modal is up
 constexpr UINT WM_APP_SIGN = WM_APP + 3;   // wParam = SignState, lParam = heap "file\tkey\tgrants" (UI frees)
 
 enum CtrlId : int { IDC_TREE = 2001, IDC_EDIT = 2002, IDC_OUT = 2003, IDC_PROBLEMS = 2004 };
@@ -91,6 +93,7 @@ struct AppState {
     int   tier = 1;  // 0=dev 1=experimental 2=stable 3=hardened (TIERED_RELEASES.md)
     int   target = 0;  // active build target (index into project.targets)
     std::wstring rootPath, curFilePath, curFileName, sncPath;
+    std::wstring pendingUpdate;   // version offered by the background poll, held until no modal is up
     std::wstring savedText;   // editor text as of the last load/save — the saved point undo can return to
     std::wstring statusLeft = L"Ln 1, Col 1", statusMsg = L"Open a folder to start", pendingMsg;
     std::vector<std::wstring> nodePaths;
@@ -1501,6 +1504,49 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_LBUTTONUP: if (g.dragV) { g.dragV = false; ReleaseCapture(); } return 0;
+    case WM_APP_UPDATE_AVAILABLE: {
+        // Our own appcast poll found something newer (WinSparkle's periodic check is off —
+        // its prompt leads to the install path that does nothing). Offer it; accepting runs
+        // checkForUpdates(), which is the entry point that actually installs.
+        wchar_t* ver = reinterpret_cast<wchar_t*>(lParam);
+        if (ver) { g.pendingUpdate = ver; free(ver); }
+        if (g.pendingUpdate.empty()) return 0;
+        // The user asked never to see this one again.
+        if (_wcsicmp(g.pendingUpdate.c_str(), g.settings.updateSkipVersion.c_str()) == 0) {
+            logMsg(LogLevel::Info, L"Updater: skipping offer of " + g.pendingUpdate + L" (user skipped this version)");
+            g.pendingUpdate.clear(); return 0;
+        }
+        // NEVER open on top of another modal. This message is posted asynchronously, and every
+        // modal here pumps with a null-filter GetMessageW, so it would be dispatched straight
+        // into their nested loop — and this dialog would then re-enable the main window with
+        // that prompt still pending. Wait until the main window is interactive again.
+        if (!IsWindowEnabled(hwnd)) { SetTimer(hwnd, kUpdateOfferTimer, 4000, nullptr); return 0; }
+        KillTimer(hwnd, kUpdateOfferTimer);
+        const std::wstring newVer = g.pendingUpdate;
+        g.pendingUpdate.clear();
+        switch (showUpdateAvailableDialog(hwnd, newVer, SENTINEL_FILEVERSION_STR_W)) {
+            case UpdateChoice::InstallNow:
+                logMsg(LogLevel::Info, L"Updater: user accepted the background offer of " + newVer);
+                checkForUpdates(hwnd);
+                break;
+            case UpdateChoice::SkipVersion:
+                g.settings.updateSkipVersion = newVer; saveSettings(g.settings);
+                logMsg(LogLevel::Info, L"Updater: user chose to skip version " + newVer);
+                break;
+            default:
+                logMsg(LogLevel::Info, L"Updater: user deferred the background offer of " + newVer);
+                break;
+        }
+        return 0;
+    }
+    case WM_TIMER:
+        if (wParam == kUpdateOfferTimer) {
+            KillTimer(hwnd, kUpdateOfferTimer);
+            if (!g.pendingUpdate.empty())
+                PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, 0, (LPARAM)_wcsdup(g.pendingUpdate.c_str()));
+            return 0;
+        }
+        break;
     case WM_APP_LINE: {
         wchar_t* raw = (wchar_t*)lParam;
         std::wstring line = stripAnsi(raw ? raw : L""); if (raw) free(raw);

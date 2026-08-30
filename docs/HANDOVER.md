@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–40 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–41 built and verified.
 
 ---
 
@@ -42,10 +42,10 @@ exist so far:
   disables auto-update for every installed client.
 - **Released.** Latest is **v0.1.6 (build 160)**; seven releases so far. Every file reader/parser in
   the IDE runs in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`), but read
-  phase 40 before trusting it: v0.1.0–v0.1.4 offered updates that **could never install**, and even in
-  0.1.5 only the **manual** ≡ ▸ Check for Updates… path installs — WinSparkle's **automatic/background
-  check is still broken** (same empty-payload bug, upstream). See **Releases** below and
-  `docs/RELEASING.md` for the cut procedure.
+  phases 40–41 before trusting it: v0.1.0–v0.1.4 offered updates that **could never install**, and
+  0.1.5 fixed only the **manual** ≡ ▸ Check for Updates… path. Since **phase 41** the background path
+  works too, on **our own timer** — WinSparkle's periodic check is switched off because its prompt is
+  the broken one. See **Releases** below and `docs/RELEASING.md` for the cut procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
 
@@ -66,6 +66,7 @@ exist so far:
 | `src/host/win32/SigningDialog.{h,cpp}` | Themed modal **Signing & Trust** panel (ADR-0061 keygen/sign/verify + trust viewer) |
 | `src/host/win32/AboutDialog.{h,cpp}` | Themed modal **About** box (S2 shield + name/version/tagline + lines-of-code shields.io badges) |
 | `src/host/win32/PasswordDialog.{h,cpp}` | Themed modal password prompt (one field, or two with a match check for sealing) |
+| `src/host/win32/UpdateDialog.{h,cpp}` | Themed modal **update offer** (class `SentinelUpdateDlg`, Skip/Install/Later) raised by the updater's own appcast poll — WinSparkle's equivalent prompt leads to the install path that does nothing (phase 41). |
 | `src/host/win32/SaveChangesDialog.{h,cpp}` | Themed modal **Save / Don't Save / Cancel** prompt for unsaved edits (class `SentinelSaveDlg`). Driven by `MainWindow.cpp::confirmSaveIfDirty` — the single choke point every discarding path goes through (phase 39). |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
@@ -177,7 +178,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–40 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–41 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -554,9 +555,42 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     raised the update prompt unprompted after 7.8 s, and clicking Install logged
     `payload ready — []  exists=NO` and installed nothing. `checkForUpdates()` is the only entry point
     we control, so the fix reaches the menu item and the About-box button and nothing else.
-    **Do not claim auto-update "just works"** — it works when the user asks for it. Fixing the
-    background path needs either a newer/rebuilt WinSparkle, or replacing its periodic check with our
-    own timer calling the same working entry point (untried).
+    **Do not claim auto-update "just works"** — it worked only when the user asked for it, until
+    phase 41 replaced the background path too.
+
+41. **Background auto-update, on our own timer.** Phase 40 fixed only the manual check, because
+    `checkForUpdates()` is the sole entry point we control; WinSparkle's periodic check raised its own
+    prompt and installed nothing. Now `initUpdater` calls
+    **`win_sparkle_set_automatic_check_for_updates(0)`** — silencing that prompt entirely, so there is
+    never a second, dud offer — and starts a detached thread that sleeps 90 s, GETs the appcast over
+    WinINet, pulls `sparkle:version` out of it, and compares against `SENTINEL_FILEVERSION_STR`. If it
+    is newer the thread posts **`WM_APP_UPDATE_AVAILABLE`** and returns (one offer per run). The host
+    shows a themed `UpdateDialog` (**Skip this version · Install now · Later**), and accepting calls
+    `checkForUpdates()` — the entry point that works.
+    **Only the decision to OFFER is ours.** The download, the Ed25519 verification against the
+    compiled-in key, and the install all remain WinSparkle's, so a tampered feed can at worst provoke
+    an offer WinSparkle then refuses to install. We deliberately did not reimplement any of that.
+    **Three defects an adversarial review caught in the first cut, all real, all fixed:**
+    (i) the offer is posted **asynchronously**, and every modal in this app pumps with a
+    `GetMessageW(&msg, nullptr, 0, 0)` — a null filter — so the message was dispatched *into their
+    nested loop* and the offer opened **on top of** e.g. the unsaved-changes prompt; worse, closing it
+    ran an unconditional `EnableWindow(owner, TRUE)`, re-enabling the main window with that prompt
+    still pending, which is a route back to discarding edits. The handler now refuses to open while
+    `!IsWindowEnabled(hwnd)`, parks the version in `g.pendingUpdate` and retries on a 4 s timer; and
+    the dialog restores the owner's *prior* enabled state rather than TRUE.
+    (ii) `Install now` was the focused `BS_DEFPUSHBUTTON`, copied from `SaveChangesDialog` — fine
+    there because the user asked for that dialog, wrong here because this one arrives uninvited while
+    they are typing, so a stray Enter would install and quit the IDE mid-sentence. **`Later` is now
+    the default and holds focus**, and `IDOK` is ignored for 700 ms after the dialog appears.
+    (iii) a declined version was re-offered on every launch. **Skip this version** persists to
+    `settings.ini` (`[update] skip_version`) and is checked before offering.
+    **Verified live, each point separately:** the offer appears unattended at ~91 s and no WinSparkle
+    prompt appears alongside it; accepting took a 0.1.5.162 client to 0.1.6.160 in under 10 s; with a
+    Settings modal open the offer correctly did **not** appear, then arrived 3.3 s after that modal
+    closed; Skip wrote `skip_version=0.1.6.160` and a relaunch was not re-offered; and an
+    already-current client saw no prompt at all in 125 s.
+    **Known and deliberate:** the poll runs 90 s after *every* launch (a ~1 KB GET) rather than
+    persisting a daily last-check, and `Later` means "ask again next launch" — Skip is the durable no.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
@@ -763,7 +797,7 @@ read the handover belongs in the handover body, not here._
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
-> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–40, Environment gotchas,
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–41, Environment gotchas,
 > the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not

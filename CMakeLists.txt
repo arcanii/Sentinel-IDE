@@ -29,6 +29,7 @@ add_executable(SentinelIDE WIN32
   src/host/win32/AboutDialog.cpp
   src/host/win32/PasswordDialog.cpp
   src/host/win32/SaveChangesDialog.cpp
+  src/host/win32/UpdateDialog.cpp
   src/host/win32/Updater.cpp
   packaging/SentinelIDE.rc)
 
@@ -91,7 +92,7 @@ set_target_properties(SentinelIDE PROPERTIES OUTPUT_NAME "Sentinel-IDE")
 
 target_include_directories(SentinelIDE PRIVATE src "${SENTINEL_GENERATED_DIR}")
 target_link_libraries(SentinelIDE PRIVATE
-  comctl32 dwmapi uxtheme gdi32 user32 shell32 ole32 bcrypt cabinet advapi32)
+  comctl32 dwmapi uxtheme gdi32 user32 shell32 ole32 bcrypt cabinet advapi32 wininet)
 
 # Sentinel-native parsers (src/sentinel/parsers.sentinel — the diagnostic + trust
 # parsers). scripts\build.bat compiles them to build/generated/parsers.lib via

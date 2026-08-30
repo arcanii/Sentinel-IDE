@@ -29,6 +29,17 @@ void shutdownUpdater();
 // is hidden when false, so we never present a check that cannot verify anything.
 bool updaterAvailable();
 
+// Posted to the main window when OUR OWN periodic check finds a newer version in the
+// appcast. lParam is a heap wchar_t* with the new version string; the UI must free it.
+//
+// We run that periodic check ourselves because WinSparkle's built-in one is unusable here:
+// it raises WinSparkle's own update prompt, which is the flow that hands us an empty payload
+// path and installs nothing (see HANDOVER phase 40). initUpdater therefore turns WinSparkle's
+// automatic checking OFF and starts the timer below instead. Nothing security-relevant moves:
+// we only decide whether to OFFER, and the download, Ed25519 verification and install still
+// go through WinSparkle via checkForUpdates().
+constexpr UINT WM_APP_UPDATE_AVAILABLE = WM_APP + 9;
+
 // True once WinSparkle has asked us to quit so it can install an update. The WM_CLOSE
 // that arrives then is NOT a user closing the window: WinSparkle is waiting on our
 // process handle behind a 3-second force-exit watchdog, so the close path must not stop
