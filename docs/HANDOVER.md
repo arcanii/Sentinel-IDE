@@ -547,8 +547,10 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     that works, which is precisely how this survived four releases.
     ⚠ **Clients on v0.1.4 or older cannot auto-install 0.1.5** — the broken updater is the thing being
     fixed. They need one manual install.
-    ⚠ **Only the MANUAL check installs. The automatic/background check is STILL BROKEN** — verified
-    afterwards, and the reason this entry exists in two halves. `win_sparkle_init()` also starts a
+    ⚠ **As shipped in 0.1.5/0.1.6, only the MANUAL check installed; the automatic/background check
+    was still broken** — verified afterwards, and the reason this entry exists in two halves.
+    **Superseded by phase 41**, which replaced the background path; this paragraph is kept because it
+    records *why* the split existed and how the background failure was measured. `win_sparkle_init()` also starts a
     periodic check, and that check raises WinSparkle's *own* prompt, i.e. the same
     `check_update_with_ui()` flow whose payload path is empty. Measured: with `CheckForUpdates=1` and
     `LastCheckTime=0` forced in `HKCU\Software\Sentinel\Sentinel-IDE\WinSparkle`, a 0.1.2.153 client
