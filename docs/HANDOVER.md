@@ -40,7 +40,7 @@ exist so far:
   `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
   fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
   disables auto-update for every installed client.
-- **Released.** Latest is **v0.1.6 (build 160)**; seven releases so far. Every file reader/parser in
+- **Released.** Latest is **v0.1.7 (build 164)**; eight releases so far. Every file reader/parser in
   the IDE runs in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`), but read
   phases 40–41 before trusting it: v0.1.0–v0.1.4 offered updates that **could never install**, and
   0.1.5 fixed only the **manual** ≡ ▸ Check for Updates… path. Since **phase 41** the background path
@@ -614,6 +614,7 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.4` | 151 | `Sentinel-IDE-0.1.4.151-setup.exe` | Patch. The **unsaved-changes guard** (phase 39), and — found by a pre-flight audit of this very release — **the first build that runs on a machine without Visual Studio**: v0.1.0–v0.1.3 all shipped a Debug `/MDd` binary importing the non-redistributable debug CRT. Now Release + static CRT; exe 2.65 → 0.78 MB. |
 | `v0.1.5` | 154 | `Sentinel-IDE-0.1.5.154-setup.exe` | Patch. **The first release whose auto-update actually installs** — v0.1.0–v0.1.4 offered, downloaded and verified updates, then silently installed nothing (phase 40). The app now runs the verified payload itself, and the updater logs what it does. **Clients ≤0.1.4 must install this one by hand.** |
 | `v0.1.6` | 160 | `Sentinel-IDE-0.1.6.160-setup.exe` | Patch. Saved-point dirty tracking: undoing back to the loaded or last-saved text now clears the `●` and the unsaved-changes prompt, instead of latching on at the first keystroke. **First release verified by a real released client auto-updating to it** — a shipped 0.1.5 install went to 0.1.6.160 in under 10 s via ≡ ▸ Check for Updates…. |
+| `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
 
 **Every release before 0.1.4 was dead on arrival for anyone without Visual Studio.** `scripts/build.bat`
 is the only build script and it configured `-DCMAKE_BUILD_TYPE=Debug`, so v0.1.0–v0.1.3 shipped a
@@ -791,7 +792,7 @@ read the handover belongs in the handover body, not here._
 
 > You're continuing **Sentinel-IDE** (`G:\SentinelIDE`) — a native Win32 IDE for the **Sentinel**
 > language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It is a
-> **released, public, auto-updating** product: seven releases, latest **v0.1.6 (build 160)**, and real
+> **released, public, auto-updating** product: eight releases, latest **v0.1.7 (build 164)**, and real
 > Sentinel code runs in the shipped binary (the four file parsers). Treat `main` as shippable.
 >
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
