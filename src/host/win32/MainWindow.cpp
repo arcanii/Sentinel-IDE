@@ -857,10 +857,10 @@ void outLinkify(LONG base, size_t ts, size_t te) {
 // are given, they receive the [start,end) char span of the file:line:col token
 // within `s` (used to mark it as a clickable link in the Output pane).
 #ifdef SENTINELIDE_SENTINEL
-// The diagnostic parser IS Sentinel code — src/sentinel/diag.sentinel, compiled to a
-// C-ABI static lib (build/generated/diag.lib) and linked in. This is the first piece
-// of Sentinel-IDE's runtime PRODUCT logic written in Sentinel to ship in the binary,
-// making the About box's "interpretation of untrusted bytes: Sentinel" literally true.
+// The diagnostic parser IS Sentinel code — parse_diag in src/sentinel/parsers.sentinel,
+// compiled to a C-ABI static lib (build/generated/parsers.lib) and linked in. The first
+// piece of Sentinel-IDE's runtime PRODUCT logic written in Sentinel to ship in the
+// binary, making the About box's "interpretation of untrusted bytes: Sentinel" true.
 // The C++ #else branch below is a byte-identical fallback for a snc-less build; the two
 // are held in lockstep by tests/diag_xcheck.cpp (11 cross-checked cases).
 //

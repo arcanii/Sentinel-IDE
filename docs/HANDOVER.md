@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–35 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–36 built and verified.
 
 ---
 
@@ -60,8 +60,8 @@ exist so far:
 | `src/host/win32/PasswordDialog.{h,cpp}` | Themed modal password prompt (one field, or two with a match check for sealing) |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
-| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phase 35). `diag.sentinel` = the build-diagnostic parser, built to `build/generated/diag.lib` (C-ABI, ADR 0059) and called from `parseDiag`. This is the thin-host thesis made real. |
-| `tests/diag_xcheck.cpp` | Proves `diag.sentinel` is byte-identical to the C++ `parseDiag` oracle (11 cross-checked cases). `cmake --build build --target diag_xcheck` / `ctest`. |
+| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phase 35). `parsers.sentinel` = the build-diagnostic + trust-manifest parsers, built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust`. The thin-host thesis made real; About box shows the % in Sentinel. |
+| `tests/diag_xcheck.cpp`, `tests/trust_xcheck.cpp` | Prove the Sentinel parsers stay byte-identical to their C++ oracles (11 + 12 cases). `ctest --test-dir build`. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
 | `src/core/Signing.h` | Trust manifest (`[[keys]]`) + `.sig` parsers, `verifyFile`, and `sncSigningCaps` — which reports **verify** and **keygen/sign** as separate capabilities (they fail independently; see phase 30) |
@@ -146,7 +146,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–35 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–36 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -336,11 +336,30 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     ABI** (not `&mut [u8]`) to sidestep R3; the host converts UTF-8 byte offsets back to UTF-16 char
     offsets so link spans stay correct on non-ASCII paths; **calling** a Sentinel lib (vs merely
     linking an unused one) pulls in the runtime — the exe grew **~1.05 MB** (1.68→2.73 MB, Debug),
-    the honest cost the R-doc's "+512 bytes" (unreferenced) did not show. `loc.ps1` now counts
+    the honest cost the R-doc's "+512 bytes" (unreferenced) did not show. **(Phase 36 renamed `diag.sentinel`→`parsers.sentinel` / `diag.lib`→`parsers.lib` and the gate `SENTINELIDE_SENTINEL_DIAG`→`SENTINELIDE_SENTINEL` when the trust parser joined the same lib.)** `loc.ps1` now counts
     `src/**.sentinel`, so the About box's **Sentinel LOC badge went 67 → 228**.
     **New build-time fact:** a normal `build.bat` now expects release `snc` at
     `G:\Sentinel-lang\target\release\snc.exe` to produce the lib (graceful C++ fallback if absent),
     so the default build genuinely depends on the Sentinel toolchain.
+
+36. **Trust-manifest parser in Sentinel — first security-boundary port + a thesis meter.**
+    `loadTrust` (the code deciding which Ed25519 keys the build trusts) now runs in Sentinel:
+    `parse_trust` in `src/sentinel/parsers.sentinel`, a faithful port of `Signing.h::loadTrust`
+    (`[[keys]]` tables, `name`/`pubkey` via projUnq, `grants` via parseInlineArr, block-closing
+    tables, the loose `[[keystore]]` match quirk preserved). `tests/trust_xcheck.cpp` holds it
+    byte-identical to the C++ oracle (12 cases). **Architecture change:** `diag.sentinel` +
+    `trust.sentinel` were **merged into one lib** (`parsers.sentinel` → `parsers.lib`) because each
+    Sentinel static lib bundles the whole runtime — two libs would collide on `sentinel_free_bytes`
+    / the allocator. The payoff is the thesis working: the second parser grew the exe by **only
+    ~8 KB** (the first paid the ~1 MB runtime cost; every further port is nearly free). The gate is
+    now `SENTINELIDE_SENTINEL` (both parsers); `MainWindow.cpp::parseDiag` and `Signing.h::loadTrust`
+    both call in, both keep C++ `#else` fallbacks. **Verified live:** the Signing & Trust panel lists
+    the demo key (`58ad2d8c…`, grants secret/constant_time/alloc) parsed from `sentinel-trust.toml`
+    by the Sentinel `loadTrust`.
+    Also (per Bryan's request): the **About box now shows a "built in Sentinel" progress bar** — a
+    coral fill + `X.X% written in Sentinel`, Sentinel's share of Sentinel+C++ LOC (build tooling
+    excluded). It moves with every port: ~1.4% → 4.9% (diag) → **8.3%** (trust). Sentinel LOC badge
+    is now **408**.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
@@ -470,9 +489,12 @@ sessions but no image was committed — treat their screenshots as absent, not l
   port a net security *regression* versus the CNG code it replaces. The **diagnostic `file:line:col`
   parser** was the first low-risk/file-driven candidate and is **DONE (phase 35)** — it proved the
   whole C-ABI integration spine (build lib → emit header → link with R8 libs → call → verify),
-  end-to-end in the live app. The natural **next** port along the same seam: the **trust-manifest
-  validator** (`Signing.h::loadTrust`) — same "parse untrusted bytes, no secrets" shape, higher
-  value (a real security boundary), and the diag port's mechanics carry straight over.
+  end-to-end in the live app. The **trust-manifest validator** (`Signing.h::loadTrust`) followed as
+  the second port (phase 36) — a real security boundary, and it proved the "one lib, further ports
+  nearly free" economics (+8 KB). **Next candidates along the same seam** (parse untrusted bytes, no
+  secrets, host does file I/O): the `.sig` carrier parser (`Signing.h::readSig`) and the `sentinel.toml`
+  / `*.sntproject` manifest parser (`Project.h` — bigger, has a comment-preserving *writer* that is
+  the hard part and would stay native for now). The crypto core stays blocked on R1.
 - **Signing follow-ons (remaining):** surface capability-bound verify failures as Problems; an
   editable trust manifest (policy/grants) beyond add+import; a Settings field for a default signing
   key (today post-build signing uses `sentinel.key` in the project dir).
@@ -504,7 +526,7 @@ sessions but no image was committed — treat their screenshots as absent, not l
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–35 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–36 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
