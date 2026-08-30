@@ -1,6 +1,6 @@
 # Sentinel-IDE — Handover
 
-_Last updated: 2026-07-19._
+_Last updated: 2026-08-30._
 
 > **Naming:** the product/exe is **`Sentinel-IDE`** (matching `Sentinel-lang` / `Sentinel-learning`);
 > the build output is `build\Sentinel-IDE.exe`. **Internal identifiers stay `SentinelIDE`** by design —
@@ -586,8 +586,11 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 >
 > **Layout:** `src/core/` = portable-*intended* logic (Project, Signing, Seal, Settings, Toolchain,
 > FileAssoc, Proc, Logger — all header-only, still Win32-coupled today); `src/host/win32/` = the thin
-> Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
-> `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
+> Win32 host (WinMain, MainWindow ~1650 lines, five themed dialogs, `Updater.{h,cpp}`, Theme.h);
+> **`src/sentinel/` = product logic written *in* Sentinel** (`parsers.sentinel` — four parsers,
+> compiled to one C-ABI lib the host links; see below); `tests/` = `seal_test` + the four
+> `*_xcheck.cpp` parser-parity tests. A macOS/Linux port adds `src/host/<os>/` against the same core —
+> **do not scaffold empty platform trees** until a port starts.
 >
 > **Phases 1–38 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
@@ -600,8 +603,28 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 > `snc keygen`/`sign`/`verify`, live trust chip, post-build artifact signing); **sealed projects**
 > (password → AES-256-GCM over an LZMS-compressed archive, LUKS-style unlock slots in `core/Seal.h`);
 > **file associations** (double-click `.sntproject`/`.sentinel`); an **About box with LOC badges**
-> whose total is counted by **`tools/loc.sentinel`** (the first piece written *in* Sentinel); and a
-> **Windows installer** (Inno Setup → `build/installer/Sentinel-IDE-<ver>.<build>-setup.exe`).
+> whose total is counted by **`tools/loc.sentinel`**; and a **Windows installer**
+> (Inno Setup → `build/installer/Sentinel-IDE-<ver>.<build>-setup.exe`).
+>
+> **The thesis is now live in the binary (phases 35–38).** Four parsers were ported from C++ into
+> **Sentinel** — the build-diagnostic parser (`parseDiag`), the trust-manifest parser (`loadTrust`),
+> the `.sig`-carrier parser (`readSig`), and the project-manifest reader (`loadProject`) — compiled to
+> **one** C-ABI static lib (`src/sentinel/parsers.sentinel` → `build/generated/parsers.lib`, ADR 0059)
+> that the host links and calls into. **Every file reader/parser in the IDE is now Sentinel**; only
+> the comment-preserving manifest *writer* (`saveProject`) stays C++ (a surgical structure-preserving
+> TOML rewrite, deliberately native). Each has a byte-identical C++ `#else` fallback (used when
+> `snc` is absent, gate `SENTINELIDE_SENTINEL`) held in lockstep by a `tests/*_xcheck.cpp`. The About
+> box shows a **"built in Sentinel" progress bar** (~14.5%, moves with each port). One-lib-on-purpose:
+> each Sentinel lib bundles the whole runtime, so the first port cost ~1 MB and every port since ~8 KB.
+>
+> **Auto-update (phase 32):** WinSparkle (vendored `third_party/winsparkle/`, x64, MIT) reads an
+> **Ed25519-signed appcast** off `main`; ≡ ▸ Check for Updates… + an About-box button + background
+> checks. The signing key is real and compiled into `Updater.cpp` (public half — the private key is at
+> `%SENTINEL_SIGN_KEY%`, outside the repo).
+>
+> **Released:** latest **v0.1.3 (build 145)** on GitHub; four releases so far (see the **Releases**
+> table above). Auto-update verified end-to-end (a 0.1.0 client offered a later version across a
+> marketing bump). `docs/RELEASING.md` is the cut procedure.
 >
 > **Build / run / screenshot**
 > ```
@@ -610,7 +633,15 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 > powershell -File scripts\capture.ps1                       :: → build\shot.png, then Read that PNG
 > powershell -File scripts\capture.ps1 -Class SentinelSigningDlg
 > cmd /c scripts\make-installer.bat           :: builds, then ISCC → build\installer\
+> pwsh scripts\sign-release.ps1 -Appcast      :: sign the installer + verify + write appcast.xml
+> ctest --test-dir build                      :: seal + 4 parser-parity tests (build the targets first)
 > ```
+> `build.bat` now also compiles `src/sentinel/parsers.sentinel` to `build/generated/parsers.lib` via
+> **release `snc`** (`SENTINEL_PARSERS_OK`); if `snc` is absent it prints `SENTINEL_PARSERS_FALLBACK`
+> and CMake uses the C++ parsers instead — the build never breaks, but the default build now depends on
+> the Sentinel toolchain. Releases: see `docs/RELEASING.md` (bump `MKT`/`MKTRC` → clean commit →
+> `make-installer.bat` → `sign-release.ps1 -Appcast` → tag the build commit → `gh release create` →
+> commit+push `appcast.xml` → verify the feed + enclosure resolve). Key path is in `%SENTINEL_SIGN_KEY%`.
 > The app isn't installed, so the screenshot MCP can't see it — always go through `capture.ps1`
 > (it overwrites the same `build\shot.png`). Window classes for `-Class`: `SentinelIDEMainWindow`,
 > `SentinelSettingsDlg`, `SentinelProjectDlg`, `SentinelSigningDlg`, `SentinelAboutDlg`,
@@ -651,20 +682,33 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 >   `BUILD_DIRTY <n>` if the tree doesn't match HEAD; don't ship such a build.
 > - `.gitattributes` forces `eol=crlf` on text and marks `*.sig` **binary** so the signed demo stays
 >   byte-exact. **Any tool that rewrites `examples/crypto.sentinel` with LF breaks its signature.**
-> - A raw `cmake --build` without `build.bat` silently yields "0.1.1 (build 0)" + zeroed LOC badges.
+> - A raw `cmake --build` without `build.bat` silently yields "0.1.3 (build 0)" + zeroed LOC badges,
+>   and no `parsers.lib` → the C++ parser fallbacks. Always build through `build.bat`.
 > - A `Remove-Item` in the *same* PowerShell call as a `cmd /c` is rejected by a sandbox guard —
 >   keep them in separate calls.
-> - Writing Sentinel: **no `%` operator** (use `v - (v/10)*10`), `if` is an *expression* so a bare
->   `if c { stmt; }` is a parse error, and there are no `for` loops, tuples, or *capturing* closures.
->   **But do NOT trust the older, longer gap list** — argv exists (`arg_count()`/`arg(i)`),
->   non-capturing `Fn<T,R>` works, and directory traversal / `stat` / streaming / recoverable I/O
->   errors are all reachable through `extern "C" link("kernel32")` even though the *builtins* lack
->   them. A full recursive archiver has been written in 100% Sentinel and verified byte-identical.
->   See **`docs/Sentinel-lang_request.md`** — every one of those was re-measured on 2026-07-19 and
->   several long-standing entries in this file turned out to be false.
+> - Writing Sentinel (the four parsers in `src/sentinel/parsers.sentinel` are the worked examples):
+>   **no `%` operator** (use `v - (v/10)*10`); `if` is an *expression*, so a side-effecting `if` needs
+>   an `else` and both arms end in a dummy `0` (`if c { ...; 0 } else { 0 };`); no early `return` (thread
+>   a flag, encode once at the end); void helpers are `-> i64` returning `0`; `&&` short-circuits (relied
+>   on for bounds-guarded indexing); a **by-value `[u8]` param is MOVED on first use inside a loop** —
+>   pass `&[u8]` for anything reused across iterations; **`&"literal"` is rejected** ("cannot borrow a
+>   non-lvalue") — bind the literal to a `let` first, then borrow; and char-literal compares are `u8`
+>   but numeric literals are `i64` (cast: `(c as i64) >= 128`). No `for` loops, tuples, or *capturing*
+>   closures. **Do NOT trust the older, longer gap list** — argv exists (`arg_count()`/`arg(i)`),
+>   non-capturing `Fn<T,R>` works, and dir traversal / `stat` / streaming / recoverable I/O errors are
+>   reachable through `extern "C" link("kernel32")`. See **`docs/Sentinel-lang_request.md`** (R1–R15,
+>   re-measured 2026-07-19; several long-standing entries in this file turned out to be false).
 > - Editing a `.bat` file with a tool that writes **LF** breaks it: `cmd.exe` needs CRLF and fails
 >   with nonsense like `'t' is not recognized`. Convert back to CRLF after any programmatic edit.
 >
-> **Pick a next task** from "What's next" — the strongest candidates are porting `Seal.h`'s AEAD+KDF
-> to a Sentinel C-ABI lib over `std/security` (the cross-platform reuse layer *and* the dogfood), the
-> Direct2D editor, single-instance/IPC, or reconciling the draft BMad spines/PRD (still Authenticode-framed).
+> **Pick a next task** from "What's next". Note what's already done and what's blocked:
+> the four *file readers* are ported to Sentinel (phases 35–38); the natural remaining Sentinel work is
+> the manifest *writer* `saveProject` (hard — structure-preserving TOML rewrite; deliberately deferred)
+> and the **Seal.h AEAD+KDF core**, which is **BLOCKED upstream on R1** (no secure-zero for `[secret u8]`
+> — porting key material would be a net security regression; see `docs/Sentinel-lang_request.md`), not a
+> quick win despite older notes calling it the top candidate. Genuinely open and unblocked: the
+> **Direct2D editor** (SQLTerminal's `SqlEditorControl.cpp` is GPL-3.0, same lineage), **single-instance
+> /IPC + drag-drop** (land `openFile`'s missing dirty-guard first — see What's next), reconciling the
+> draft BMad spines/PRD (still Authenticode-framed), and Argon2id (also blocked — no Argon2/BLAKE2
+> anywhere). The IDE is released with live auto-update, so treat `main` as shippable and cut releases
+> per `docs/RELEASING.md` when asked.
