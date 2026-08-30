@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // parsers.sentinel — Sentinel-IDE's runtime PRODUCT logic, written in Sentinel and
-// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Two
-// exports so far, both "interpret untrusted bytes" jobs the host used to do in C++:
+// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Four
+// exports, all "interpret untrusted bytes" jobs the host used to do in C++:
 //
-//   parse_diag(line)  — one line of snc build output -> a diagnostic (file:line:col)
-//   parse_trust(text) — the consumer trust manifest -> the trusted [[keys]]
+//   parse_diag(line)     — one line of snc build output -> a diagnostic (file:line:col)
+//   parse_trust(text)    — the consumer trust manifest -> the trusted [[keys]]
+//   parse_sig(text)      — a detached-signature (.sig) carrier -> algorithm/key/grants
+//   parse_manifest(text) — a project manifest -> the [project]/[build]/[signing] fields
+//                          and the [[target]] blocks
 //
 // Kept as ONE lib on purpose: each Sentinel lib bundles the whole runtime, so linking
-// two would collide on sentinel_free_bytes / the allocator. One lib = one runtime.
-// Both use the owned `-> [u8]` return ABI (not `&mut [u8]`), sidestepping the
+// several would collide on sentinel_free_bytes / the allocator. One lib = one runtime,
+// so every port after the first adds only its own code (~8 KB), not another runtime.
+// All use the owned `-> [u8]` return ABI (not `&mut [u8]`), sidestepping the
 // header-emits-&mut-as-const defect (Sentinel-lang R3). Each export's record format is
 // documented above it. The C++ fallbacks (MainWindow.cpp::parseDiag, Signing.h::
-// loadTrust) stay byte-identical, guarded by tests/diag_xcheck.cpp + trust_xcheck.cpp.
+// loadTrust/readSig, Project.h::loadProject) stay byte-identical, each guarded by a
+// tests/*_xcheck.cpp cross-check.
 
 // ---- shared helpers ---------------------------------------------------------
 
@@ -408,5 +413,305 @@ export "C" fn parse_sig(text: &[u8]) -> [u8] {
     if hasA { push_lenpref(&mut out, text, aA, aB); 0 } else { push_le8(&mut out, 0); 0 };
     if hasK { push_lenpref(&mut out, text, kA, kB); 0 } else { push_le8(&mut out, 0); 0 };
     if hasG { push_lenpref(&mut out, text, gA, gB); 0 } else { push_le8(&mut out, 0); 0 };
+    vec_to_array(out)
+}
+
+// ---- project manifest reader ------------------------------------------------
+//
+// A faithful port of Project.h::loadProject's parsing. The manifest is real TOML;
+// the IDE reads the flat `[section] key = value` fields and the `[[target]]`
+// array-of-tables. Two behaviours must be replicated EXACTLY, and they differ:
+//
+//   * Flat fields were read via the Win32 profile API (GetPrivateProfileString),
+//     which is CASE-INSENSITIVE for section + key, returns the FIRST match, and
+//     applies no comment stripping (projUnq strips quotes afterward). Empirically
+//     confirmed (scratchpad probe). -> emit_scalar / emit_array use lit_ieq.
+//   * [[target]] blocks were hand-parsed (parseTargets), matching field keys
+//     CASE-SENSITIVELY (`k == "name"`). -> emit_targets uses lit_eq.
+//
+// File I/O stays native (readUtf8); the host hands the bytes in and unpacks the
+// record below into a SentinelProject, then applies the trivial post-processing
+// (typeFromName / tierFromName / the sign=="true" test / single-target fallback).
+//
+// Record the host unpacks, in this exact order:
+//   10 scalars, each  [found:1 byte][len i64 LE][bytes]  (projUnq'd; len 0 if absent):
+//       project.name, project.version, project.type, project.entry, project.icon,
+//       build.src, build.default_tier, signing.require, signing.trust, signing.sign
+//   2 arrays, each a stream { byte 1, [len i64][bytes] }* then byte 0:
+//       build.lib_paths, build.links
+//   targets: a stream, per target { byte 1, name/entry/type each [len][bytes],
+//       then a links stream { byte 1, [len][bytes] }* byte 0 }, ended by byte 0.
+
+fn to_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { i64_to_u8((c as i64) + 32) } else { c }
+}
+
+// Case-insensitive equality of text[a..b) and the (lowercase) literal `lit`.
+// `lit` is borrowed (&[u8]) not moved: emit_scalar passes the same key/section param
+// on every loop iteration, and a by-value [u8] would be moved out on the first.
+fn lit_ieq(text: &[u8], a: i64, b: i64, lit: &[u8]) -> bool {
+    let m: i64 = b - a;
+    let ll: i64 = len(*lit);
+    let mut ok: bool = m == ll;
+    let mut i: i64 = 0;
+    while ok && i < ll {
+        ok = ok && (to_lower((*text)[a + i]) == (*lit)[i]);
+        i = i + 1;
+    }
+    ok
+}
+
+// Is the trimmed line [ts,te) the header `[sect]` (single-bracket, case-insensitive)?
+fn sect_eq(text: &[u8], ts: i64, te: i64, sect: &[u8]) -> bool {
+    let mut ok: bool = false;
+    if te - ts >= 2 && (*text)[ts] == '[' && (*text)[ts + 1] != '[' {
+        let mut re: i64 = ts + 1;
+        let mut hasr: bool = false;
+        while re < te && hasr == false {
+            if (*text)[re] == ']' { hasr = true; 0 } else { re = re + 1; 0 };
+        }
+        if hasr {
+            let mut ia: i64 = ts + 1;
+            while ia < re && is_ws((*text)[ia]) { ia = ia + 1; }
+            let mut ib: i64 = re;
+            while ib > ia && is_ws((*text)[ib - 1]) { ib = ib - 1; }
+            ok = lit_ieq(text, ia, ib, sect);
+            0
+        } else { 0 };
+        0
+    } else { 0 };
+    ok
+}
+
+// Emit a scalar field [found][lenpref], matching GetPrivateProfileString + projUnq:
+// first case-insensitive key match inside the first matching section, value projUnq'd.
+fn emit_scalar(out: &mut Vec<u8>, text: &[u8], n: i64, sect: &[u8], key: &[u8]) -> i64 {
+    let mut inSect: bool = false;
+    let mut found: bool = false;
+    let mut va: i64 = 0; let mut vb: i64 = 0;
+    let mut ls: i64 = 0; let mut i: i64 = 0;
+    while i <= n && found == false {
+        if i == n || (*text)[i] == '\n' {
+            let mut ts: i64 = ls;
+            while ts < i && is_ws((*text)[ts]) { ts = ts + 1; }
+            let mut te: i64 = i;
+            while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+            if ts < te && (*text)[ts] != '#' {
+                if (*text)[ts] == '[' {
+                    inSect = sect_eq(text, ts, te, sect); 0
+                } else {
+                    if inSect {
+                        let mut eq: i64 = ts;
+                        let mut haseq: bool = false;
+                        while eq < te && haseq == false {
+                            if (*text)[eq] == '=' { haseq = true; 0 } else { eq = eq + 1; 0 };
+                        }
+                        if haseq {
+                            let mut ka: i64 = ts;
+                            while ka < eq && is_ws((*text)[ka]) { ka = ka + 1; }
+                            let mut kb: i64 = eq;
+                            while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                            if lit_ieq(text, ka, kb, key) {
+                                let mut ua: i64 = eq + 1;
+                                while ua < te && is_hsp((*text)[ua]) { ua = ua + 1; }
+                                let mut ub: i64 = te;
+                                while ub > ua && is_hsp_cr((*text)[ub - 1]) { ub = ub - 1; }
+                                if ub - ua >= 2 && (*text)[ua] == '"' && (*text)[ub - 1] == '"' { ua = ua + 1; ub = ub - 1; 0 } else { 0 };
+                                va = ua; vb = ub; found = true; 0
+                            } else { 0 };
+                            0
+                        } else { 0 };
+                        0
+                    } else { 0 };
+                    0
+                };
+                0
+            } else { 0 };
+            ls = i + 1; 0
+        } else { 0 };
+        i = i + 1;
+    }
+    if found { push(out, i64_to_u8(1)); push_lenpref(out, text, va, vb); 0 }
+    else { push(out, i64_to_u8(0)); push_le8(out, 0); 0 };
+    0
+}
+
+// Emit an array field as a { byte 1, lenpref }* stream ended by byte 0. The raw value
+// (the whole `["a", "b"]`) is located like a scalar, then its quoted strings extracted
+// (projArr) via emit_grants. Absent key -> empty stream (matches the "" default).
+fn emit_array(out: &mut Vec<u8>, text: &[u8], n: i64, sect: &[u8], key: &[u8]) -> i64 {
+    let mut inSect: bool = false;
+    let mut found: bool = false;
+    let mut va: i64 = 0; let mut vb: i64 = 0;
+    let mut ls: i64 = 0; let mut i: i64 = 0;
+    while i <= n && found == false {
+        if i == n || (*text)[i] == '\n' {
+            let mut ts: i64 = ls;
+            while ts < i && is_ws((*text)[ts]) { ts = ts + 1; }
+            let mut te: i64 = i;
+            while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+            if ts < te && (*text)[ts] != '#' {
+                if (*text)[ts] == '[' {
+                    inSect = sect_eq(text, ts, te, sect); 0
+                } else {
+                    if inSect {
+                        let mut eq: i64 = ts;
+                        let mut haseq: bool = false;
+                        while eq < te && haseq == false {
+                            if (*text)[eq] == '=' { haseq = true; 0 } else { eq = eq + 1; 0 };
+                        }
+                        if haseq {
+                            let mut ka: i64 = ts;
+                            while ka < eq && is_ws((*text)[ka]) { ka = ka + 1; }
+                            let mut kb: i64 = eq;
+                            while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                            if lit_ieq(text, ka, kb, key) { va = eq + 1; vb = te; found = true; 0 } else { 0 };
+                            0
+                        } else { 0 };
+                        0
+                    } else { 0 };
+                    0
+                };
+                0
+            } else { 0 };
+            ls = i + 1; 0
+        } else { 0 };
+        i = i + 1;
+    }
+    if found { emit_grants(out, text, va, vb); 0 } else { 0 };
+    push(out, i64_to_u8(0));
+    0
+}
+
+// Emit one target record (name/entry/type + a links stream).
+fn flush_target(out: &mut Vec<u8>, text: &[u8],
+                hasN: bool, nA: i64, nB: i64,
+                hasE: bool, eA: i64, eB: i64,
+                hasT: bool, tA: i64, tB: i64,
+                hasL: bool, lA: i64, lB: i64) -> i64 {
+    push(out, i64_to_u8(1));
+    if hasN { push_lenpref(out, text, nA, nB); 0 } else { push_le8(out, 0); 0 };
+    if hasE { push_lenpref(out, text, eA, eB); 0 } else { push_le8(out, 0); 0 };
+    if hasT { push_lenpref(out, text, tA, tB); 0 } else { push_le8(out, 0); 0 };
+    if hasL { emit_grants(out, text, lA, lB); 0 } else { 0 };
+    push(out, i64_to_u8(0));   // links terminator
+    0
+}
+
+// Emit the [[target]] stream. parseTargets: `[[...target...]]` opens a block (loose
+// contains-match), field keys matched CASE-SENSITIVELY, name/entry/type projUnq'd,
+// links from the raw value; a normal `[section]` closes the block.
+fn emit_targets(out: &mut Vec<u8>, text: &[u8], n: i64) -> i64 {
+    let mut have: bool = false;
+    let mut hasN: bool = false; let mut nA: i64 = 0; let mut nB: i64 = 0;
+    let mut hasE: bool = false; let mut eA: i64 = 0; let mut eB: i64 = 0;
+    let mut hasT: bool = false; let mut tA: i64 = 0; let mut tB: i64 = 0;
+    let mut hasL: bool = false; let mut lA: i64 = 0; let mut lB: i64 = 0;
+
+    let mut ls: i64 = 0; let mut i: i64 = 0;
+    while i <= n {
+        if i == n || (*text)[i] == '\n' {
+            let mut ts: i64 = ls;
+            while ts < i && is_ws((*text)[ts]) { ts = ts + 1; }
+            let mut te: i64 = i;
+            while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+            if ts < te && (*text)[ts] != '#' {
+                if te - ts >= 2 && (*text)[ts] == '[' && (*text)[ts + 1] == '[' {
+                    if have { flush_target(out, text, hasN, nA, nB, hasE, eA, eB, hasT, tA, tB, hasL, lA, lB); 0 } else { 0 };
+                    if range_has(text, ts, te, "target") {
+                        have = true; hasN = false; hasE = false; hasT = false; hasL = false; 0
+                    } else { have = false; 0 };
+                    0
+                } else {
+                    if (*text)[ts] == '[' {
+                        if have { flush_target(out, text, hasN, nA, nB, hasE, eA, eB, hasT, tA, tB, hasL, lA, lB); 0 } else { 0 };
+                        have = false; 0
+                    } else {
+                        if have {
+                            let mut eq: i64 = ts;
+                            let mut haseq: bool = false;
+                            while eq < te && haseq == false {
+                                if (*text)[eq] == '=' { haseq = true; 0 } else { eq = eq + 1; 0 };
+                            }
+                            if haseq {
+                                let mut ka: i64 = ts;
+                                while ka < eq && is_ws((*text)[ka]) { ka = ka + 1; }
+                                let mut kb: i64 = eq;
+                                while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                                let mut ua: i64 = eq + 1;
+                                while ua < te && is_hsp((*text)[ua]) { ua = ua + 1; }
+                                let mut ub: i64 = te;
+                                while ub > ua && is_hsp_cr((*text)[ub - 1]) { ub = ub - 1; }
+                                if ub - ua >= 2 && (*text)[ua] == '"' && (*text)[ub - 1] == '"' { ua = ua + 1; ub = ub - 1; 0 } else { 0 };
+                                if lit_eq(text, ka, kb, "name") {
+                                    nA = ua; nB = ub; hasN = true; 0
+                                } else {
+                                    if lit_eq(text, ka, kb, "entry") {
+                                        eA = ua; eB = ub; hasE = true; 0
+                                    } else {
+                                        if lit_eq(text, ka, kb, "type") {
+                                            tA = ua; tB = ub; hasT = true; 0
+                                        } else {
+                                            if lit_eq(text, ka, kb, "links") { lA = eq + 1; lB = te; hasL = true; 0 } else { 0 };
+                                            0
+                                        };
+                                        0
+                                    };
+                                    0
+                                };
+                                0
+                            } else { 0 };
+                            0
+                        } else { 0 };
+                        0
+                    };
+                    0
+                };
+                0
+            } else { 0 };
+            ls = i + 1; 0
+        } else { 0 };
+        i = i + 1;
+    }
+    if have { flush_target(out, text, hasN, nA, nB, hasE, eA, eB, hasT, tA, tB, hasL, lA, lB); 0 } else { 0 };
+    push(out, i64_to_u8(0));   // end of targets
+    0
+}
+
+export "C" fn parse_manifest(text: &[u8]) -> [u8] {
+    let n: i64 = len(*text);
+    let mut out: Vec<u8> = vec_new();
+    // Literals bound to locals so they can be BORROWED (&x): Sentinel forbids `&"lit"`
+    // (can't borrow a temporary), and a by-value [u8] param would be moved out on the
+    // first loop iteration inside the emitters. Section names are borrowed repeatedly,
+    // which is fine — shared borrows are copyable.
+    let s_project: [u8] = "project";
+    let s_build: [u8] = "build";
+    let s_signing: [u8] = "signing";
+    let k_name: [u8] = "name";
+    let k_version: [u8] = "version";
+    let k_type: [u8] = "type";
+    let k_entry: [u8] = "entry";
+    let k_icon: [u8] = "icon";
+    let k_src: [u8] = "src";
+    let k_tier: [u8] = "default_tier";
+    let k_require: [u8] = "require";
+    let k_trust: [u8] = "trust";
+    let k_sign: [u8] = "sign";
+    let k_libpaths: [u8] = "lib_paths";
+    let k_links: [u8] = "links";
+    emit_scalar(&mut out, text, n, &s_project, &k_name);
+    emit_scalar(&mut out, text, n, &s_project, &k_version);
+    emit_scalar(&mut out, text, n, &s_project, &k_type);
+    emit_scalar(&mut out, text, n, &s_project, &k_entry);
+    emit_scalar(&mut out, text, n, &s_project, &k_icon);
+    emit_scalar(&mut out, text, n, &s_build, &k_src);
+    emit_scalar(&mut out, text, n, &s_build, &k_tier);
+    emit_scalar(&mut out, text, n, &s_signing, &k_require);
+    emit_scalar(&mut out, text, n, &s_signing, &k_trust);
+    emit_scalar(&mut out, text, n, &s_signing, &k_sign);
+    emit_array(&mut out, text, n, &s_build, &k_libpaths);
+    emit_array(&mut out, text, n, &s_build, &k_links);
+    emit_targets(&mut out, text, n);
     vec_to_array(out)
 }
