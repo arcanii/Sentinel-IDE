@@ -3,7 +3,10 @@
 
 #ifdef SENTINELIDE_HAVE_WINSPARKLE
 
+#include <shellapi.h>   // ShellExecuteExW — we launch the update installer ourselves
+
 #include <atomic>
+#include <string>
 #include <thread>
 #include <winsparkle.h>
 
@@ -75,6 +78,86 @@ void onShutdownRequest() {
 
 int onCanShutdown() { return 1; }
 
+// ---- diagnostics ----------------------------------------------------------
+// WinSparkle reports failures ONLY through these callbacks. Without them a failed
+// update is completely silent: the app cannot know, and the log shows nothing between
+// "shutdown requested" and the next launch still on the old version. That silence is
+// how a broken install path survived four releases unnoticed.
+void onError() {
+    logMsg(LogLevel::Error, L"Updater: WinSparkle reported an error (check/download/verify/install failed)");
+}
+void onDidFindUpdate()    { logMsg(LogLevel::Info,  L"Updater: update found"); }
+void onDidNotFindUpdate() { logMsg(LogLevel::Info,  L"Updater: no update available"); }
+void onUpdateCancelled()  { logMsg(LogLevel::Info,  L"Updater: update cancelled by user"); }
+void onUpdateDismissed()  { logMsg(LogLevel::Info,  L"Updater: update dialog dismissed"); }
+
+// Called once the payload is downloaded and SIGNATURE-VERIFIED, with its path,
+// immediately before WinSparkle would execute it. Return 1 for "handled by me",
+// 0 for "do your default thing".
+//
+// WE RUN IT OURSELVES, because WinSparkle's own execute step does not work here:
+// it downloads and verifies correctly, then launches nothing and reports no error
+// (its error callback never fires). Measured 2026-08-30 — every release v0.1.0..v0.1.4
+// offered updates that could never install. Proven by taking WinSparkle's own
+// downloaded payload, from its own temp dir, and running it by hand: installs fine,
+// byte-identical to the published installer. So the artifact, the feed, the download
+// and the Ed25519 verification are all sound; only the launch was broken.
+//
+// This costs no security: WinSparkle verifies the signature against the compiled-in
+// public key BEFORE calling us, and refuses to call us at all if it fails.
+int onUserRunInstaller(const wchar_t* path) {
+    const std::wstring p = path ? path : L"(null)";
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    const bool exists = path && *path && GetFileAttributesExW(path, GetFileExInfoStandard, &fad);
+    unsigned long long size = 0;
+    if (exists) size = (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    logMsg(LogLevel::Info, L"Updater: payload ready — [" + p + L"]  exists=" +
+           (exists ? L"yes" : L"NO") + L" size=" + std::to_wstring(size));
+
+    if (!exists) {
+        // Nothing we can launch. Fall back rather than pretend we handled it.
+        logMsg(LogLevel::Error, L"Updater: no usable payload path from WinSparkle — "
+                                L"falling back to its (known-broken) handling; update will not install");
+        return 0;
+    }
+
+    // /SILENT gives a progress window but no wizard pages — the Sparkle-style
+    // experience. The install SCOPE must be explicit: the .iss sets
+    // PrivilegesRequiredOverridesAllowed=dialog, so without /CURRENTUSER or /ALLUSERS
+    // Inno stops on its "Select Setup Install Mode" dialog — and a silent launch
+    // sitting on a modal question is just a hang. (Measured: that is exactly where the
+    // first version of this fix stalled.) Pick the scope this copy actually lives in,
+    // so an update never installs a second copy into the other scope.
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    wchar_t localAppData[MAX_PATH]{};
+    const DWORD ladLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    const bool perUser = ladLen > 0 && ladLen < MAX_PATH &&
+                         _wcsnicmp(exePath, localAppData, ladLen) == 0;
+    const wchar_t* args = perUser ? L"/SILENT /NORESTART /CURRENTUSER"
+                                  : L"/SILENT /NORESTART /ALLUSERS";
+    logMsg(LogLevel::Info, std::wstring(L"Updater: install scope = ") +
+           (perUser ? L"per-user (/CURRENTUSER)" : L"per-machine (/ALLUSERS)"));
+
+    // SEE_MASK_NOASYNC matters because WinSparkle asks us to quit immediately after
+    // this returns; without it the shell call can be abandoned as the process dies.
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb       = L"open";
+    sei.lpFile       = path;
+    sei.lpParameters = args;
+    sei.nShow        = SW_SHOWNORMAL;
+    if (ShellExecuteExW(&sei)) {
+        if (sei.hProcess) CloseHandle(sei.hProcess);
+        logMsg(LogLevel::Info, L"Updater: installer launched — handing off and quitting");
+        return 1;   // handled
+    }
+    logMsg(LogLevel::Error, L"Updater: ShellExecuteEx failed for the installer, GetLastError=" +
+           std::to_wstring(GetLastError()));
+    return 0;
+}
+
 }  // namespace
 
 bool updaterAvailable() { return haveSigningKey(); }
@@ -106,6 +189,14 @@ void initUpdater(HWND mainWnd) {
     }
     win_sparkle_set_can_shutdown_callback(onCanShutdown);
     win_sparkle_set_shutdown_request_callback(onShutdownRequest);
+    // Diagnostics — see the block above. Cheap, and the only way a failed update is
+    // ever visible.
+    win_sparkle_set_error_callback(onError);
+    win_sparkle_set_did_find_update_callback(onDidFindUpdate);
+    win_sparkle_set_did_not_find_update_callback(onDidNotFindUpdate);
+    win_sparkle_set_update_cancelled_callback(onUpdateCancelled);
+    win_sparkle_set_update_dismissed_callback(onUpdateDismissed);
+    win_sparkle_set_user_run_installer_callback(onUserRunInstaller);
     win_sparkle_init();   // also runs the periodic background check
     g_started = true;
     logMsg(LogLevel::Info, std::wstring(L"Updater: initialised (") + SENTINEL_FILEVERSION_STR_W + L")");
@@ -120,7 +211,16 @@ void checkForUpdates(HWND owner) {
                     L"Sentinel-IDE", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    win_sparkle_check_update_with_ui();
+    // NOT win_sparkle_check_update_with_ui(). That is the prompt-then-install flow, and
+    // in 0.9.3 it calls our user_run_installer callback with an EMPTY path ~0.5s after
+    // finding the update — i.e. before it has downloaded anything — and then launches
+    // nothing and reports no error. Measured repeatedly on 2026-08-30; it is why every
+    // release v0.1.0..v0.1.4 offered updates that could never install.
+    //
+    // This variant downloads first and hands the callback a real, verified payload,
+    // which we then run ourselves. It skips the "do you want to update?" prompt, which
+    // is acceptable here because the user reached this by explicitly asking to check.
+    win_sparkle_check_update_with_ui_and_install();
 }
 
 void shutdownUpdater() {
