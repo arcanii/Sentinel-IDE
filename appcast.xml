@@ -6,13 +6,13 @@
     <description>Most recent updates to Sentinel-IDE</description>
     <language>en</language>
     <item>
-      <title>Version 0.1.3.145</title>
-      <sparkle:releaseNotesLink>https://github.com/arcanii/Sentinel-IDE/releases/tag/v0.1.3</sparkle:releaseNotesLink>
-      <pubDate>Sun, 30 Aug 2026 02:41:53 +0000</pubDate>
-      <enclosure url="https://github.com/arcanii/Sentinel-IDE/releases/download/v0.1.3/Sentinel-IDE-0.1.3.145-setup.exe"
-                 sparkle:version="0.1.3.145"
-                 sparkle:edSignature="crtlaSXCUcvdNFsJMvP+7VAMj63zRbpG/vzwR7LGi4iHPlxISRsbNclCSLmUYcIFpqngzmuowoBu9e9TVYtlCQ=="
-                 length="3902203"
+      <title>Version 0.1.4.151</title>
+      <sparkle:releaseNotesLink>https://github.com/arcanii/Sentinel-IDE/releases/tag/v0.1.4</sparkle:releaseNotesLink>
+      <pubDate>Sun, 30 Aug 2026 07:22:48 +0000</pubDate>
+      <enclosure url="https://github.com/arcanii/Sentinel-IDE/releases/download/v0.1.4/Sentinel-IDE-0.1.4.151-setup.exe"
+                 sparkle:version="0.1.4.151"
+                 sparkle:edSignature="0txxkuxinCO+Pm14yGq8yFlQ9bCuIv+Tggr5fo+6vGUe4tYtDlcQEl3YbdNl/V0kYmIivFqV12qmbXz6FY9zDA=="
+                 length="3587403"
                  type="application/octet-stream"/>
     </item>
   </channel>
