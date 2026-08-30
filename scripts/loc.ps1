@@ -22,7 +22,10 @@ function Line-Count([string]$t) {
 
 # --- enumerate the IDE's own source (not BMad skills, not reference repos) ---
 $cpp = @(Get-ChildItem -Path "$Root\src" -Recurse -Include *.cpp,*.h -File -EA SilentlyContinue)
-$snt = @(Get-ChildItem -Path "$Root\tools","$Root\examples" -Recurse -Include *.sentinel -File -EA SilentlyContinue)
+# .sentinel counts as Sentinel wherever it lives, INCLUDING src\sentinel — that's
+# product logic compiled into the binary (the diagnostic parser), not a build tool,
+# so it belongs in the About box's Sentinel total rather than being invisible.
+$snt = @(Get-ChildItem -Path "$Root\src","$Root\tools","$Root\examples" -Recurse -Include *.sentinel -File -EA SilentlyContinue)
 $bld = @()
 if (Test-Path "$Root\CMakeLists.txt") { $bld += Get-Item "$Root\CMakeLists.txt" }
 $bld += @(Get-ChildItem -Path "$Root\scripts" -Recurse -Include *.bat,*.ps1 -File -EA SilentlyContinue)

@@ -89,6 +89,23 @@ target_include_directories(SentinelIDE PRIVATE src "${SENTINEL_GENERATED_DIR}")
 target_link_libraries(SentinelIDE PRIVATE
   comctl32 dwmapi uxtheme gdi32 user32 shell32 ole32 bcrypt cabinet advapi32)
 
+# Sentinel-native diagnostic parser (src/sentinel/diag.sentinel). scripts\build.bat
+# compiles it to build/generated/diag.lib via `snc build --lib`; when that lib is
+# present the host's parseDiag calls INTO Sentinel (SENTINELIDE_SENTINEL_DIAG),
+# otherwise it uses the C++ fallback in MainWindow.cpp. Linking a Sentinel static lib
+# additionally requires these Windows system libs (they satisfy the Rust runtime the
+# lib pulls in — undocumented upstream, filed as R8 in docs/Sentinel-lang_request.md).
+set(SENTINEL_DIAG_LIB "${SENTINEL_GENERATED_DIR}/diag.lib")
+if(EXISTS "${SENTINEL_DIAG_LIB}")
+  target_compile_definitions(SentinelIDE PRIVATE SENTINELIDE_SENTINEL_DIAG)
+  target_link_libraries(SentinelIDE PRIVATE
+    "${SENTINEL_DIAG_LIB}"
+    legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
+  message(STATUS "SentinelIDE: diagnostic parser = Sentinel (diag.lib linked)")
+else()
+  message(STATUS "SentinelIDE: diagnostic parser = C++ fallback (diag.lib absent)")
+endif()
+
 # The .rc embeds app.manifest; stop the linker generating a competing one.
 if(MSVC)
   target_link_options(SentinelIDE PRIVATE /MANIFEST:NO)
@@ -105,3 +122,16 @@ target_include_directories(seal_test PRIVATE src/core)
 target_link_libraries(seal_test PRIVATE bcrypt cabinet shell32 advapi32)
 set_target_properties(seal_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME seal_format COMMAND seal_test)
+
+# diag_xcheck — proves the Sentinel diagnostic parser matches the C++ oracle it
+# replaced (they must stay byte-identical). Only defined when the Sentinel lib was
+# built; it links the same diag.lib + system libs the app does.
+#     cmake --build build --target diag_xcheck  &&  build\diag_xcheck.exe
+if(EXISTS "${SENTINEL_DIAG_LIB}")
+  add_executable(diag_xcheck tests/diag_xcheck.cpp)
+  target_link_libraries(diag_xcheck PRIVATE
+    "${SENTINEL_DIAG_LIB}"
+    legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
+  set_target_properties(diag_xcheck PROPERTIES EXCLUDE_FROM_ALL TRUE)
+  add_test(NAME diag_parity COMMAND diag_xcheck)
+endif()

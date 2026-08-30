@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// diag.sentinel — the first piece of Sentinel-IDE's PRODUCT logic written in
+// Sentinel and shipped in the binary (tools/loc.sentinel is a build-time tool;
+// this runs at runtime, on the host's hot path).
+//
+// It parses a single line of `snc` build output for a `path.sentinel:line[:col]`
+// diagnostic — the untrusted bytes the About box promises are "interpreted by
+// Sentinel". The Win32 host feeds each streamed output line in and, on a match,
+// jumps the editor to that location and marks the token clickable.
+//
+// A faithful port of the C++ `parseDiag` (src/host/win32/MainWindow.cpp): find the
+// first ".sentinel", require ":<digits>" after it, an optional ":<col>", then walk
+// backwards through path characters to where the file token began.
+//
+// C-ABI (ADR 0059): one export returning an owned `[u8]` record the host unpacks.
+// Using the `-> [u8]` return ABI rather than `&mut [u8]` out-params deliberately
+// sidesteps the header-emits-`&mut`-as-`const` defect (Sentinel-lang R3).
+//
+// Result record (integers little-endian i64, matching the host's getU64):
+//   byte 0 == 0            -> no diagnostic on this line
+//   byte 0 == 1            -> matched, followed by:
+//       [1  .. 9)   line number
+//       [9  .. 17)  column   (1 if the line carried no column)
+//       [17 .. 25)  token-start byte offset  (clickable-link span start)
+//       [25 .. 33)  token-end   byte offset  (one past the last line/col digit)
+//       [33 .. )    the file-token bytes, `path.sentinel`, verbatim
+//
+// Offsets are BYTE offsets into the UTF-8 line; the host converts them to UTF-16
+// character offsets for the RichEdit link, so non-ASCII paths stay correct.
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// The characters C++ `isPath` accepts, plus any byte >= 0x80 so multi-byte UTF-8
+// path components (accented or non-Latin directory names) stay whole rather than
+// truncating the token at the first continuation byte.
+fn is_path(c: u8) -> bool {
+    is_alnum(c) || c == '_' || c == '.' || c == '\\' || c == '/'
+        || c == ':' || c == '-' || c == ' ' || (c as i64) >= 128
+}
+
+fn digit_val(c: u8) -> i64 {
+    (c as i64) - ('0' as i64)
+}
+
+// True iff ".sentinel" (9 bytes) begins at `at` in `s` (length `n`). `&&`
+// short-circuits, so the leading bounds test guards every index.
+fn is_sentinel_at(s: &[u8], n: i64, at: i64) -> bool {
+    at + 9 <= n
+        && (*s)[at] == '.'
+        && (*s)[at + 1] == 's' && (*s)[at + 2] == 'e' && (*s)[at + 3] == 'n'
+        && (*s)[at + 4] == 't' && (*s)[at + 5] == 'i' && (*s)[at + 6] == 'n'
+        && (*s)[at + 7] == 'e' && (*s)[at + 8] == 'l'
+}
+
+// Append an i64 as 8 little-endian bytes. `-> i64` returning 0 is the Sentinel
+// idiom for a side-effect-only helper (there is no unit-returning fn form).
+fn push_le8(out: &mut Vec<u8>, v: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut x: i64 = v;
+    while i < 8 {
+        push(out, i64_to_u8(x - (x / 256) * 256));   // no `%` operator — x mod 256
+        x = x / 256;
+        i = i + 1;
+    }
+    0
+}
+
+export "C" fn parse_diag(line: &[u8]) -> [u8] {
+    let n: i64 = len(*line);
+
+    // Function-scope state — Sentinel has no early `return`, so everything is
+    // decided here and encoded once at the end, guarded by `matched`.
+    let mut matched: bool = false;
+    let mut ln: i64 = 0;
+    let mut col: i64 = 1;
+    let mut ts: i64 = 0;
+    let mut te: i64 = 0;
+
+    // First ".sentinel" (C++ uses find(), i.e. the earliest occurrence).
+    let mut e: i64 = 0 - 1;
+    let mut i: i64 = 0;
+    while i + 9 <= n && e < 0 {
+        if is_sentinel_at(line, n, i) { e = i; 0 } else { 0 };
+        i = i + 1;
+    }
+
+    // Require ".sentinel" then ":" then a digit. `&&` short-circuits, so each
+    // index is bounded by the length test to its left.
+    if e >= 0 && e + 9 < n && (*line)[e + 9] == ':' && e + 10 < n && is_digit((*line)[e + 10]) {
+        // line number
+        let mut q: i64 = e + 10;
+        while q < n && is_digit((*line)[q]) {
+            ln = ln * 10 + digit_val((*line)[q]);
+            q = q + 1;
+        }
+        // optional ":col" — mirror C++ exactly: the colon is consumed the moment it
+        // is seen (so the link span `te` includes a trailing `:` even when no column
+        // digits follow, e.g. "file.sentinel:12: warning"); the column is only set if
+        // digits are actually present.
+        if q < n && (*line)[q] == ':' {
+            q = q + 1;
+            let mut c: i64 = 0;
+            let mut any: bool = false;
+            while q < n && is_digit((*line)[q]) {
+                c = c * 10 + digit_val((*line)[q]);
+                q = q + 1;
+                any = true;
+            }
+            if any { col = c; 0 } else { 0 };
+            0
+        } else { 0 };
+        // walk back to the start of the path token (stop at '[')
+        let mut start: i64 = e;
+        while start > 0 && is_path((*line)[start - 1]) && (*line)[start - 1] != '[' {
+            start = start - 1;
+        }
+        // trim leading spaces to the real token start
+        let mut t0: i64 = start;
+        while t0 < n && (*line)[t0] == ' ' {
+            t0 = t0 + 1;
+        }
+        ts = t0;
+        te = q;
+        matched = true;
+        0
+    } else { 0 };
+
+    let mut out: Vec<u8> = vec_new();
+    if matched {
+        push(&mut out, i64_to_u8(1));
+        push_le8(&mut out, ln);
+        push_le8(&mut out, col);
+        push_le8(&mut out, ts);
+        push_le8(&mut out, te);
+        // File token = line[ts .. fileEnd), fileEnd = end of the first ".sentinel"
+        // at or after ts (the token always contains it, by construction).
+        let mut je: i64 = ts;
+        let mut found: bool = false;
+        while je + 9 <= n && found == false {
+            if is_sentinel_at(line, n, je) { found = true; 0 } else { je = je + 1; 0 };
+        }
+        let fileEnd: i64 = je + 9;
+        let mut m: i64 = ts;
+        while m < fileEnd {
+            push(&mut out, (*line)[m]);
+            m = m + 1;
+        }
+        0
+    } else {
+        push(&mut out, i64_to_u8(0));
+        0
+    };
+    vec_to_array(out)
+}

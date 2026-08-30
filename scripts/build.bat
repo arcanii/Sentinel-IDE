@@ -61,6 +61,23 @@ REM already in this env, so snc's link step works. Non-fatal: never blocks a bui
 set "SNC=G:\Sentinel-lang\target\debug\snc.exe"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0loc.ps1" -Root "%~dp0.." -Gen "%GENDIR%" -Snc "%SNC%"
 
+REM --- Sentinel-native diagnostic parser (first PRODUCT logic in Sentinel) ------
+REM Compile src\sentinel\diag.sentinel to a C-ABI static lib the host links, so the
+REM shipped binary genuinely interprets snc's diagnostic bytes in Sentinel (ADR 0059).
+REM vcvars is already in this env, so snc's internal lib.exe step resolves. If snc is
+REM absent or the build fails, diag.lib is simply not produced and CMake falls back to
+REM the C++ parseDiag (kept in lockstep by tests\diag_xcheck.cpp). Never blocks a build.
+set "SNCREL=G:\Sentinel-lang\target\release\snc.exe"
+set "SNCLIBPATH=G:\Sentinel-lang\sentinel_library"
+set "DIAGLIB=%GENDIR%\diag.lib"
+if exist "%DIAGLIB%" del /f /q "%DIAGLIB%"
+if exist "%SNCREL%" (
+  "%SNCREL%" build --lib "%~dp0..\src\sentinel\diag.sentinel" -o "%DIAGLIB%" --emit-header "%GENDIR%\sentinel_diag.h" --lib-path "%SNCLIBPATH%"
+  if exist "%DIAGLIB%" (echo SENTINEL_DIAG_OK) else (echo SENTINEL_DIAG_FALLBACK - snc lib build failed, using C++ parseDiag)
+) else (
+  echo SENTINEL_DIAG_FALLBACK - snc not found, using C++ parseDiag
+)
+
 "%CMAKE%" -S "%~dp0.." -B "%~dp0..\build" -G Ninja -DCMAKE_MAKE_PROGRAM="%NINJA%" -DCMAKE_BUILD_TYPE=Debug || exit /b 1
 "%CMAKE%" --build "%~dp0..\build" || exit /b 1
 echo BUILD_OK
