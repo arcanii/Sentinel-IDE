@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–37 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–38 built and verified.
 
 ---
 
@@ -64,8 +64,8 @@ exist so far:
 | `src/host/win32/PasswordDialog.{h,cpp}` | Themed modal password prompt (one field, or two with a match check for sealing) |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
-| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phase 35). `parsers.sentinel` = the build-diagnostic + trust-manifest parsers, built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust`. The thin-host thesis made real; About box shows the % in Sentinel. |
-| `tests/diag_xcheck.cpp`, `tests/trust_xcheck.cpp` | Prove the Sentinel parsers stay byte-identical to their C++ oracles (11 + 12 cases). `ctest --test-dir build`. |
+| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38). `parsers.sentinel` = four parsers (diagnostic, trust manifest, `.sig` carrier, project manifest), built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject`. Every file reader in the IDE. About box shows the % in Sentinel. |
+| `tests/*_xcheck.cpp` | Prove each Sentinel parser stays byte-identical to its C++ oracle: `diag` (11), `trust` (12), `sig` (12), `manifest` (14). Plus `seal_test`. `ctest --test-dir build`. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
 | `src/core/Signing.h` | Trust manifest (`[[keys]]`) + `.sig` parsers, `verifyFile`, and `sncSigningCaps` — which reports **verify** and **keygen/sign** as separate capabilities (they fail independently; see phase 30) |
@@ -152,7 +152,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–37 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–38 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -379,6 +379,29 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     (Sentinel LOC 408 → 479). The only file parser still in C++ is the manifest parser (`Project.h`),
     whose comment-preserving *writer* is the hard part and would stay native for now.
 
+38. **Project manifest reader in Sentinel — fourth port; every file parser is now Sentinel.**
+    `Project.h::loadProject` reads the manifest in Sentinel: `parse_manifest` in `parsers.sentinel`
+    does **both** the flat `[section] key=value` fields (replacing the Win32 profile API,
+    `projIni`/`projArr`) **and** the `[[target]]` array-of-tables (replacing `parseTargets`) in one
+    pass. The subtlety: those two had **different** semantics, both reproduced — flat fields are
+    **case-insensitive** (GetPrivateProfileString; empirically probed via a scratchpad harness) so
+    `emit_scalar`/`emit_array` use `lit_ieq`; `[[target]]` field keys are **case-sensitive**
+    (`parseTargets`) so `emit_targets` uses `lit_eq`. A `Name`-vs-`name` target test guards the split.
+    Defaults / `typeFromName` / `tierFromName` / single-target fallback stay host-side; Sentinel
+    returns raw found-flag + strings. `tests/manifest_xcheck.cpp` holds it byte-identical to the C++
+    `loadProject` across **14** cases (it deliberately does *not* define `SENTINELIDE_SENTINEL`, so
+    its `Project.h` is the C++ oracle, and links `parsers.lib` for `parse_manifest`). **Verified
+    live:** opening `examples/` loads crypto-lib with both `[[target]]`s, the Experimental tier, and
+    the entry file — all via the Sentinel reader. All **5** tests pass.
+    **The comment-preserving WRITER (`saveProject`) stays C++** — a surgical, structure-preserving
+    TOML rewrite is the genuinely hard part and out of scope. So every file *reader/parser* in the
+    IDE is now Sentinel; the manifest *writer* is the one file-touching path still in C++.
+    About-box figure **9.5% → 14.5%** (Sentinel LOC 479 → 784 — the biggest jump; parse_manifest is
+    ~200 lines). Sentinel language notes learned here, worth keeping: a **by-value `[u8]` param is
+    moved on first use inside a loop** — pass `&[u8]` for anything reused across iterations; and
+    **`&"literal"` is rejected** ("cannot borrow a non-lvalue") — bind literals to a `let` first,
+    then borrow.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -530,9 +553,10 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
   end-to-end in the live app. The **trust-manifest validator** (`Signing.h::loadTrust`) followed as
   the second port (phase 36) — a real security boundary, and it proved the "one lib, further ports
   nearly free" economics (+8 KB). The `.sig` carrier parser (`Signing.h::readSig`) followed as the third port (phase 37), so every
-  signing/trust file parser is now Sentinel. The remaining file parser is the `sentinel.toml` /
-  `*.sntproject` manifest reader (`Project.h`) — bigger, and its comment-preserving *writer* (`saveProject`)
-  is the hard part that would stay native for now. The crypto core stays blocked on R1 (secure-zero).
+  signing/trust file parser is now Sentinel. The manifest reader (`Project.h::loadProject`) followed as the fourth port (phase 38), so **every
+  file reader/parser in the IDE is now Sentinel**. The one file-touching path still in C++ is the
+  comment-preserving manifest *writer* (`saveProject`) — a surgical structure-preserving TOML rewrite,
+  the genuinely hard part, deliberately left native. The crypto core stays blocked on R1 (secure-zero).
 - **Signing follow-ons (remaining):** surface capability-bound verify failures as Problems; an
   editable trust manifest (policy/grants) beyond add+import; a Settings field for a default signing
   key (today post-build signing uses `sentinel.key` in the project dir).
@@ -564,7 +588,7 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–37 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–38 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
