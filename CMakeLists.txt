@@ -89,21 +89,22 @@ target_include_directories(SentinelIDE PRIVATE src "${SENTINEL_GENERATED_DIR}")
 target_link_libraries(SentinelIDE PRIVATE
   comctl32 dwmapi uxtheme gdi32 user32 shell32 ole32 bcrypt cabinet advapi32)
 
-# Sentinel-native diagnostic parser (src/sentinel/diag.sentinel). scripts\build.bat
-# compiles it to build/generated/diag.lib via `snc build --lib`; when that lib is
-# present the host's parseDiag calls INTO Sentinel (SENTINELIDE_SENTINEL_DIAG),
-# otherwise it uses the C++ fallback in MainWindow.cpp. Linking a Sentinel static lib
-# additionally requires these Windows system libs (they satisfy the Rust runtime the
-# lib pulls in — undocumented upstream, filed as R8 in docs/Sentinel-lang_request.md).
-set(SENTINEL_DIAG_LIB "${SENTINEL_GENERATED_DIR}/diag.lib")
-if(EXISTS "${SENTINEL_DIAG_LIB}")
-  target_compile_definitions(SentinelIDE PRIVATE SENTINELIDE_SENTINEL_DIAG)
+# Sentinel-native parsers (src/sentinel/parsers.sentinel — the diagnostic + trust
+# parsers). scripts\build.bat compiles them to build/generated/parsers.lib via
+# `snc build --lib`; when that lib is present the host's parseDiag and loadTrust call
+# INTO Sentinel (SENTINELIDE_SENTINEL), otherwise they use the C++ fallbacks. Linking a
+# Sentinel static lib additionally requires these Windows system libs (they satisfy the
+# Rust runtime the lib pulls in — undocumented upstream, filed as R8 in
+# docs/Sentinel-lang_request.md).
+set(SENTINEL_PARSERS_LIB "${SENTINEL_GENERATED_DIR}/parsers.lib")
+if(EXISTS "${SENTINEL_PARSERS_LIB}")
+  target_compile_definitions(SentinelIDE PRIVATE SENTINELIDE_SENTINEL)
   target_link_libraries(SentinelIDE PRIVATE
-    "${SENTINEL_DIAG_LIB}"
+    "${SENTINEL_PARSERS_LIB}"
     legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
-  message(STATUS "SentinelIDE: diagnostic parser = Sentinel (diag.lib linked)")
+  message(STATUS "SentinelIDE: diagnostic + trust parsers = Sentinel (parsers.lib linked)")
 else()
-  message(STATUS "SentinelIDE: diagnostic parser = C++ fallback (diag.lib absent)")
+  message(STATUS "SentinelIDE: diagnostic + trust parsers = C++ fallback (parsers.lib absent)")
 endif()
 
 # The .rc embeds app.manifest; stop the linker generating a competing one.
@@ -123,15 +124,19 @@ target_link_libraries(seal_test PRIVATE bcrypt cabinet shell32 advapi32)
 set_target_properties(seal_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME seal_format COMMAND seal_test)
 
-# diag_xcheck — proves the Sentinel diagnostic parser matches the C++ oracle it
-# replaced (they must stay byte-identical). Only defined when the Sentinel lib was
-# built; it links the same diag.lib + system libs the app does.
+# diag_xcheck / trust_xcheck — prove the Sentinel parsers stay byte-identical to the
+# C++ oracles they replaced. Only defined when the Sentinel lib was built; they link
+# the same parsers.lib + system libs the app does.
 #     cmake --build build --target diag_xcheck  &&  build\diag_xcheck.exe
-if(EXISTS "${SENTINEL_DIAG_LIB}")
-  add_executable(diag_xcheck tests/diag_xcheck.cpp)
-  target_link_libraries(diag_xcheck PRIVATE
-    "${SENTINEL_DIAG_LIB}"
-    legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
-  set_target_properties(diag_xcheck PROPERTIES EXCLUDE_FROM_ALL TRUE)
-  add_test(NAME diag_parity COMMAND diag_xcheck)
+#     cmake --build build --target trust_xcheck &&  build\trust_xcheck.exe
+if(EXISTS "${SENTINEL_PARSERS_LIB}")
+  foreach(_xc diag_xcheck trust_xcheck)
+    add_executable(${_xc} tests/${_xc}.cpp)
+    target_link_libraries(${_xc} PRIVATE
+      "${SENTINEL_PARSERS_LIB}"
+      legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
+    set_target_properties(${_xc} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+  endforeach()
+  add_test(NAME diag_parity  COMMAND diag_xcheck)
+  add_test(NAME trust_parity COMMAND trust_xcheck)
 endif()

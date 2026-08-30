@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// parsers.sentinel — Sentinel-IDE's runtime PRODUCT logic, written in Sentinel and
+// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Two
+// exports so far, both "interpret untrusted bytes" jobs the host used to do in C++:
+//
+//   parse_diag(line)  — one line of snc build output -> a diagnostic (file:line:col)
+//   parse_trust(text) — the consumer trust manifest -> the trusted [[keys]]
+//
+// Kept as ONE lib on purpose: each Sentinel lib bundles the whole runtime, so linking
+// two would collide on sentinel_free_bytes / the allocator. One lib = one runtime.
+// Both use the owned `-> [u8]` return ABI (not `&mut [u8]`), sidestepping the
+// header-emits-&mut-as-const defect (Sentinel-lang R3). Each export's record format is
+// documented above it. The C++ fallbacks (MainWindow.cpp::parseDiag, Signing.h::
+// loadTrust) stay byte-identical, guarded by tests/diag_xcheck.cpp + trust_xcheck.cpp.
+
+// ---- shared helpers ---------------------------------------------------------
+
+// Append v as 8 little-endian bytes (`-> i64` returning 0 is the side-effect-only
+// helper idiom; Sentinel has no unit-returning fn form).
+fn push_le8(out: &mut Vec<u8>, v: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut x: i64 = v;
+    while i < 8 {
+        push(out, i64_to_u8(x - (x / 256) * 256));   // no `%` operator — x mod 256
+        x = x / 256;
+        i = i + 1;
+    }
+    0
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// The characters C++ `isPath` accepts, plus any byte >= 0x80 so multi-byte UTF-8
+// path components (accented or non-Latin directory names) stay whole rather than
+// truncating the token at the first continuation byte.
+fn is_path(c: u8) -> bool {
+    is_alnum(c) || c == '_' || c == '.' || c == '\\' || c == '/'
+        || c == ':' || c == '-' || c == ' ' || (c as i64) >= 128
+}
+
+fn digit_val(c: u8) -> i64 {
+    (c as i64) - ('0' as i64)
+}
+
+// True iff ".sentinel" (9 bytes) begins at `at` in `s` (length `n`). `&&`
+// short-circuits, so the leading bounds test guards every index.
+fn is_sentinel_at(s: &[u8], n: i64, at: i64) -> bool {
+    at + 9 <= n
+        && (*s)[at] == '.'
+        && (*s)[at + 1] == 's' && (*s)[at + 2] == 'e' && (*s)[at + 3] == 'n'
+        && (*s)[at + 4] == 't' && (*s)[at + 5] == 'i' && (*s)[at + 6] == 'n'
+        && (*s)[at + 7] == 'e' && (*s)[at + 8] == 'l'
+}
+
+// Append an i64 as 8 little-endian bytes. `-> i64` returning 0 is the Sentinel
+// idiom for a side-effect-only helper (there is no unit-returning fn form).
+export "C" fn parse_diag(line: &[u8]) -> [u8] {
+    let n: i64 = len(*line);
+
+    // Function-scope state — Sentinel has no early `return`, so everything is
+    // decided here and encoded once at the end, guarded by `matched`.
+    let mut matched: bool = false;
+    let mut ln: i64 = 0;
+    let mut col: i64 = 1;
+    let mut ts: i64 = 0;
+    let mut te: i64 = 0;
+
+    // First ".sentinel" (C++ uses find(), i.e. the earliest occurrence).
+    let mut e: i64 = 0 - 1;
+    let mut i: i64 = 0;
+    while i + 9 <= n && e < 0 {
+        if is_sentinel_at(line, n, i) { e = i; 0 } else { 0 };
+        i = i + 1;
+    }
+
+    // Require ".sentinel" then ":" then a digit. `&&` short-circuits, so each
+    // index is bounded by the length test to its left.
+    if e >= 0 && e + 9 < n && (*line)[e + 9] == ':' && e + 10 < n && is_digit((*line)[e + 10]) {
+        // line number
+        let mut q: i64 = e + 10;
+        while q < n && is_digit((*line)[q]) {
+            ln = ln * 10 + digit_val((*line)[q]);
+            q = q + 1;
+        }
+        // optional ":col" — mirror C++ exactly: the colon is consumed the moment it
+        // is seen (so the link span `te` includes a trailing `:` even when no column
+        // digits follow, e.g. "file.sentinel:12: warning"); the column is only set if
+        // digits are actually present.
+        if q < n && (*line)[q] == ':' {
+            q = q + 1;
+            let mut c: i64 = 0;
+            let mut any: bool = false;
+            while q < n && is_digit((*line)[q]) {
+                c = c * 10 + digit_val((*line)[q]);
+                q = q + 1;
+                any = true;
+            }
+            if any { col = c; 0 } else { 0 };
+            0
+        } else { 0 };
+        // walk back to the start of the path token (stop at '[')
+        let mut start: i64 = e;
+        while start > 0 && is_path((*line)[start - 1]) && (*line)[start - 1] != '[' {
+            start = start - 1;
+        }
+        // trim leading spaces to the real token start
+        let mut t0: i64 = start;
+        while t0 < n && (*line)[t0] == ' ' {
+            t0 = t0 + 1;
+        }
+        ts = t0;
+        te = q;
+        matched = true;
+        0
+    } else { 0 };
+
+    let mut out: Vec<u8> = vec_new();
+    if matched {
+        push(&mut out, i64_to_u8(1));
+        push_le8(&mut out, ln);
+        push_le8(&mut out, col);
+        push_le8(&mut out, ts);
+        push_le8(&mut out, te);
+        // File token = line[ts .. fileEnd), fileEnd = end of the first ".sentinel"
+        // at or after ts (the token always contains it, by construction).
+        let mut je: i64 = ts;
+        let mut found: bool = false;
+        while je + 9 <= n && found == false {
+            if is_sentinel_at(line, n, je) { found = true; 0 } else { je = je + 1; 0 };
+        }
+        let fileEnd: i64 = je + 9;
+        let mut m: i64 = ts;
+        while m < fileEnd {
+            push(&mut out, (*line)[m]);
+            m = m + 1;
+        }
+        0
+    } else {
+        push(&mut out, i64_to_u8(0));
+        0
+    };
+    vec_to_array(out)
+}
+
+// ---- trust manifest parser --------------------------------------------------
+fn is_ws(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+// projUnq trims leading " \t" and trailing " \t\r" (note: not \n).
+fn is_hsp(c: u8) -> bool {
+    c == ' ' || c == '\t'
+}
+fn is_hsp_cr(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\r'
+}
+
+// text[a..b) equals the literal `lit`, byte for byte.
+fn lit_eq(text: &[u8], a: i64, b: i64, lit: [u8]) -> bool {
+    let m: i64 = b - a;
+    let ll: i64 = len(lit);
+    let mut ok: bool = m == ll;
+    let mut i: i64 = 0;
+    while ok && i < ll {
+        ok = ok && ((*text)[a + i] == lit[i]);
+        i = i + 1;
+    }
+    ok
+}
+
+// Does text[a..b) contain the literal `lit` anywhere? (C++ uses find() != npos.)
+fn range_has(text: &[u8], a: i64, b: i64, lit: [u8]) -> bool {
+    let ll: i64 = len(lit);
+    let mut found: bool = false;
+    let mut i: i64 = a;
+    while i + ll <= b && found == false {
+        let mut m: bool = true;
+        let mut j: i64 = 0;
+        while m && j < ll {
+            m = m && ((*text)[i + j] == lit[j]);
+            j = j + 1;
+        }
+        if m { found = true; 0 } else { 0 };
+        i = i + 1;
+    }
+    found
+}
+
+// Append v as 8 little-endian bytes.
+// Append a length-prefixed byte range: [len i64 LE][ text[a..b) ].
+fn push_lenpref(out: &mut Vec<u8>, text: &[u8], a: i64, b: i64) -> i64 {
+    push_le8(out, b - a);
+    let mut i: i64 = a;
+    while i < b {
+        push(out, (*text)[i]);
+        i = i + 1;
+    }
+    0
+}
+
+// Emit the grant entries in text[a..b): each quoted string becomes { byte 1, lenpref }.
+// Mirrors parseInlineArr: toggle on '"', emit the content when a quote closes.
+fn emit_grants(out: &mut Vec<u8>, text: &[u8], a: i64, b: i64) -> i64 {
+    let mut inq: bool = false;
+    let mut cs: i64 = a;
+    let mut i: i64 = a;
+    while i < b {
+        if (*text)[i] == '"' {
+            if inq {
+                push(out, i64_to_u8(1));
+                push_lenpref(out, text, cs, i);
+                inq = false;
+                0
+            } else {
+                inq = true;
+                cs = i + 1;
+                0
+            };
+            0
+        } else { 0 };
+        i = i + 1;
+    }
+    0
+}
+
+// Emit one key record (name, pubkey, grants) then the grants terminator.
+fn flush_key(out: &mut Vec<u8>, text: &[u8],
+             hasN: bool, nA: i64, nB: i64,
+             hasP: bool, pA: i64, pB: i64,
+             hasG: bool, gA: i64, gB: i64) -> i64 {
+    push(out, i64_to_u8(1));                 // a key follows
+    if hasN { push_lenpref(out, text, nA, nB); 0 } else { push_le8(out, 0); 0 };
+    if hasP { push_lenpref(out, text, pA, pB); 0 } else { push_le8(out, 0); 0 };
+    if hasG { emit_grants(out, text, gA, gB); 0 } else { 0 };
+    push(out, i64_to_u8(0));                 // grants terminator
+    0
+}
+
+export "C" fn parse_trust(text: &[u8]) -> [u8] {
+    let n: i64 = len(*text);
+    let mut out: Vec<u8> = vec_new();
+
+    // Pending-key state. Values are index RANGES into `text` (which lives for the
+    // whole call), so nothing is copied until a key is flushed.
+    let mut have: bool = false;
+    let mut hasN: bool = false; let mut nA: i64 = 0; let mut nB: i64 = 0;
+    let mut hasP: bool = false; let mut pA: i64 = 0; let mut pB: i64 = 0;
+    let mut hasG: bool = false; let mut gA: i64 = 0; let mut gB: i64 = 0;
+
+    // Walk the text line by line (split on '\n', a trailing '\r' trimmed by projTrim).
+    let mut ls: i64 = 0;
+    let mut i: i64 = 0;
+    while i <= n {
+        // A line ends at '\n' or at end-of-text.
+        if i == n || (*text)[i] == '\n' {
+            let la: i64 = ls;
+            let lb: i64 = i;
+            // projTrim: trim " \t\r\n" from both ends.
+            let mut ts: i64 = la;
+            while ts < lb && is_ws((*text)[ts]) { ts = ts + 1; }
+            let mut te: i64 = lb;
+            while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+
+            if ts < te && (*text)[ts] != '#' {
+                if te - ts >= 2 && (*text)[ts] == '[' && (*text)[ts + 1] == '[' {
+                    // [[...]] array-of-tables: flush any pending key, then open/close.
+                    if have { flush_key(&mut out, text, hasN, nA, nB, hasP, pA, pB, hasG, gA, gB); 0 } else { 0 };
+                    if range_has(text, ts, te, "keys") {
+                        have = true; hasN = false; hasP = false; hasG = false; 0
+                    } else {
+                        have = false; 0
+                    };
+                    0
+                } else {
+                    if (*text)[ts] == '[' {
+                        // any other single-bracket table closes the block.
+                        if have { flush_key(&mut out, text, hasN, nA, nB, hasP, pA, pB, hasG, gA, gB); 0 } else { 0 };
+                        have = false; 0
+                    } else {
+                        if have {
+                            // find the first '=' in [ts, te)
+                            let mut eq: i64 = ts;
+                            let mut haseq: bool = false;
+                            while eq < te && haseq == false {
+                                if (*text)[eq] == '=' { haseq = true; 0 } else { eq = eq + 1; 0 };
+                            }
+                            if haseq {
+                                // key range [ts, eq) trimmed to [ka, kb)
+                                let mut ka: i64 = ts;
+                                while ka < eq && is_ws((*text)[ka]) { ka = ka + 1; }
+                                let mut kb: i64 = eq;
+                                while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                                // projUnq the raw value [eq+1, te): trim " \t" / " \t\r", strip a matched quote pair.
+                                let mut ua: i64 = eq + 1;
+                                while ua < te && is_hsp((*text)[ua]) { ua = ua + 1; }
+                                let mut ub: i64 = te;
+                                while ub > ua && is_hsp_cr((*text)[ub - 1]) { ub = ub - 1; }
+                                if ub - ua >= 2 && (*text)[ua] == '"' && (*text)[ub - 1] == '"' { ua = ua + 1; ub = ub - 1; 0 } else { 0 };
+                                // dispatch (grants uses the RAW value range, like parseInlineArr)
+                                if lit_eq(text, ka, kb, "pubkey") {
+                                    pA = ua; pB = ub; hasP = true; 0
+                                } else {
+                                    if lit_eq(text, ka, kb, "name") {
+                                        nA = ua; nB = ub; hasN = true; 0
+                                    } else {
+                                        if lit_eq(text, ka, kb, "grants") {
+                                            gA = eq + 1; gB = te; hasG = true; 0
+                                        } else { 0 };
+                                        0
+                                    };
+                                    0
+                                };
+                                0
+                            } else { 0 };
+                            0
+                        } else { 0 };
+                        0
+                    };
+                    0
+                };
+                0
+            } else { 0 };
+
+            ls = i + 1;
+            0
+        } else { 0 };
+        i = i + 1;
+    }
+
+    // Flush the last pending key, then the no-more-keys terminator.
+    if have { flush_key(&mut out, text, hasN, nA, nB, hasP, pA, pB, hasG, gA, gB); 0 } else { 0 };
+    push(&mut out, i64_to_u8(0));
+    vec_to_array(out)
+}

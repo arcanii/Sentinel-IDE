@@ -61,21 +61,23 @@ REM already in this env, so snc's link step works. Non-fatal: never blocks a bui
 set "SNC=G:\Sentinel-lang\target\debug\snc.exe"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0loc.ps1" -Root "%~dp0.." -Gen "%GENDIR%" -Snc "%SNC%"
 
-REM --- Sentinel-native diagnostic parser (first PRODUCT logic in Sentinel) ------
-REM Compile src\sentinel\diag.sentinel to a C-ABI static lib the host links, so the
-REM shipped binary genuinely interprets snc's diagnostic bytes in Sentinel (ADR 0059).
-REM vcvars is already in this env, so snc's internal lib.exe step resolves. If snc is
-REM absent or the build fails, diag.lib is simply not produced and CMake falls back to
-REM the C++ parseDiag (kept in lockstep by tests\diag_xcheck.cpp). Never blocks a build.
+REM --- Sentinel-native parsers (PRODUCT logic in Sentinel) ---------------------
+REM Compile src\sentinel\parsers.sentinel to ONE C-ABI static lib the host links, so
+REM the shipped binary interprets snc's diagnostic + trust-manifest bytes in Sentinel
+REM (ADR 0059). One lib on purpose: each Sentinel lib bundles the whole runtime, so two
+REM would collide on sentinel_free_bytes / the allocator. vcvars is already in this env,
+REM so snc's internal lib.exe step resolves. If snc is absent or the build fails, the lib
+REM is simply not produced and CMake falls back to the C++ implementations (kept in
+REM lockstep by tests\diag_xcheck.cpp + trust_xcheck.cpp). Never blocks a build.
 set "SNCREL=G:\Sentinel-lang\target\release\snc.exe"
 set "SNCLIBPATH=G:\Sentinel-lang\sentinel_library"
-set "DIAGLIB=%GENDIR%\diag.lib"
-if exist "%DIAGLIB%" del /f /q "%DIAGLIB%"
+set "SNTLIB=%GENDIR%\parsers.lib"
+if exist "%SNTLIB%" del /f /q "%SNTLIB%"
 if exist "%SNCREL%" (
-  "%SNCREL%" build --lib "%~dp0..\src\sentinel\diag.sentinel" -o "%DIAGLIB%" --emit-header "%GENDIR%\sentinel_diag.h" --lib-path "%SNCLIBPATH%"
-  if exist "%DIAGLIB%" (echo SENTINEL_DIAG_OK) else (echo SENTINEL_DIAG_FALLBACK - snc lib build failed, using C++ parseDiag)
+  "%SNCREL%" build --lib "%~dp0..\src\sentinel\parsers.sentinel" -o "%SNTLIB%" --emit-header "%GENDIR%\sentinel_parsers.h" --lib-path "%SNCLIBPATH%"
+  if exist "%SNTLIB%" (echo SENTINEL_PARSERS_OK) else (echo SENTINEL_PARSERS_FALLBACK - snc lib build failed, using C++ parsers)
 ) else (
-  echo SENTINEL_DIAG_FALLBACK - snc not found, using C++ parseDiag
+  echo SENTINEL_PARSERS_FALLBACK - snc not found, using C++ parsers
 )
 
 "%CMAKE%" -S "%~dp0.." -B "%~dp0..\build" -G Ninja -DCMAKE_MAKE_PROGRAM="%NINJA%" -DCMAKE_BUILD_TYPE=Debug || exit /b 1
