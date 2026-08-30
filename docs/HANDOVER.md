@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–36 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–37 built and verified.
 
 ---
 
@@ -152,7 +152,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
 
-## Prototype status — phases 1–36 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–37 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -367,6 +367,18 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     excluded). It moves with every port: ~1.4% → 4.9% (diag) → **8.3%** (trust). Sentinel LOC badge
     is now **408**.
 
+37. **`.sig` carrier parser in Sentinel — third port.** `Signing.h::readSig` now runs in Sentinel:
+    `parse_sig` in `parsers.sentinel`, a faithful port of the flat `key: value` carrier parser (split
+    on the first `:`, both halves projTrim'd, `algorithm`/`key`/`grants` last-wins). Byte-identical
+    to the C++ oracle via `tests/sig_xcheck.cpp` (12 cases — value-contains-colon, colon-with-no-key,
+    empty value, whitespace-only `present`, unknown keys ignored, non-ASCII, no trailing newline).
+    **Verified live:** the Signing panel's FILE SIGNATURE section shows Key/Grants parsed from
+    `crypto.sentinel.sig` by the Sentinel `readSig`. All **4** tests pass via ctest (seal, diag,
+    trust, sig). The one-lib economics held again — **+~8 KB** (2,741,760 → 2,749,952). Now every
+    parser on the signing/trust path is Sentinel; the About-box Sentinel bar moved **8.3% → 9.5%**
+    (Sentinel LOC 408 → 479). The only file parser still in C++ is the manifest parser (`Project.h`),
+    whose comment-preserving *writer* is the hard part and would stay native for now.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -516,10 +528,10 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
   whole C-ABI integration spine (build lib → emit header → link with R8 libs → call → verify),
   end-to-end in the live app. The **trust-manifest validator** (`Signing.h::loadTrust`) followed as
   the second port (phase 36) — a real security boundary, and it proved the "one lib, further ports
-  nearly free" economics (+8 KB). **Next candidates along the same seam** (parse untrusted bytes, no
-  secrets, host does file I/O): the `.sig` carrier parser (`Signing.h::readSig`) and the `sentinel.toml`
-  / `*.sntproject` manifest parser (`Project.h` — bigger, has a comment-preserving *writer* that is
-  the hard part and would stay native for now). The crypto core stays blocked on R1.
+  nearly free" economics (+8 KB). The `.sig` carrier parser (`Signing.h::readSig`) followed as the third port (phase 37), so every
+  signing/trust file parser is now Sentinel. The remaining file parser is the `sentinel.toml` /
+  `*.sntproject` manifest reader (`Project.h`) — bigger, and its comment-preserving *writer* (`saveProject`)
+  is the hard part that would stay native for now. The crypto core stays blocked on R1 (secure-zero).
 - **Signing follow-ons (remaining):** surface capability-bound verify failures as Problems; an
   editable trust manifest (policy/grants) beyond add+import; a Settings field for a default signing
   key (today post-build signing uses `sentinel.key` in the project dir).
@@ -551,7 +563,7 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 > Win32 host (WinMain, MainWindow ~1600 lines, five themed dialogs, Theme.h). A macOS/Linux port adds
 > `src/host/<os>/` against the same core — **do not scaffold empty platform trees** until a port starts.
 >
-> **Phases 1–36 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
+> **Phases 1–37 are done** (screenshots cover phases 1–11, 13, 15 only): themed dark/coral shell with **dark popup +
 > right-click menus**; editor with syntax highlighting, line gutter (Ctrl+L), dirty `●`/Save (Ctrl+S),
 > error tints, **undo/redo** (Ctrl+Z/Y + toolbar `↶`/`↷`; the highlighter no longer pollutes the undo
 > stack — TOM `ITextDocument` undo is suspended around formatting); `snc` build/run with streamed
