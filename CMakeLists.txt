@@ -69,12 +69,12 @@ if(NOT EXISTS "${SENTINEL_GENERATED_DIR}/Version.h")
   file(WRITE "${SENTINEL_GENERATED_DIR}/Version.h"
     "#pragma once\n"
     "#define SENTINEL_BUILD_NUMBER 0\n"
-    "#define SENTINEL_VERSION_MARKETING \"0.1.2\"\n"
-    "#define SENTINEL_VERSION_DISPLAY \"0.1.2 (build 0)\"\n"
-    "#define SENTINEL_VERSION_DISPLAY_W L\"0.1.2 (build 0)\"\n"
-    "#define SENTINEL_FILEVERSION 0,1,2,0\n"
-    "#define SENTINEL_FILEVERSION_STR \"0.1.2.0\"\n"
-    "#define SENTINEL_FILEVERSION_STR_W L\"0.1.2.0\"\n")
+    "#define SENTINEL_VERSION_MARKETING \"0.1.3\"\n"
+    "#define SENTINEL_VERSION_DISPLAY \"0.1.3 (build 0)\"\n"
+    "#define SENTINEL_VERSION_DISPLAY_W L\"0.1.3 (build 0)\"\n"
+    "#define SENTINEL_FILEVERSION 0,1,3,0\n"
+    "#define SENTINEL_FILEVERSION_STR \"0.1.3.0\"\n"
+    "#define SENTINEL_FILEVERSION_STR_W L\"0.1.3.0\"\n")
 endif()
 if(NOT EXISTS "${SENTINEL_GENERATED_DIR}/Loc.h")
   file(WRITE "${SENTINEL_GENERATED_DIR}/Loc.h"
