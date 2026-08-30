@@ -38,10 +38,10 @@ exist so far:
   `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
   fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
   disables auto-update for every installed client.
-- **Released.** Latest is **v0.1.1 (build 135)** — the first release carrying Sentinel code in the
-  binary. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`); a 0.1.0 client was
-  verified end-to-end being offered 0.1.1. See **Releases** below and `docs/RELEASING.md` for the cut
-  procedure.
+- **Released.** Latest is **v0.1.2 (build 140)** — every parser on the signing/trust path now runs
+  in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`); the offer path was
+  verified end-to-end (a 0.1.0 client offered 0.1.1, across a marketing bump). See **Releases** below
+  and `docs/RELEASING.md` for the cut procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
 
@@ -128,7 +128,7 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   (The old `[string]$Args` param collided with PowerShell's automatic `$Args` and silently
   dropped every argument — that's why a launch could come up with no folder open.)
 
-- **Versioning:** marketing version is **`0.1.1`** (`MKT`/`MKTRC` at the top of `build.bat`; was
+- **Versioning:** marketing version is **`0.1.2`** (`MKT`/`MKTRC` at the top of `build.bat`; was
   `0.1.0` through the first release, bumped for v0.1.1). The build number is
   **`git rev-list --count HEAD` + `BUILDBASE`** (phase 34). Same commit → same version, so any
   released artifact can be rebuilt from its tag. It only advances when you **commit**, so repeated
@@ -396,6 +396,7 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 |---|---|---|---|
 | `v0.1.0` | 127 | `Sentinel-IDE-0.1.0.127-setup.exe` | First release. The whole phase 1–32 IDE + live auto-update. **No Sentinel in the binary yet** (C++ parsers). |
 | `v0.1.1` | 135 | `Sentinel-IDE-0.1.1.135-setup.exe` | **First release with Sentinel in the binary** — the diagnostic + trust-manifest parsers run in Sentinel; About-box "built in Sentinel" progress bar; installer x64/`Program Files` fix; git-derived build number. |
+| `v0.1.2` | 140 | `Sentinel-IDE-0.1.2.140-setup.exe` | Patch. The `.sig`-carrier parser (`readSig`) now runs in Sentinel too — every signing/trust-path parser is Sentinel. About figure 8.3% → 9.5%. Behavior-identical to 0.1.1 otherwise. |
 
 To cut the next one: `docs/RELEASING.md` (bump `MKT`/`MKTRC` in `build.bat` if the marketing version
 moves → clean commit → `make-installer.bat` → `sign-release.ps1 -Appcast` → tag the build commit →
