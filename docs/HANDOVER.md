@@ -40,11 +40,12 @@ exist so far:
   `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
   fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
   disables auto-update for every installed client.
-- **Released.** Latest is **v0.1.3 (build 145)** — every file reader/parser in the IDE now runs
-  in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`); the offer path was
-  verified end-to-end **as of 0.1.5 only** — before that the *offer* worked and the **install never did**
-  (see phase 40; v0.1.0–v0.1.4 could not auto-install anything). See **Releases** below
-  and `docs/RELEASING.md` for the cut procedure.
+- **Released.** Latest is **v0.1.5 (build 154)**; six releases so far. Every file reader/parser in
+  the IDE runs in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`), but read
+  phase 40 before trusting it: v0.1.0–v0.1.4 offered updates that **could never install**, and even in
+  0.1.5 only the **manual** ≡ ▸ Check for Updates… path installs — WinSparkle's **automatic/background
+  check is still broken** (same empty-payload bug, upstream). See **Releases** below and
+  `docs/RELEASING.md` for the cut procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
 
@@ -155,6 +156,26 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   in the **same** PowerShell call as `cmd /c` — keep them in separate calls.
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
+
+## Environment gotchas (this machine)
+
+Small, non-obvious frictions that cost real time when rediscovered. None is a defect in the project.
+
+- **Never edit a `.bat` with `sed`, a heredoc, or anything else that writes LF.** `cmd.exe` needs
+  CRLF and fails with nonsense like `'t' is not recognized`. Use the `Edit` tool, which preserves
+  line endings. **This overrides any harness preference for shell-based edits.** The same care
+  applies to `examples/crypto.sentinel` — rewriting it with LF invalidates its committed `.sig`,
+  which `.gitattributes` marks binary precisely to prevent.
+- **`G:` is a mapped network share** (`\truenas.local\hkshare01\...`). Ordinary binaries run from it
+  fine — `launch.ps1` runs the app straight off the share, and the `ctest` binaries run in place — but
+  an **Inno installer** launched from `build\installer\` fails with **"Access is denied"**. Copy the
+  setup exe to local disk before running it. Git also needs `safe.directory` here (already configured
+  globally).
+- **A `Remove-Item` in the same PowerShell call as a `cmd /c` is rejected** by a sandbox guard
+  ("path is protected from removal"). Put them in separate calls.
+- **Bash heredocs strip one level of backslash escaping** on the way to the interpreter, so a Python
+  one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
+  mysteriously fails to match, that is usually why.
 
 ## Prototype status — phases 1–40 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
@@ -514,7 +535,18 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
     **The diagnostic callbacks stay in.** An updater that fails silently is indistinguishable from one
     that works, which is precisely how this survived four releases.
     ⚠ **Clients on v0.1.4 or older cannot auto-install 0.1.5** — the broken updater is the thing being
-    fixed. They need one manual install; updates work from then on.
+    fixed. They need one manual install.
+    ⚠ **Only the MANUAL check installs. The automatic/background check is STILL BROKEN** — verified
+    afterwards, and the reason this entry exists in two halves. `win_sparkle_init()` also starts a
+    periodic check, and that check raises WinSparkle's *own* prompt, i.e. the same
+    `check_update_with_ui()` flow whose payload path is empty. Measured: with `CheckForUpdates=1` and
+    `LastCheckTime=0` forced in `HKCU\Software\Sentinel\Sentinel-IDE\WinSparkle`, a 0.1.2.153 client
+    raised the update prompt unprompted after 7.8 s, and clicking Install logged
+    `payload ready — []  exists=NO` and installed nothing. `checkForUpdates()` is the only entry point
+    we control, so the fix reaches the menu item and the About-box button and nothing else.
+    **Do not claim auto-update "just works"** — it works when the user asks for it. Fixing the
+    background path needs either a newer/rebuilt WinSparkle, or replacing its periodic check with our
+    own timer calling the same working entry point (untried).
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
@@ -712,35 +744,49 @@ in the first few tool calls, before the handover has been read. Everything look-
 read the handover belongs in the handover body, not here._
 
 > You're continuing **Sentinel-IDE** (`G:\SentinelIDE`) — a native Win32 IDE for the **Sentinel**
-> language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It's a
-> **released** product (latest **v0.1.3**, on GitHub, with live WinSparkle auto-update), and real
-> Sentinel code now runs in the shipped binary (the four file parsers). **Read `docs/HANDOVER.md`
-> first — it is the full, current state** (phase list 1–40, the Releases table, What's next, and the
-> per-area detail). Then, as needed: `docs/RELEASING.md` (how to cut a release), and
-> `docs/Sentinel-lang_request.md` (what the Sentinel language/toolchain can and can't do — measured,
-> not folklore). `docs/prototype.md` + `docs/sentinel-project.md` are older narrative detail.
+> language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It is a
+> **released, public, auto-updating** product: six releases, latest **v0.1.5 (build 154)**, and real
+> Sentinel code runs in the shipped binary (the four file parsers). Treat `main` as shippable.
 >
-> **Before you touch anything, five things that bite in the first five minutes** (the handover
-> explains each; these just need to land before you act):
+> **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
+> pick something off "What's next" and start — this is live software with users on auto-update.
+>
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–40, Environment gotchas,
+> the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
+> section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
+> `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not
+> folklore). `docs/prototype.md` + `docs/sentinel-project.md` are older narrative detail.
+>
+> **One rule that overrides your defaults:** never edit a `.bat` with `sed`, a heredoc, or any tool
+> that writes LF — `cmd` needs CRLF and dies with `'t' is not recognized`. Use `Edit`. If your harness
+> tells you to prefer shell edits, this beats it. Same for `examples/crypto.sentinel`: rewriting it
+> with LF invalidates its committed `.sig`.
+>
+> **Four more things that bite early** (all expanded under *Environment gotchas* and the phase list):
 > 1. **Don't "fix" the naming.** Product/exe = `Sentinel-IDE`; internal identifiers (window class
 >    `SentinelIDEMainWindow`, `sentinelide` namespace, `%LOCALAPPDATA%\SentinelIDE`, `SentinelIDE.rc`,
 >    the CMake target, the folder) deliberately stay `SentinelIDE`. Changing them breaks saved
->    settings and the `-Class` capture path.
-> 2. **Build through `cmd /c scripts\build.bat`**, never raw `cmake` (the batch stamps the version and
->    builds the Sentinel parser lib). It's a git-derived build number; `BUILD_DIRTY` in the output
->    means the tree doesn't match HEAD — never ship such a build.
-> 3. **Commit/push only when asked.** The repo is **public and must stay public** (auto-update fetches
->    the appcast over anonymous HTTPS). `main` is shippable; treat it that way.
-> 4. **Never edit a `.bat` with `sed` or any tool that writes LF** — `cmd` needs CRLF and dies with
->    `'t' is not recognized`. Use `Edit`. (Same reason `.gitattributes` forces CRLF; and don't let any
->    tool rewrite `examples/crypto.sentinel` to LF — it invalidates the committed `.sig`.)
-> 5. **Don't trust your priors about Sentinel's limits.** Much "Sentinel can't do X" folklore is false
+>    settings and the `-Class` screenshot path.
+> 2. **Build through `cmd /c scripts\build.bat`**, never raw `cmake` — the batch stamps the version,
+>    selects Release + static CRT, and builds the Sentinel parser lib. `BUILD_DIRTY` means the tree
+>    doesn't match HEAD: fine while developing, never ship one.
+> 3. **Commit/push only when asked.** The repo is **public and must stay public** — auto-update fetches
+>    the appcast over anonymous HTTPS, and a private repo 404s every client silently.
+> 4. **Don't trust your priors about Sentinel's limits.** Much "Sentinel can't do X" folklore is false
 >    (argv, non-capturing closures, dir-walk via FFI all work); the crypto-core port is *blocked*
->    (R1, secure-zero) despite older notes calling it the top candidate. `docs/Sentinel-lang_request.md`
->    is the measured truth. If you write Sentinel, `src/sentinel/parsers.sentinel` is the worked
->    example for the language's quirks (no `%`, `if` is an expression, no early `return`, `[u8]` params
->    move in loops so pass `&[u8]`, `&"literal"` is illegal).
+>    (R1, secure-zero) despite older notes calling it the top candidate.
+>    `src/sentinel/parsers.sentinel` is the worked example for the language's quirks (no `%`, `if` is
+>    an expression, no early `return`, `[u8]` params move in loops so pass `&[u8]`, `&"literal"` is
+>    illegal).
 >
-> That's the seed. Everything else — the phase history, the build/screenshot commands and window
-> classes, the trust-manifest four-site lockstep rule, the release procedure, the full gotcha list —
-> is in `docs/HANDOVER.md` and the docs it points to. Read there; don't expect it duplicated here.
+> **One habit this project earned the hard way.** Three defects shipped across v0.1.0–v0.1.4: unsaved
+> edits silently discarded, a Debug binary that could not launch without Visual Studio, and an
+> auto-updater that offered updates it could never install. The last is the cautionary one — the docs
+> called auto-update "verified end-to-end" when only the *offer* path had ever been tested, and the
+> install had never once worked. So: when something here says "verified", check **what** was verified,
+> and prefer running the thing over reading that it works. (Auto-update is still only half-fixed —
+> the manual check installs, the background check does not. See phase 40.)
+>
+> That's the seed. The phase history, build/screenshot commands and window classes, the
+> trust-manifest four-site lockstep rule, the release procedure and the full gotcha list are all in
+> `docs/HANDOVER.md`. Read there; don't expect it duplicated here.
