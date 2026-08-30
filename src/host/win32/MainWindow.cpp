@@ -91,6 +91,7 @@ struct AppState {
     int   tier = 1;  // 0=dev 1=experimental 2=stable 3=hardened (TIERED_RELEASES.md)
     int   target = 0;  // active build target (index into project.targets)
     std::wstring rootPath, curFilePath, curFileName, sncPath;
+    std::wstring savedText;   // editor text as of the last load/save — the saved point undo can return to
     std::wstring statusLeft = L"Ln 1, Col 1", statusMsg = L"Open a folder to start", pendingMsg;
     std::vector<std::wstring> nodePaths;
     std::vector<Diag> problems;
@@ -459,17 +460,26 @@ void applyBackColor(LONG a, LONG b, COLORREF color) {
     SendMessageW(g.hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
     SendMessageW(g.hEdit, EM_EXSETSEL, 0, (LPARAM)&save);
 }
-void highlight() {
-    if (g.highlighting || !g.hEdit) return;
-    g.highlighting = true;
-    suspendUndo();   // keep the re-colorize off the native undo stack
-    const Theme& th = currentTheme();
+// The editor's whole buffer, with line breaks left exactly as RichEdit stores them
+// (a lone CR). Shared by highlight() and by the saved-point snapshot, so both see the
+// same representation. saveFile() deliberately re-fetches with GT_USECRLF for the on-disk
+// form; that value is never compared against this one.
+std::wstring editorText() {
+    if (!g.hEdit) return {};
     GETTEXTLENGTHEX gtl{ GTL_NUMCHARS, 1200 };
     LONG n = (LONG)SendMessageW(g.hEdit, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
     std::wstring s; s.resize(n + 1);
     GETTEXTEX gt{}; gt.cb = (DWORD)((n + 1) * sizeof(wchar_t)); gt.flags = GT_DEFAULT; gt.codepage = 1200;
     LONG got = (LONG)SendMessageW(g.hEdit, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)s.data());
     s.resize(got < 0 ? 0 : got);
+    return s;
+}
+void highlight() {
+    if (g.highlighting || !g.hEdit) return;
+    g.highlighting = true;
+    suspendUndo();   // keep the re-colorize off the native undo stack
+    const Theme& th = currentTheme();
+    std::wstring s = editorText();
     CHARRANGE save; SendMessageW(g.hEdit, EM_EXGETSEL, 0, (LPARAM)&save);
     SendMessageW(g.hEdit, WM_SETREDRAW, FALSE, 0);
     applyColor(g.hEdit, 0, -1, th.textPrimary, true);
@@ -550,7 +560,11 @@ void refreshUndoButtons(HWND hwnd) {
 void onEditChanged(HWND hwnd) {
     if (g.highlighting || g.loadingFile) return;   // programmatic format/load, not a user edit
     highlight();
-    if (!g.dirty) { g.dirty = true; InvalidateRect(hwnd, &g.rTabs, FALSE); }
+    // Dirty is a comparison against the saved point, not a one-way latch: undoing back to
+    // the text we loaded/saved clears the dot and the Save prompt, as any editor should.
+    bool wasDirty = g.dirty;
+    g.dirty = editorText() != g.savedText;
+    if (g.dirty != wasDirty) { InvalidateRect(hwnd, &g.rTabs, FALSE); InvalidateRect(hwnd, &g.rSave, FALSE); }
     if (g.errorMarks) clearErrorMarks();
     if (g.lineNumbers) InvalidateRect(hwnd, &g.rGutter, FALSE);
     refreshUndoButtons(hwnd);   // edits/undo/redo all arrive here via EN_CHANGE
@@ -619,6 +633,7 @@ void loadFileIntoEditor(HWND hwnd, const std::wstring& path) {
     highlight();
     g.loadingFile = false;
     g.fileOpen = true; g.curFilePath = path; g.curFileName = baseName(path);
+    g.savedText = editorText();   // the point undo can return to
     g.dirty = false; g.errorMarks = false;
     g.tbCanUndo = false; g.tbCanRedo = false;   // SetWindowText cleared the undo buffer
     g.statusMsg = path;
@@ -664,6 +679,7 @@ bool saveFile(HWND hwnd) {
     LONG got = (LONG)SendMessageW(g.hEdit, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)s.data());
     s.resize(got < 0 ? 0 : got);
     if (!writeUtf8(g.curFilePath, s)) { g.statusMsg = L"Could not save " + g.curFileName; InvalidateRect(hwnd, &g.rStatus, FALSE); return false; }
+    g.savedText = editorText();   // the saved point moves to what we just wrote
     g.dirty = false;
     logMsg(LogLevel::Info, L"Saved: " + g.curFilePath);
     g.statusMsg = L"Saved " + g.curFileName;
@@ -1240,6 +1256,7 @@ void closeProject(HWND hwnd) {
     g.project = SentinelProject{};
     g.rootPath.clear(); g.curFilePath.clear(); g.curFileName.clear();
     g.nodePaths.clear();
+    g.savedText.clear();
     g.dirty = false; g.errorMarks = false; g.tbCanUndo = false; g.tbCanRedo = false; g.target = 0;
     g.signState = SignState::Unknown; g.signKey.clear(); g.signGrants.clear();
     TreeView_DeleteAllItems(g.hTree);

@@ -490,6 +490,16 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     correct prior state. (iv) The header static lacked **`SS_NOPREFIX`**, so a file called
     `notes & drafts.sentinel` was shown as `notes  drafts.sentinel` — the *same* `&`-as-mnemonic bug
     phase 24 hit in the ≡ menu. All four re-verified live.
+    **Follow-up landed later:** `g.dirty` was a one-way latch, so undo-to-original still showed `●`
+    and still prompted (phase 18's wart, which the guard made user-visible). It is now
+    `g.dirty = (editorText() != g.savedText)`, with `g.savedText` snapshotted in `loadFileIntoEditor`
+    and `saveFile`. Costs nothing measurable: `highlight()` already did the identical whole-buffer
+    `EM_GETTEXTEX` on every keystroke and then re-colorized the lot, so the compare is lost in the
+    noise — and `highlight()` now shares the same `editorText()` helper rather than duplicating it.
+    The comparison is deliberately in the control's own representation (`GT_DEFAULT`, lone CR);
+    `saveFile` re-fetches with `GT_USECRLF` for the on-disk form and the two are never compared.
+    Verified: a genuinely modified buffer still prompts; undo back to the loaded text does not; after
+    a save the saved point moves, so typing-then-undoing back to the *saved* text is clean too.
     (Harness note for next time: a cross-process `SendMessage(WM_COMMAND)` to one of these dialogs
     sets `done` but leaves its `GetMessageW` blocked — sent messages don't wake a queue wait. **Post**
     the message instead, or the dialog looks wedged when the code is fine.)
@@ -660,10 +670,11 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
   open project gains a file/tab instead. Also: drag-drop files onto the window; a shell "New ▸ Sentinel
   Project" entry. **Unblocked now** — both swap the open file, and phase 39 landed the dirty-guard
   they needed (`confirmSaveIfDirty`; route any new open through `openFile`, not `loadFileIntoEditor`).
-- **Unsaved-changes follow-ons** (guard shipped phase 39): RichEdit doesn't track a saved point, so
-  undoing back to the original text still leaves `●` set and will still prompt (phase 18's known
-  wart, now user-visible); and there is no "reload from disk" prompt when a file changes underneath
-  the editor.
+- **Unsaved-changes follow-ons** (guard shipped phase 39): ~~undo-to-original still leaves `●` set~~
+  **fixed** — `g.dirty` is now a comparison against `g.savedText` (a snapshot taken at load and at
+  save) rather than a one-way latch, so undoing back to the loaded *or* saved text clears the dot and
+  the prompt. Still open: there is no "reload from disk" prompt when a file changes underneath the
+  editor.
 - **Installer follow-ons** (installer shipped phase 28; ~~build-number pickup~~ + ~~real `AppUrl`~~
   done phase 33; ~~non-reproducible build number~~ done phase 34 — now `git rev-list --count HEAD`
   + `BUILDBASE`, so a released `Sentinel-IDE-0.1.0.<n>-setup.exe` can be rebuilt from its tag).
