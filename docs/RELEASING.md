@@ -235,6 +235,25 @@ treat that as a safety net, never as the plan.
 Installed builds pick it up via **≡ ▸ Check for Updates…**, the **Check for Updates…** button in
 the **About box** (next to the version it reports), or WinSparkle's periodic background check.
 
+> **A green feed is NOT proof the update installs.** Steps 1-7 verify the *offer* path only, and that
+> is all anyone verified for v0.1.0-v0.1.4 - every one of which offered updates that then installed
+> nothing (see HANDOVER phase 40). The install step is separate, and was broken the whole time.
+>
+> To verify an actual install, build a throwaway client stamped **below** the feed's version
+> (temporarily lower `MKT`/`MKTRC` in `build.bat` - do **not** commit that), install it from **local
+> disk**, clear `%TEMP%\Update-*`, then Check for Updates and confirm the installed `FileVersion`
+> actually changes. Watch `%LOCALAPPDATA%\SentinelIDE\logs\sentinelide.log`: the updater now logs
+> `update found` -> `payload ready - [path] exists=yes size=N` -> `install scope = ...` ->
+> `installer launched`. A `payload ready - []  exists=NO` line means WinSparkle handed over nothing
+> and the update will not install.
+>
+> Two traps worth knowing when testing:
+> - **`G:` is a network share and refuses to execute.** Running an installer straight out of
+>   `build\installer\` fails with *"Access is denied"*. Copy it to local disk first - that is a
+>   property of the share, not a defect in the build.
+> - The download lands in **`%TEMP%\Update-<guid>\`**, not a `{GUID}` directory. Watching the wrong
+>   pattern makes a working download look like no download at all.
+
 ---
 
 ## How it behaves in the app
