@@ -19,8 +19,8 @@ REM BUILDBASE keeps the sequence above the retired counter's high-water mark (38
 REM the version never goes backwards across the switch. Nothing had been released when
 REM this changed, so the offset is cosmetic continuity, not a correctness requirement —
 REM but a version that regresses is exactly the bug WinSparkle cannot recover from.
-set "MKT=0.1.3"
-set "MKTRC=0,1,3"
+set "MKT=0.1.4"
+set "MKTRC=0,1,4"
 set "BUILDBASE=100"
 set "BUILDNO="
 for /f %%i in ('git -C "%~dp0.." rev-list --count HEAD 2^>nul') do set "BUILDNO=%%i"
@@ -80,6 +80,12 @@ if exist "%SNCREL%" (
   echo SENTINEL_PARSERS_FALLBACK - snc not found, using C++ parsers
 )
 
-"%CMAKE%" -S "%~dp0.." -B "%~dp0..\build" -G Ninja -DCMAKE_MAKE_PROGRAM="%NINJA%" -DCMAKE_BUILD_TYPE=Debug || exit /b 1
+REM Release + STATIC CRT. Both halves matter, and the old Debug default was a shipping bug:
+REM a /MDd binary imports MSVCP140D.dll / VCRUNTIME140D.dll / ucrtbased.dll, which ship only
+REM with Visual Studio and are NOT licensed for redistribution — so every installer through
+REM v0.1.3 failed to launch on any machine without VS ("VCRUNTIME140D.dll was not found").
+REM MultiThreaded (/MT) links the CRT in, so the per-user installer needs no redistributable
+REM and no admin rights. Verified: parsers.lib links under /MT, and the exe went 2.65 -> 0.78 MB.
+"%CMAKE%" -S "%~dp0.." -B "%~dp0..\build" -G Ninja -DCMAKE_MAKE_PROGRAM="%NINJA%" -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
 "%CMAKE%" --build "%~dp0..\build" || exit /b 1
 echo BUILD_OK
