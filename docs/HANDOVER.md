@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–44 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–45 built and verified.
 
 ---
 
@@ -178,7 +178,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–44 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–45 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -681,6 +681,24 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     **7 tests**. Live: Project Settings ▸ Save over `examples/sentinel.toml` kept all 16 comments and
     lost no line, growing exactly 45 bytes — the 45 LF→CRLF conversions the writer has always done.
 
+45. **Post-build signing verifies before it claims success (RD-06).** On a successful build with
+    `signing.sign = true`, the IDE ran `snc sign` and printed a green `[signed · <name>.sig]` **off
+    the signer's exit code alone** — `verifyFile` was never called on that path. So any way for `snc
+    sign` to exit 0 without leaving a usable signature produced a green line asserting the one thing
+    the feature exists to assert. The UX spec had forbidden exactly this, in as many words
+    ("never on the signer's exit code alone"), and the code did it anyway; the mismatch only surfaced
+    when phase 43 reconciled the spines against the shipped product.
+    Now a successful `snc sign` is followed by `verifyFile` — **the same function the trust chip
+    uses**, so the Output line and the chip can no longer disagree about what "signed" means. Verified
+    it prints `[signed · <name>.sig · verified]`; not verified prints a red *"sign reported success
+    but the signature does NOT verify — treat as UNSIGNED"* and logs at Error. A non-zero `snc sign`
+    still reports `[sign failed · exit N]` as before.
+    **Verified live** on a project with `sign = true` and a real `snc keygen` key: the build produced
+    `signdemo.exe.sig` and the Output pane showed the green `· verified` form, with the log line
+    changing from the old "(exit 0)" to "signature verified". The red branch's predicate was checked
+    separately — `snc verify` against a one-byte-flipped `.sig` exits non-zero, which is what makes
+    `verifyFile` return `Invalid`.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -791,12 +809,10 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Still stale, deliberately out of scope:** the three `mockups/*.html` still render the
   Authenticode signing UI, and the brief/addendum's exposed-surface map.
 
-⚠ **Two live code defects this reconciliation surfaced** (docs now describe reality; the code is
-unfixed):
-- **Post-build signing can report success when it failed.** On a successful build with
-  `signing.sign = true`, `MainWindow.cpp` prints `[signed · <name>.sig]` off `snc sign`'s **exit
-  code alone** — `verifyFile` is never called on that path. The spec explicitly forbade this
-  ("never on the signer's exit code alone"). RD-06.
+⚠ **Two live code defects this reconciliation surfaced.** One is fixed, one is not:
+- ~~**Post-build signing can report success when it failed.**~~ **FIXED in phase 45.** It printed
+  `[signed · <name>.sig]` off `snc sign`'s **exit code alone**, with `verifyFile` never called —
+  the exact thing the spec forbade ("never on the signer's exit code alone"). RD-06.
 - **The trust chip does not recompute on edit.** `refreshSignState`'s only call sites are
   `loadFileIntoEditor`, `saveFile`, `openSigning` and Settings-OK; `onEditChanged` never touches
   it, so a signed file being edited keeps showing `✓ Signed` until saved. The `// edits invalidate
@@ -905,7 +921,7 @@ read the handover belongs in the handover body, not here._
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
-> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–44, Environment gotchas,
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–45, Environment gotchas,
 > the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not

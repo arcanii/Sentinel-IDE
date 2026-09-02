@@ -1680,10 +1680,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 outAppend(L"  (signing: artifact not found: " + art + L")", th.diagWarning);
             else {
                 std::wstring so; DWORD sc = runCapture(L"\"" + g.sncPath + L"\" sign \"" + art + L"\" --key \"" + key + L"\"", g.project.dir, so);
-                outAppend(sc == 0 ? (L"[signed · " + baseName(art) + L".sig]") : (L"[sign failed · exit " + std::to_wstring((int)sc) + L"]"),
-                          sc == 0 ? th.trustVerified : th.diagError);
-                std::wstring t2 = projTrim(so); if (!t2.empty()) outAppend(L"  " + t2, th.textMuted);
-                logMsg(sc == 0 ? LogLevel::Info : LogLevel::Warn, L"snc sign artifact " + baseName(art) + L" (exit " + std::to_wstring((int)sc) + L")");
+                std::wstring t2 = projTrim(so);
+                if (sc != 0) {
+                    outAppend(L"[sign failed · exit " + std::to_wstring((int)sc) + L"]", th.diagError);
+                    if (!t2.empty()) outAppend(L"  " + t2, th.textMuted);
+                    logMsg(LogLevel::Warn, L"snc sign artifact " + baseName(art) + L" failed (exit " + std::to_wstring((int)sc) + L")");
+                } else {
+                    // Re-VERIFY before claiming it. Reporting "signed" on the signer's exit code
+                    // alone means a green line whenever snc exits 0 without producing a usable
+                    // signature — a false claim about the one thing this feature exists to assert.
+                    // The UX spec forbade it in as many words ("never on the signer's exit code
+                    // alone") and the code did it anyway; found by reconciling the spines against
+                    // the shipped product (RD-06). Same verifyFile the trust chip uses, so the
+                    // Output line and the chip can no longer disagree about what "signed" means.
+                    const VerifyResult vr = verifyFile(g.sncPath, art);
+                    if (vr.state == SignState::Signed) {
+                        outAppend(L"[signed · " + baseName(art) + L".sig · verified]", th.trustVerified);
+                        if (!t2.empty()) outAppend(L"  " + t2, th.textMuted);
+                        logMsg(LogLevel::Info, L"snc sign artifact " + baseName(art) + L" — signature verified");
+                    } else {
+                        // snc sign said OK; the signature does not check out. Never green.
+                        outAppend(L"[sign reported success but the signature does NOT verify — treat as UNSIGNED]", th.diagError);
+                        if (!t2.empty()) outAppend(L"  " + t2, th.textMuted);
+                        if (!vr.message.empty()) outAppend(L"  " + vr.message, th.textMuted);
+                        logMsg(LogLevel::Error, L"snc sign exited 0 for " + baseName(art) +
+                               L" but verifyFile returned " + (vr.state == SignState::Unsigned ? L"Unsigned" : L"Invalid"));
+                    }
+                }
             }
         }
         logMsg(code == 0 ? LogLevel::Info : LogLevel::Warn, L"Build finished — exit " + std::to_wstring((int)code));
