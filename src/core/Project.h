@@ -252,6 +252,98 @@ inline bool writeUtf8(const std::wstring& path, const std::wstring& text) {
     return ok && wrote == bytes.size();
 }
 
+// Encode the managed values for the Sentinel writer (save_manifest in parsers.sentinel).
+// Fixed order, every value already RENDERED as TOML text by tomlStr/tomlArr so quoting and
+// array formatting stay here rather than being reimplemented in Sentinel:
+//   0 name, 1 version, 2 type, 3 entry      -> section "project"
+//   4 src, 5 lib_paths, 6 links, 7 tier     -> section "build"
+//   8 require, 9 trust, 10 sign             -> section "signing"
+//   then an 8-byte LE target count, then per target: name, entry, type, links
+// Each value is an 8-byte little-endian length followed by that many UTF-8 bytes.
+//
+// Deliberately defined OUTSIDE the SENTINELIDE_SENTINEL guard so tests/saveproject_xcheck.cpp
+// builds the model with the exact bytes the host does. Two encoders that must agree is a
+// silent-divergence trap; one is not.
+inline std::string encodeSaveModel(const SentinelProject& p) {
+    std::string m;
+    auto u8 = [](const std::wstring& w) {
+        if (w.empty()) return std::string();
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+        std::string s((size_t)n, 0);
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+        return s;
+    };
+    auto put8 = [&](uint64_t v) { for (int i = 0; i < 8; i++) m.push_back((char)(uint8_t)((v >> (8 * i)) & 0xFF)); };
+    auto put  = [&](const std::wstring& w) { const std::string b = u8(w); put8(b.size()); m += b; };
+
+    put(tomlStr(p.name));
+    put(tomlStr(p.version));
+    put(tomlStr(typeName(p.type)));
+    put(tomlStr(p.entry));
+    put(tomlStr(p.srcDir));
+    put(tomlArr(p.libPaths));
+    put(tomlArr(p.links));
+    put(tomlStr(tierDir(p.defaultTier)));
+    put(tomlStr(p.signRequire));
+    put(tomlStr(p.trust));
+    put(p.signOutput ? L"true" : L"false");
+    put8(p.targets.size());
+    for (const auto& t : p.targets) {
+        put(tomlStr(t.name));
+        put(tomlStr(t.entry));
+        put(tomlStr(typeName(t.type)));
+        put(tomlArr(t.links));
+    }
+    return m;
+}
+
+#ifdef SENTINELIDE_SENTINEL
+// The manifest WRITER is Sentinel now — save_manifest in parsers.sentinel. With it, every
+// file-touching path in the IDE runs in Sentinel: four readers (phases 35-38) and now the
+// writer. Held byte-identical to the C++ #else fallback by tests/saveproject_xcheck.cpp
+// (27 cases); the fallback's own behaviour is pinned by tests/saveproject_test.cpp.
+//
+// Same split as every other port: Sentinel interprets and produces the bytes, the host does
+// file I/O. TOML rendering (tomlStr/tomlArr) also stays here, so quoting rules are not
+// reimplemented in a second language — encodeSaveModel ships values already rendered.
+//
+// Raw byte I/O on purpose, NOT readUtf8/writeUtf8: those round-trip through UTF-16, and
+// MultiByteToWideChar without MB_ERR_INVALID_CHARS rewrites any invalid UTF-8 to U+FFFD.
+// save_manifest is byte-transparent, so reading raw preserves a Latin-1 comment or an
+// unmodeled value that the C++ path silently corrupts. That is the one deliberate
+// divergence from the oracle, documented in the header of parsers.sentinel.
+inline bool saveProject(const SentinelProject& p) {
+    const std::wstring manifestPath = p.dir + L"\\" + (p.manifest.empty() ? L"sentinel.toml" : p.manifest);
+
+    std::string before;
+    HANDLE rf = CreateFileW(manifestPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (rf != INVALID_HANDLE_VALUE) {
+        DWORD n = GetFileSize(rf, nullptr), got = 0;
+        before.resize(n);
+        ReadFile(rf, before.data(), n, &got, nullptr);
+        before.resize(got);
+        CloseHandle(rf);
+    }
+
+    const std::string model = encodeSaveModel(p);
+    uint8_t* out = nullptr; int64_t olen = 0;
+    save_manifest((const uint8_t*)before.data(), (int64_t)before.size(),
+                  (const uint8_t*)model.data(), (int64_t)model.size(), &out, &olen);
+    if (!out) return false;
+
+    HANDLE wf = CreateFileW(manifestPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    bool ok = false;
+    if (wf != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        ok = WriteFile(wf, out, (DWORD)olen, &wrote, nullptr) != 0 && wrote == (DWORD)olen;
+        CloseHandle(wf);
+    }
+    sentinel_free_bytes(out);
+    return ok;
+}
+#else
 inline bool saveProject(const SentinelProject& p) {
     const std::wstring manifestPath = p.dir + L"\\" + (p.manifest.empty() ? L"sentinel.toml" : p.manifest);
     struct KV { std::wstring section, key, value; bool written = false; };
@@ -346,5 +438,6 @@ inline bool saveProject(const SentinelProject& p) {
     while (out.size() >= 4 && out.substr(out.size() - 4) == L"\r\n\r\n") out.erase(out.size() - 2);
     return writeUtf8(manifestPath, out);
 }
+#endif
 
 }  // namespace sentinelide

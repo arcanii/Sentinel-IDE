@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // parsers.sentinel — Sentinel-IDE's runtime PRODUCT logic, written in Sentinel and
-// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Four
-// exports, all "interpret untrusted bytes" jobs the host used to do in C++:
+// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Five
+// exports the host used to do in C++ — four "interpret untrusted bytes" readers and
+// the one writer that closes the loop:
 //
 //   parse_diag(line)     — one line of snc build output -> a diagnostic (file:line:col)
 //   parse_trust(text)    — the consumer trust manifest -> the trusted [[keys]]
 //   parse_sig(text)      — a detached-signature (.sig) carrier -> algorithm/key/grants
 //   parse_manifest(text) — a project manifest -> the [project]/[build]/[signing] fields
 //                          and the [[target]] blocks
+//   save_manifest(text, model)
+//                        — the old manifest + the managed values -> the new manifest
+//                          text, rewritten surgically (the host does the file write)
 //
 // Kept as ONE lib on purpose: each Sentinel lib bundles the whole runtime, so linking
 // several would collide on sentinel_free_bytes / the allocator. One lib = one runtime,
@@ -16,8 +20,16 @@
 // All use the owned `-> [u8]` return ABI (not `&mut [u8]`), sidestepping the
 // header-emits-&mut-as-const defect (Sentinel-lang R3). Each export's record format is
 // documented above it. The C++ fallbacks (MainWindow.cpp::parseDiag, Signing.h::
-// loadTrust/readSig, Project.h::loadProject) stay byte-identical, each guarded by a
-// tests/*_xcheck.cpp cross-check.
+// loadTrust/readSig, Project.h::loadProject/saveProject) stay byte-identical, each
+// guarded by a tests/ cross-check.
+//
+// ONE DELIBERATE DIVERGENCE, in save_manifest only: it is BYTE-TRANSPARENT, while the C++
+// saveProject round-trips the file through UTF-16 (readUtf8 calls MultiByteToWideChar
+// without MB_ERR_INVALID_CHARS), so the C++ rewrites every invalid UTF-8 byte to U+FFFD
+// and this does not. It surfaces only on bytes inside a line the writer does not rewrite
+// — a Latin-1 comment, an unmodeled value. Sentinel's behaviour is the better one, so it
+// is kept rather than bug-compatibly broken; the cross-check feeds valid UTF-8, where the
+// two agree exactly.
 
 // ---- shared helpers ---------------------------------------------------------
 
@@ -714,4 +726,547 @@ export "C" fn parse_manifest(text: &[u8]) -> [u8] {
     emit_array(&mut out, text, n, &s_build, &k_links);
     emit_targets(&mut out, text, n);
     vec_to_array(out)
+}
+
+// ---- project manifest WRITER ------------------------------------------------
+//
+// A faithful port of Project.h::saveProject — the last file-touching path that was
+// still C++. Pure bytes in, bytes out: `text` is the manifest as it stands on disk
+// (empty if there is none) and `model` is the managed values ALREADY rendered as
+// TOML value text by the host, so quoting and array formatting stay exactly where
+// tomlStr/tomlArr put them. The return is the COMPLETE new manifest; the host
+// writes it. Sentinel does no file I/O here, same as the four readers above.
+//
+// The writer is surgical on purpose: it rewrites only the VALUES of the keys the
+// IDE manages and leaves everything else — comments, blank lines, the file's own
+// key alignment, unmodeled keys like `icon`/`authors` — byte for byte as it found
+// them. (TOML forbids duplicate section headers, so a missing managed key is
+// inserted INSIDE its existing section rather than appended as a second block.)
+//
+// `model` encoding, fixed order, host-produced. Every value is an 8-byte
+// little-endian length followed by that many bytes — the same length-prefix idiom
+// push_lenpref writes on the read side. Values arrive fully rendered, e.g. the six
+// bytes `"demo"` INCLUDING its quotes, or `[]`:
+//     0 name    1 version    2 type   3 entry          -> section [project]
+//     4 src     5 lib_paths  6 links  7 default_tier   -> section [build]
+//     8 require 9 trust     10 sign                    -> section [signing]
+//   then an 8-byte LE target count, then per target: name, entry, type, links.
+//
+// The algorithm, mirroring saveProject step for step:
+//   1. Split on '\n'; a trailing '\r' is dropped. The final segment is a line only
+//      if it is non-empty — and it KEEPS its '\r' (the C++ pops the CR only in the
+//      '\n' branch), so a CR-terminated last line round-trips unchanged.
+//   2. A line whose TRIMMED form starts with '[' opens a section named by the
+//      trimmed text between '[' and the FIRST ']', lowercased. "[[target]]" therefore
+//      names the section "[target" — the leading bracket is retained. That is
+//      load-bearing, not a bug to fix: the target pass keys off exactly that name.
+//   3. Rewrite pass: in a managed section, a line that is not blank/comment/header
+//      is split at its FIRST '='; the key (trimmed) is matched against the first
+//      not-yet-written managed entry of that section, and the line becomes
+//      line[0..eq] + "= " + value — everything up to and including the '=' survives,
+//      and the file's alignment survives with it. Only the FIRST match wins (the
+//      C++ breaks out of the loop), so a duplicate key line later is left untouched.
+//      ASYMMETRY, preserved deliberately: section names compare CASE-INSENSITIVELY
+//      (the C++ lowercases them), key names CASE-SENSITIVELY. `Name` is not `name`.
+//   4. Any managed entry still unwritten is appended at the END of its section's
+//      lines — after that section's trailing blank lines, as in the C++ — in the
+//      order project, build, signing. A section that does not exist at all is
+//      appended at the very end as a blank line, then "[<section>]", then its keys.
+//   5. [[target]] blocks are matched to the model's targets BY ORDER; only EXISTING
+//      name/entry/type/links lines are rewritten, NEVER inserted, so per-target
+//      comments and unmodeled keys survive. The index advances for every "[target"
+//      section, including ones past the end of the model's list (emitted untouched).
+//   6. Every line is emitted with CRLF; then, while the output is at least 4 bytes
+//      and ends with two CRLFs, the last 2 bytes are dropped — collapsing trailing
+//      blank lines to a single newline.
+//
+// SHAPE NOTES — why this does not look like the C++. Sentinel has no Vec<[u8]>, so
+// there is no vector-of-lines to build and mutate; everything works on OFFSETS into
+// `text` and appends to one Vec<u8>. Insertion has to know the FINAL set of written
+// entries before the first line is emitted, so the line walk runs three times —
+// rewrite_mask (which entries get consumed), sect_last_line (where a section's last
+// line is), then the emit — which is the same "re-walk per question" shape
+// emit_scalar/emit_array already use. The `written` flags are an 11-bit mask packed
+// into an i64, there being no mutable bool array.
+//
+// Section ids used throughout: 1 = project, 2 = build, 3 = signing, 4 = "[target",
+// 0 = anything else, including the preamble before the first header (which the C++
+// models as a section whose name is "" and which no managed key can ever match).
+
+// Read 8 little-endian bytes at `off` as an i64 (the inverse of push_le8). Built from
+// the TOP byte down, which keeps the accumulator small for well-formed input but does
+// NOT make overflow impossible: a length whose top byte is >= 0x80 still overflows i64
+// and comes out negative. That is caught by the `off >= 0` half of the guard below, not
+// by the accumulation order — do not read this as an overflow proof.
+//
+// The bound is written `off <= len - 8`, never `off + 8 <= len`: the addition form
+// WRAPS. An `off` in [0x7FFFFFFFFFFFFFF0, 0x7FFFFFFFFFFFFFF7] makes `off + 8` negative,
+// so the comparison passes while `off >= 0` also passes, and the index below runs at
+// i64::MAX — which is not a wrong answer but a dead process, since a bounds violation
+// inside a Sentinel export terminates immediately and __try/__except cannot recover it
+// (R2). Measured: the addition form aborted with 0xC0000409 on exactly that window.
+// Unreachable from a manifest — every prefix here is a host-computed byte count — so
+// this is defence in depth against a future host-encoder bug.
+fn rd_le8(m: &[u8], off: i64) -> i64 {
+    let mut v: i64 = 0;
+    if off >= 0 && off <= len(*m) - 8 {
+        let mut i: i64 = 7;
+        while i >= 0 {
+            v = v * 256 + ((*m)[off + i] as i64);
+            i = i - 1;
+        }
+        0
+    } else { 0 };
+    v
+}
+
+// Offset just past the length-prefixed value that starts at `off`.
+fn skip_str(m: &[u8], off: i64) -> i64 {
+    off + 8 + rd_le8(m, off)
+}
+
+// Offset of the n'th length-prefixed value counting from `base`.
+fn skip_n(m: &[u8], base: i64, n: i64) -> i64 {
+    let mut o: i64 = base;
+    let mut i: i64 = 0;
+    while i < n {
+        o = skip_str(m, o);
+        i = i + 1;
+    }
+    o
+}
+
+// Append the bytes of the length-prefixed value at `off` (the prefix itself is not
+// emitted — the value is already rendered TOML text).
+fn push_val(out: &mut Vec<u8>, m: &[u8], off: i64) -> i64 {
+    let mn: i64 = len(*m);
+    let vl: i64 = rd_le8(m, off);
+    let mut i: i64 = 0;
+    while i < vl && off + 8 + i < mn {
+        push(out, (*m)[off + 8 + i]);
+        i = i + 1;
+    }
+    0
+}
+
+// Append text[a..b) verbatim (push_lenpref without the length prefix).
+fn push_bytes(out: &mut Vec<u8>, text: &[u8], a: i64, b: i64) -> i64 {
+    let mut i: i64 = a;
+    while i < b {
+        push(out, (*text)[i]);
+        i = i + 1;
+    }
+    0
+}
+
+// Append a literal. By-value `[u8]`, so a call site can hand it a fresh string
+// literal directly — `&"lit"` is illegal (no borrowing a temporary), and nothing
+// here reuses one literal across an enclosing loop, which is what would move it.
+fn push_lit(out: &mut Vec<u8>, lit: [u8]) -> i64 {
+    let ll: i64 = len(lit);
+    let mut i: i64 = 0;
+    while i < ll {
+        push(out, lit[i]);
+        i = i + 1;
+    }
+    0
+}
+
+// The `written` flags of saveProject's KV table, as bits of an i64: Sentinel has no
+// mutable bool array, and 11 entries fit comfortably in one integer.
+fn pow2(e: i64) -> i64 {
+    let mut p: i64 = 1;
+    let mut i: i64 = 0;
+    while i < e {
+        p = p * 2;
+        i = i + 1;
+    }
+    p
+}
+fn bit_get(mask: i64, e: i64) -> bool {
+    let q: i64 = mask / pow2(e);
+    (q - (q / 2) * 2) == 1          // no `%` operator — q mod 2
+}
+fn bit_set(mask: i64, e: i64) -> i64 {
+    if bit_get(mask, e) { mask } else { mask + pow2(e) }
+}
+
+// Section id of the header line trimmed to [ts,te) (its first byte is '['). The name
+// is the trimmed text between '[' and the FIRST ']', compared case-insensitively
+// (the C++ projLower's it). No ']' at all -> the C++ name is "", i.e. id 0. Note
+// "[target": sect_eq above REJECTS a double bracket, this one must not — the
+// writer's whole [[target]] pass keys off that bracket-retaining name.
+fn sec_id(text: &[u8], ts: i64, te: i64) -> i64 {
+    let mut id: i64 = 0;
+    let mut re: i64 = ts;
+    let mut hasr: bool = false;
+    while re < te && hasr == false {
+        if (*text)[re] == ']' { hasr = true; 0 } else { re = re + 1; 0 };
+    }
+    if hasr {
+        let mut ia: i64 = ts + 1;
+        while ia < re && is_ws((*text)[ia]) { ia = ia + 1; }
+        let mut ib: i64 = re;
+        while ib > ia && is_ws((*text)[ib - 1]) { ib = ib - 1; }
+        let s_p: [u8] = "project";
+        let s_b: [u8] = "build";
+        let s_g: [u8] = "signing";
+        let s_t: [u8] = "[target";
+        if lit_ieq(text, ia, ib, &s_p) { id = 1; 0 } else { 0 };
+        if lit_ieq(text, ia, ib, &s_b) { id = 2; 0 } else { 0 };
+        if lit_ieq(text, ia, ib, &s_g) { id = 3; 0 } else { 0 };
+        if lit_ieq(text, ia, ib, &s_t) { id = 4; 0 } else { 0 };
+        0
+    } else { 0 };
+    id
+}
+
+// Which section managed entry `e` belongs to (the KV table's fixed layout).
+fn ent_sec(e: i64) -> i64 {
+    if e < 4 { 1 } else { if e < 8 { 2 } else { 3 } }
+}
+
+// Is text[a..b) entry `e`'s key? CASE-SENSITIVE, like the C++ `e.key == key` and
+// unlike the section test above — `Name` is not the managed `name`.
+fn ent_key_eq(e: i64, text: &[u8], a: i64, b: i64) -> bool {
+    let mut ok: bool = false;
+    if e == 0  { ok = lit_eq(text, a, b, "name"); 0 } else { 0 };
+    if e == 1  { ok = lit_eq(text, a, b, "version"); 0 } else { 0 };
+    if e == 2  { ok = lit_eq(text, a, b, "type"); 0 } else { 0 };
+    if e == 3  { ok = lit_eq(text, a, b, "entry"); 0 } else { 0 };
+    if e == 4  { ok = lit_eq(text, a, b, "src"); 0 } else { 0 };
+    if e == 5  { ok = lit_eq(text, a, b, "lib_paths"); 0 } else { 0 };
+    if e == 6  { ok = lit_eq(text, a, b, "links"); 0 } else { 0 };
+    if e == 7  { ok = lit_eq(text, a, b, "default_tier"); 0 } else { 0 };
+    if e == 8  { ok = lit_eq(text, a, b, "require"); 0 } else { 0 };
+    if e == 9  { ok = lit_eq(text, a, b, "trust"); 0 } else { 0 };
+    if e == 10 { ok = lit_eq(text, a, b, "sign"); 0 } else { 0 };
+    ok
+}
+
+fn push_ent_key(out: &mut Vec<u8>, e: i64) -> i64 {
+    if e == 0  { push_lit(out, "name"); 0 } else { 0 };
+    if e == 1  { push_lit(out, "version"); 0 } else { 0 };
+    if e == 2  { push_lit(out, "type"); 0 } else { 0 };
+    if e == 3  { push_lit(out, "entry"); 0 } else { 0 };
+    if e == 4  { push_lit(out, "src"); 0 } else { 0 };
+    if e == 5  { push_lit(out, "lib_paths"); 0 } else { 0 };
+    if e == 6  { push_lit(out, "links"); 0 } else { 0 };
+    if e == 7  { push_lit(out, "default_tier"); 0 } else { 0 };
+    if e == 8  { push_lit(out, "require"); 0 } else { 0 };
+    if e == 9  { push_lit(out, "trust"); 0 } else { 0 };
+    if e == 10 { push_lit(out, "sign"); 0 } else { 0 };
+    0
+}
+
+fn push_sec_name(out: &mut Vec<u8>, sid: i64) -> i64 {
+    if sid == 1 { push_lit(out, "project"); 0 } else { 0 };
+    if sid == 2 { push_lit(out, "build"); 0 } else { 0 };
+    if sid == 3 { push_lit(out, "signing"); 0 } else { 0 };
+    0
+}
+
+// The first not-yet-written managed entry in section `sid` whose key is text[a..b),
+// or -1. "First wins" is the C++ `break`: a second line with the same key is left
+// alone, because by then the entry is already marked written.
+fn find_entry(mask: i64, sid: i64, text: &[u8], a: i64, b: i64) -> i64 {
+    let mut hit: i64 = 0 - 1;
+    let mut e: i64 = 0;
+    while e < 11 && hit < 0 {
+        if bit_get(mask, e) == false && ent_sec(e) == sid && ent_key_eq(e, text, a, b) {
+            hit = e; 0
+        } else { 0 };
+        e = e + 1;
+    }
+    hit
+}
+
+// The per-target field index for key text[a..b): 0 name, 1 entry, 2 type, 3 links,
+// -1 for anything else (which the C++ `continue`s past, leaving the line alone).
+fn tgt_field(text: &[u8], a: i64, b: i64) -> i64 {
+    let mut f: i64 = 0 - 1;
+    if lit_eq(text, a, b, "name")  { f = 0; 0 } else { 0 };
+    if lit_eq(text, a, b, "entry") { f = 1; 0 } else { 0 };
+    if lit_eq(text, a, b, "type")  { f = 2; 0 } else { 0 };
+    if lit_eq(text, a, b, "links") { f = 3; 0 } else { 0 };
+    f
+}
+
+// Walk 1: replay the rewrite pass for its FLAGS only. The emit pass has to know
+// which managed entries an existing line will consume before it writes its first
+// byte, because insertion happens mid-file (at the end of a section) and must skip
+// whatever the rewrite already handled.
+fn rewrite_mask(text: &[u8], n: i64) -> i64 {
+    let mut mask: i64 = 0;
+    let mut sid: i64 = 0;
+    let mut ls: i64 = 0;
+    let mut i: i64 = 0;
+    while i <= n {
+        if i == n || (*text)[i] == '\n' {
+            let la: i64 = ls;
+            let mut lb: i64 = i;
+            let mut isline: bool = true;
+            if i == n {
+                isline = lb > la;      // trailing segment: a line only if non-empty
+                0
+            } else {
+                if lb > la && (*text)[lb - 1] == '\r' { lb = lb - 1; 0 } else { 0 };
+                0
+            };
+            if isline {
+                let mut ts: i64 = la;
+                while ts < lb && is_ws((*text)[ts]) { ts = ts + 1; }
+                let mut te: i64 = lb;
+                while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+                if ts < te && (*text)[ts] == '[' {
+                    sid = sec_id(text, ts, te); 0
+                } else {
+                    if ts < te && (*text)[ts] != '#' && sid >= 1 && sid <= 3 {
+                        let mut eq: i64 = la;
+                        let mut haseq: bool = false;
+                        while eq < lb && haseq == false {
+                            if (*text)[eq] == '=' { haseq = true; 0 } else { eq = eq + 1; 0 };
+                        }
+                        if haseq {
+                            let mut ka: i64 = la;
+                            while ka < eq && is_ws((*text)[ka]) { ka = ka + 1; }
+                            let mut kb: i64 = eq;
+                            while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                            let me: i64 = find_entry(mask, sid, text, ka, kb);
+                            if me >= 0 { mask = bit_set(mask, me); 0 } else { 0 };
+                            0
+                        } else { 0 };
+                        0
+                    } else { 0 };
+                    0
+                };
+                0
+            } else { 0 };
+            ls = i + 1;
+            0
+        } else { 0 };
+        i = i + 1;
+    }
+    mask
+}
+
+// Walk 2: the index of the LAST line of the FIRST section with id `want`, or -1 if
+// there is none. That is where saveProject inserts missing keys (it appends to the
+// section's line vector, hence after any trailing blank lines the section owns);
+// -1 doubles as the "no such section — append a fresh one at the end" signal.
+fn sect_last_line(text: &[u8], n: i64, want: i64) -> i64 {
+    let mut seen: bool = false;
+    let mut active: bool = false;
+    let mut last: i64 = 0 - 1;
+    let mut li: i64 = 0;
+    let mut ls: i64 = 0;
+    let mut i: i64 = 0;
+    while i <= n {
+        if i == n || (*text)[i] == '\n' {
+            let la: i64 = ls;
+            let mut lb: i64 = i;
+            let mut isline: bool = true;
+            if i == n {
+                isline = lb > la;
+                0
+            } else {
+                if lb > la && (*text)[lb - 1] == '\r' { lb = lb - 1; 0 } else { 0 };
+                0
+            };
+            if isline {
+                let mut ts: i64 = la;
+                while ts < lb && is_ws((*text)[ts]) { ts = ts + 1; }
+                let mut te: i64 = lb;
+                while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+                if ts < te && (*text)[ts] == '[' {
+                    let hid: i64 = sec_id(text, ts, te);
+                    if hid == want && seen == false {
+                        seen = true; active = true; 0
+                    } else { active = false; 0 };
+                    0
+                } else { 0 };
+                // The header is lines[0] of its own section, so it counts too: a
+                // section that is nothing but its header still takes the insert.
+                if active { last = li; 0 } else { 0 };
+                li = li + 1;
+                0
+            } else { 0 };
+            ls = i + 1;
+            0
+        } else { 0 };
+        i = i + 1;
+    }
+    last
+}
+
+// Does section `sid` still owe any managed key? (The C++ skips an empty `missing`
+// list, which only matters for the "create the section" branch.)
+fn sect_missing_any(mask: i64, sid: i64) -> bool {
+    let mut any: bool = false;
+    let mut e: i64 = 0;
+    while e < 11 {
+        if bit_get(mask, e) == false && ent_sec(e) == sid { any = true; 0 } else { 0 };
+        e = e + 1;
+    }
+    any
+}
+
+// Append `key = value` lines for every entry of `sid` the rewrite pass did not
+// consume, in the KV table's fixed order.
+fn emit_missing(out: &mut Vec<u8>, m: &[u8], mask: i64, sid: i64) -> i64 {
+    let mut e: i64 = 0;
+    while e < 11 {
+        if bit_get(mask, e) == false && ent_sec(e) == sid {
+            push_ent_key(out, e);
+            push_lit(out, " = ");
+            push_val(out, m, skip_n(m, 0, e));
+            push_lit(out, "\r\n");
+            0
+        } else { 0 };
+        e = e + 1;
+    }
+    0
+}
+
+// A section the manifest never declared: blank line, header, then its keys — the
+// C++ pushes Section{ sname, { "", "[sname]" } } and appends the missing keys to it.
+fn append_section(out: &mut Vec<u8>, m: &[u8], mask: i64, sid: i64) -> i64 {
+    if sect_missing_any(mask, sid) {
+        push_lit(out, "\r\n");
+        push_lit(out, "[");
+        push_sec_name(out, sid);
+        push_lit(out, "]");
+        push_lit(out, "\r\n");
+        emit_missing(out, m, mask, sid);
+        0
+    } else { 0 };
+    0
+}
+
+export "C" fn save_manifest(text: &[u8], model: &[u8]) -> [u8] {
+    let n: i64 = len(*text);
+
+    // Model layout: 11 scalars, then the target count, then 4 values per target.
+    let tbase: i64 = skip_n(model, 0, 11);
+    let tcount: i64 = rd_le8(model, tbase);
+    let tfirst: i64 = tbase + 8;
+
+    // Everything the emit walk has to know up front (see SHAPE NOTES).
+    let final_mask: i64 = rewrite_mask(text, n);
+    let last1: i64 = sect_last_line(text, n, 1);
+    let last2: i64 = sect_last_line(text, n, 2);
+    let last3: i64 = sect_last_line(text, n, 3);
+
+    let mut out: Vec<u8> = vec_new();
+    let mut mask: i64 = 0;          // replayed, so "first match wins" lands identically
+    let mut sid: i64 = 0;
+    let mut ti: i64 = 0 - 1;        // model index of the [[target]] block we are inside
+    let mut tnext: i64 = 0;
+    let mut li: i64 = 0;
+    let mut ls: i64 = 0;
+    let mut i: i64 = 0;
+    while i <= n {
+        if i == n || (*text)[i] == '\n' {
+            let la: i64 = ls;
+            let mut lb: i64 = i;
+            let mut isline: bool = true;
+            if i == n {
+                isline = lb > la;
+                0
+            } else {
+                if lb > la && (*text)[lb - 1] == '\r' { lb = lb - 1; 0 } else { 0 };
+                0
+            };
+            if isline {
+                let mut ts: i64 = la;
+                while ts < lb && is_ws((*text)[ts]) { ts = ts + 1; }
+                let mut te: i64 = lb;
+                while te > ts && is_ws((*text)[te - 1]) { te = te - 1; }
+                let mut done: bool = false;     // true once a rewritten line was emitted
+                if ts < te && (*text)[ts] == '[' {
+                    sid = sec_id(text, ts, te);
+                    // The index advances for EVERY "[target" block, including ones
+                    // the model has no target for (those are emitted untouched).
+                    if sid == 4 { ti = tnext; tnext = tnext + 1; 0 } else { 0 };
+                    0
+                } else {
+                    if ts < te && (*text)[ts] != '#' {
+                        let mut eq: i64 = la;
+                        let mut haseq: bool = false;
+                        while eq < lb && haseq == false {
+                            if (*text)[eq] == '=' { haseq = true; 0 } else { eq = eq + 1; 0 };
+                        }
+                        if haseq {
+                            let mut ka: i64 = la;
+                            while ka < eq && is_ws((*text)[ka]) { ka = ka + 1; }
+                            let mut kb: i64 = eq;
+                            while kb > ka && is_ws((*text)[kb - 1]) { kb = kb - 1; }
+                            if sid >= 1 && sid <= 3 {
+                                let me: i64 = find_entry(mask, sid, text, ka, kb);
+                                if me >= 0 {
+                                    mask = bit_set(mask, me);
+                                    push_bytes(&mut out, text, la, eq + 1);   // through the '='
+                                    push_lit(&mut out, " ");
+                                    push_val(&mut out, model, skip_n(model, 0, me));
+                                    done = true;
+                                    0
+                                } else { 0 };
+                                0
+                            } else {
+                                if sid == 4 && ti >= 0 && ti < tcount {
+                                    let f: i64 = tgt_field(text, ka, kb);
+                                    if f >= 0 {
+                                        push_bytes(&mut out, text, la, eq + 1);
+                                        push_lit(&mut out, " ");
+                                        push_val(&mut out, model, skip_n(model, tfirst, ti * 4 + f));
+                                        done = true;
+                                        0
+                                    } else { 0 };
+                                    0
+                                } else { 0 };
+                                0
+                            };
+                            0
+                        } else { 0 };
+                        0
+                    } else { 0 };
+                    0
+                };
+                if done { 0 } else { push_bytes(&mut out, text, la, lb); 0 };
+                push_lit(&mut out, "\r\n");
+                // Insertions land at the end of their section's own lines.
+                if li == last1 { emit_missing(&mut out, model, final_mask, 1); 0 } else { 0 };
+                if li == last2 { emit_missing(&mut out, model, final_mask, 2); 0 } else { 0 };
+                if li == last3 { emit_missing(&mut out, model, final_mask, 3); 0 } else { 0 };
+                li = li + 1;
+                0
+            } else { 0 };
+            ls = i + 1;
+            0
+        } else { 0 };
+        i = i + 1;
+    }
+
+    // Sections the manifest never had, appended at the very end in KV order.
+    if last1 < 0 { append_section(&mut out, model, final_mask, 1); 0 } else { 0 };
+    if last2 < 0 { append_section(&mut out, model, final_mask, 2); 0 } else { 0 };
+    if last3 < 0 { append_section(&mut out, model, final_mask, 3); 0 } else { 0 };
+
+    // Collapse trailing blank lines to one newline. The C++ erases the last 2 bytes
+    // in place; with nothing to truncate a Vec here, the keep-length is computed
+    // first and the prefix copied out — same bytes, one extra pass.
+    let total: i64 = len(out);
+    let mut keep: i64 = total;
+    while keep >= 4
+        && out[keep - 1] == '\n' && out[keep - 2] == '\r'
+        && out[keep - 3] == '\n' && out[keep - 4] == '\r' {
+        keep = keep - 2;
+    }
+    let mut fin: Vec<u8> = vec_new();
+    let mut z: i64 = 0;
+    while z < keep {
+        push(&mut fin, out[z]);
+        z = z + 1;
+    }
+    vec_to_array(fin)
 }

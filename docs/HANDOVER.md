@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–42 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–44 built and verified.
 
 ---
 
@@ -178,7 +178,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–42 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–44 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -635,6 +635,52 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     the running instance; with unsaved edits it raises the unsaved-changes prompt rather than
     discarding them; a synthesized `WM_DROPFILES` opens the dropped file. `ctest` 5/5.
 
+44. **The manifest writer runs in Sentinel — every file-touching path now does.** `saveProject` was
+    the last piece of C++ that reads or writes a file, deliberately deferred since phase 38 because a
+    surgical, structure-preserving TOML rewrite is the genuinely hard one: it must change only the
+    values it manages and leave comments, blank lines, key alignment, unmodeled keys (`icon`,
+    `authors`) and `[[target]]` blocks byte-for-byte intact.
+    **A characterization test came first, not the port.** `saveProject` had **zero** coverage while
+    being the one piece of code that overwrites the user's manifest in place, so
+    `tests/saveproject_test.cpp` (38 assertions, 10 cases) pinned the C++ behaviour before anything
+    moved. Two of its cases pin behaviour that is arguably *wrong* — section names match
+    case-INSENSITIVELY but key names case-SENSITIVELY, so `Name` is not the managed `name` and a save
+    leaves the old key *and* inserts a new one; and `[[ target ]]` with inner spaces parses to the
+    section name `"[ target"`, never matches `"[target"`, and is neither rewritten nor counted. Pinned
+    on purpose: a characterization test describes what the code *does* so a port can be proven
+    equivalent before anyone argues about what it *should* do.
+    **The design that made it tractable.** The C++ builds a `vector<Section>{ vector<wstring> lines }`
+    and mutates lines in place — a shape Sentinel cannot express, since `Vec<[u8]>` is unsupported and
+    a non-Copy `Vec` element cannot be mutated in place. But the output is *just bytes*, so the port
+    is a pure `save_manifest(text, model) -> [u8]` working on **offsets** into the original text and
+    appending to one `Vec<u8>`. The host keeps file I/O and the TOML rendering; `encodeSaveModel`
+    ships already-rendered values, so quoting rules are not reimplemented in a second language. Three
+    line walks replace the C++'s single mutate-then-emit (insertion happens mid-file and must know the
+    final written-set before the first byte is emitted), and `KV::written` becomes an 11-bit mask in
+    an i64. ~533 lines, 21 private helpers.
+    **`encodeSaveModel` deliberately sits OUTSIDE the `SENTINELIDE_SENTINEL` guard** so the xcheck
+    builds the model with the exact bytes the host does — two encoders that must agree is a
+    silent-divergence trap.
+    **One deliberate divergence from the oracle, and it is the better behaviour.** `save_manifest` is
+    byte-transparent; the C++ round-trips through UTF-16 via `readUtf8`, and `MultiByteToWideChar`
+    without `MB_ERR_INVALID_CHARS` rewrites every invalid UTF-8 byte to U+FFFD. So a Latin-1 comment
+    or an unmodeled value survives the Sentinel path and is silently corrupted by the C++ one. Kept
+    rather than bug-compatibly broken, documented in `parsers.sentinel`'s header, and the host path
+    therefore uses **raw byte I/O, not `readUtf8`/`writeUtf8`**.
+    **A review found a process-fatal bug in the first cut.** `rd_le8`'s guard was written
+    `off + 8 <= len`, and that addition **wraps**: an `off` in `[0x7FFFFFFFFFFFFFF0,
+    0x7FFFFFFFFFFFFFF7]` makes `off + 8` negative, so the bound passes while `off >= 0` also passes,
+    and the index runs at `i64::MAX`. Reproduced, aborting with `0xC0000409` — and a bounds violation
+    inside a Sentinel export **terminates the process** with no recovery (R2). Unreachable from a
+    manifest (every prefix is a host-computed byte count), but the comment above it asserted an
+    overflow guarantee the code did not have. Now `off <= len - 8`, with the comment corrected to say
+    what is actually true.
+    **Verified:** `tests/saveproject_xcheck.cpp` — 27 cases byte-identical to the C++ oracle, covering
+    the case asymmetry, duplicate keys and sections, alignment, target blocks in and out of order, a
+    header with no closing bracket, LF-only input and the trailing-blank collapse. `ctest` is now
+    **7 tests**. Live: Project Settings ▸ Save over `examples/sentinel.toml` kept all 16 comments and
+    lost no line, growing exactly 45 bytes — the 45 LF→CRLF conversions the writer has always done.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -859,7 +905,7 @@ read the handover belongs in the handover body, not here._
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
-> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–42, Environment gotchas,
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–44, Environment gotchas,
 > the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not

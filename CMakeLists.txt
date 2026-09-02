@@ -146,7 +146,7 @@ add_test(NAME saveproject COMMAND saveproject_test)
 #     cmake --build build --target diag_xcheck  &&  build\diag_xcheck.exe
 #     cmake --build build --target trust_xcheck &&  build\trust_xcheck.exe
 if(EXISTS "${SENTINEL_PARSERS_LIB}")
-  foreach(_xc diag_xcheck trust_xcheck sig_xcheck manifest_xcheck)
+  foreach(_xc diag_xcheck trust_xcheck sig_xcheck manifest_xcheck saveproject_xcheck)
     add_executable(${_xc} tests/${_xc}.cpp)
     target_link_libraries(${_xc} PRIVATE
       "${SENTINEL_PARSERS_LIB}"
@@ -154,8 +154,11 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
     set_target_properties(${_xc} PROPERTIES EXCLUDE_FROM_ALL TRUE)
   endforeach()
   target_include_directories(manifest_xcheck PRIVATE src/core)  # needs Project.h (C++ oracle)
+  target_include_directories(saveproject_xcheck PRIVATE src/core)  # needs Project.h (C++ oracle) + encodeSaveModel
+  target_link_libraries(saveproject_xcheck PRIVATE shell32 advapi32)
   add_test(NAME diag_parity  COMMAND diag_xcheck)
   add_test(NAME trust_parity COMMAND trust_xcheck)
   add_test(NAME sig_parity      COMMAND sig_xcheck)
   add_test(NAME manifest_parity COMMAND manifest_xcheck)
+  add_test(NAME saveproject_parity COMMAND saveproject_xcheck)
 endif()
