@@ -657,7 +657,27 @@ bool saveFile(HWND hwnd);   // defined just below; confirmSaveIfDirty needs it
 // when the user cancelled — in which case the CALLER MUST ABORT, changing nothing.
 // `action` completes "…if you continue <action> without saving".
 bool confirmSaveIfDirty(HWND hwnd, const std::wstring& action) {
-    if (!g.fileOpen || !g.dirty) return true;
+    if (!g.fileOpen) return true;
+    // Re-derive dirty at the moment of asking, as a ONE-WAY OR — never a plain assignment.
+    // Since phase 44 g.dirty is a pure function of (editorText(), g.savedText); the EN_CHANGE
+    // notification is only the trigger to recompute it. Recomputing here makes the guard
+    // independent of ever having received that notification, and the polarity is the point:
+    // this can only ever ADD a prompt, so even a wrong comparison cannot wave someone past
+    // unsaved work. It also preserves phase 39's deliberate "Don't Save leaves g.dirty set"
+    // (nothing has loaded between two asks, so the recompute yields true again).
+    //
+    // On RichEdit today this is provably a no-op — loadFileIntoEditor and saveFile both set
+    // savedText from editorText() the moment the text settles — so it is pure insurance,
+    // bought now because the Direct2D editor will replace the notification path, and a missed
+    // change notification there means silently discarding a buffer. If it ever fires, that is
+    // a real hole and the log says so. (A debug assert would be useless: builds are Release
+    // with NDEBUG since phase 44, so it would compile to nothing.)
+    if (!g.dirty && editorText() != g.savedText) {
+        g.dirty = true;
+        logMsg(LogLevel::Error, L"Dirty flag missed a change to " + g.curFileName +
+               L" — the editor's change notification did not fire; prompting anyway");
+    }
+    if (!g.dirty) return true;
     switch (showSaveChangesDialog(hwnd, g.curFileName, action)) {
         case SaveChoice::Save:    return saveFile(hwnd);   // a failed write must not discard the buffer
         case SaveChoice::Discard: logMsg(LogLevel::Info, L"Discarded unsaved changes to " + g.curFileName); return true;

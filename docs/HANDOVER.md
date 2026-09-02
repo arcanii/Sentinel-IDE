@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–45 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–46 built and verified.
 
 ---
 
@@ -178,7 +178,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–45 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–46 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -699,6 +699,48 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     separately — `snc verify` against a one-byte-flipped `.sig` exits non-zero, which is what makes
     `verifyFile` return `Invalid`.
 
+46. **Direct2D editor — designed, and the safety net landed (slice 1a of ~8-11 sessions).** The
+    editor replacement is the largest remaining item and is genuinely multi-session, so it was
+    designed before any code moved: three strategies proposed independently (parallel control,
+    model-first, render-first), judged on regression risk / effort / how early something ships, then
+    synthesized.
+    **The chosen spine: a `SentinelD2DEditor` that speaks RichEdit's own message dialect** — the ~18
+    `EM_*` messages `MainWindow` actually sends, plus *synchronous* `EN_CHANGE`/`EN_SELCHANGE`/
+    `EN_VSCROLL` — selected by one setting at the single `CreateWindowExW` in `createControls`. The
+    host then needs almost no feature branches. Two neat consequences: `EM_GETTEXTEX` honouring
+    `GT_USECRLF` means `saveFile` and its phase-17 `n*2+16` sizing stay untouched, and
+    `EM_GETOLEINTERFACE` returning nullptr makes `editorDoc()` return nullptr, so phase 18's
+    `suspendUndo`/`resumeUndo` become no-ops with **no** host edit. Grafted from the other two
+    proposals: vendor SQLTerminal's pure `EditorModel` with unit tests, lift the tokenizer into a
+    pure `computeSpans()`, and make error tints painted decoration rather than character formatting —
+    which buys out the one place a pure dialect shim collapses (`EM_SETCHARFORMAT` with
+    `SCF_SELECTION`, ~500 calls per keystroke).
+    **Landed now — slice 1(a), the safety net, on RichEdit, before the new control exists.**
+    `confirmSaveIfDirty` re-derives `g.dirty` at the moment of asking, as a **one-way OR — never a
+    plain assignment**. That polarity is the whole point: it can only ever *add* a prompt, so even a
+    wrong comparison cannot wave someone past unsaved work. Since phase 44 `g.dirty` is a pure
+    function of `(editorText(), g.savedText)` and the notification is only the trigger to recompute,
+    so on RichEdit this is provably a no-op — verified: the detector did not fire in live testing.
+    It is bought now because the D2D control **replaces the notification path**, and a missed change
+    notification there means silently discarding a buffer. If it ever fires, the log says so at
+    Error. (The design suggested a debug `assert`; that would be useless here — builds are Release
+    with `NDEBUG` since phase 44, so it compiles to nothing. A log line is the detector that fires.)
+    **Remaining slices, in order:** 1(b–d) vendor `EditorModel` + a golden test asserting
+    `examples/crypto.sentinel` round-trips **byte-identically** (426 bytes, 12 CRLF — the test that
+    protects its committed `.sig`); 2 the no-wrap per-line D2D renderer with real horizontal scroll
+    (the widest-variance item, and mostly *not* ported — SQLTerminal's editor word-wraps); 3 the
+    message dialect + the notification funnel + the `CreateWindowExW` switch, shipping default OFF;
+    4 `computeSpans` + painted tints; 5 a full release of opt-in bake; 6 flip the default; 7 delete
+    the RichEdit path.
+    **The two ways this can lose work, and how the plan stops them:** a missed `EN_CHANGE` leaves
+    `g.dirty` false and the buffer is discarded with no prompt — stopped by 1(a) above plus a single
+    `SendMessageW` notification funnel (never `Post`: `loadFileIntoEditor` and `closeProject` clear
+    `g.loadingFile` immediately, so a posted notification arrives too late). And `saveFile` writing
+    LF instead of CRLF would rewrite `examples/crypto.sentinel` and invalidate its signature —
+    **and Build auto-saves the open file, so that fires without anyone pressing Ctrl+S, on the file
+    that opens by default.** Stopped by the byte-identity golden test and a manual `git status
+    examples/` gate on every slice from 3 onward.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -900,7 +942,7 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Targets follow-ons (remaining):** per-target `lib_paths`; a definable output dir; add/remove
   `[[target]]` blocks from the form (today it edits existing blocks' name/entry/type in place).
 - **Undo/redo follow-up:** track the saved point so undo-to-clean clears `●`; toolbar button hover states.
-- **The Direct2D editor** (GPU-perf target, as in SQLTerminal); dark **title-bar menu bar**; a
+- **The Direct2D editor** — **designed + slice 1(a) landed, see phase 46**; dark **title-bar menu bar**; a
   project-templates picker (lib/exe/multi-target) for New Project.
 - **Reconcile the spines/PRD** to ADR-0061 signing + the project/tier model (un-park PRD work).
 
@@ -921,7 +963,7 @@ read the handover belongs in the handover body, not here._
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
-> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–45, Environment gotchas,
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–46, Environment gotchas,
 > the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not
