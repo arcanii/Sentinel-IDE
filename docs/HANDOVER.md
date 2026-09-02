@@ -725,17 +725,38 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **No tier/opt flag:** `snc` always builds `-O0` (TIERED_RELEASES is post-1.0). Tiers only set
   the output dir today.
 
-## UX spines (BMad) — status: DRAFT
+## UX spines (BMad) — status: RECONCILED to v0.1.7 (phase 43)
 
-`_bmad-output/planning-artifacts/ux-designs/ux-SentinelIDE-2026-06-27/`
-- `DESIGN.md` + `EXPERIENCE.md` (cross-reference DESIGN tokens by `{path}`), `mockups/`,
-  `.memlog.md` (canonical decision log — append via `_bmad/scripts/memlog.py`).
-- **Pending:** Bryan's sign-off on `[ASSUMPTION]`s (diag palette, shapes/spacing, keybindings),
-  then finalize; **reconcile to ADR-0061 signing + the project/tier model** (the spines + PRD
-  still assume Authenticode and debug/release).
-- **PRD:** `prds/prd-SentinelIDE-2026-06-27/` — has signing FR-19..21 + UJ-5 (Authenticode-framed)
-  and an adversarial review with open HIGH findings (timestamping, UJ-5 climax overclaim,
-  sign-confirmation spec). PRD reconciliation was **parked** by Bryan.
+`_bmad-output/planning-artifacts/`
+- **`REALITY-DELTA.md`** — the verified record of how the artifacts diverged from the code:
+  27 rows (`RD-01`…`RD-27`), each giving what the artifacts claimed, what the code does, and the
+  **file+line that proves it**, classed `STALE` / `NOT BUILT` / `UNSPEC`. Every later edit cites a
+  row id instead of re-deriving. **Start here** before touching any spine.
+- **`GAP-REGISTER.md`** — the single register the owner's D1 requires: specified-but-not-built on
+  one side, built-but-not-specified on the other.
+- `ux-designs/…/DESIGN.md` + `EXPERIENCE.md` — reconciled. Signing is ADR-0061 throughout, the
+  project/target/tier IA and the scheme selector now exist in the spec, and every
+  designed-but-unbuilt item is **kept** but carries an in-place `[NOT BUILT — RD-nn]` marker.
+- `prds/…/prd.md` — **re-opened and reconciled** (owner decision D2, reversing the earlier park).
+  The timestamping HIGH is closed **dead** (RFC-3161 presupposes certificates; ADR-0061 has none);
+  the "never report signed when it is not" HIGH is **re-filed against shipped code** — see below.
+- **Owner decisions that governed this pass:** D1 spec+gap-register (not as-built), D2 reopen the
+  PRD, D3 keep the `trust-verified` token name (no rename to `trust-signed`, in docs or code).
+- **Still stale, deliberately out of scope:** the three `mockups/*.html` still render the
+  Authenticode signing UI, and the brief/addendum's exposed-surface map.
+
+⚠ **Two live code defects this reconciliation surfaced** (docs now describe reality; the code is
+unfixed):
+- **Post-build signing can report success when it failed.** On a successful build with
+  `signing.sign = true`, `MainWindow.cpp` prints `[signed · <name>.sig]` off `snc sign`'s **exit
+  code alone** — `verifyFile` is never called on that path. The spec explicitly forbade this
+  ("never on the signer's exit code alone"). RD-06.
+- **The trust chip does not recompute on edit.** `refreshSignState`'s only call sites are
+  `loadFileIntoEditor`, `saveFile`, `openSigning` and Settings-OK; `onEditChanged` never touches
+  it, so a signed file being edited keeps showing `✓ Signed` until saved. The `// edits invalidate
+  any existing .sig` comment at the `saveFile` call site explains why SAVING re-verifies and must
+  not be read as an edit hook — the first reconciliation pass misread it exactly that way and
+  asserted the wrong behaviour in four documents before the critic caught it.
 
 ## What's next (open options)
 
