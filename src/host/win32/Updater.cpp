@@ -141,11 +141,17 @@ std::string appcastVersion(const std::string& body) {
 
 std::atomic<bool> g_timerRunning{false};
 
+// Check shortly after startup, then hourly. The startup delay is only a settle — it keeps
+// the first network call off the window-creation path — not a policy choice. Hourly (rather
+// than daily) so a release published mid-session is noticed within the hour; the request is a
+// ~1 KB GET, so the cost is negligible either way.
+constexpr DWORD kStartupSettleMs = 10 * 1000;
+constexpr DWORD kCheckIntervalMs = 60 * 60 * 1000;
+
 void startOwnUpdateTimer(HWND mainWnd) {
     if (g_timerRunning.exchange(true)) return;
     std::thread([mainWnd] {
-        // Let the app finish starting before touching the network.
-        Sleep(90 * 1000);
+        Sleep(kStartupSettleMs);
         for (;;) {
             std::string body;
             if (fetchAppcast(body)) {
@@ -154,10 +160,10 @@ void startOwnUpdateTimer(HWND mainWnd) {
                     logMsg(LogLevel::Info, L"Updater: periodic check found a newer version in the appcast");
                     const std::wstring w(ver.begin(), ver.end());   // ASCII version string
                     PostMessageW(mainWnd, WM_APP_UPDATE_AVAILABLE, 0, (LPARAM)_wcsdup(w.c_str()));
-                    return;   // offered once per run; the user decides from here
+                    return;   // offered once per run — keep checking, but never nag twice
                 }
             }
-            Sleep(24 * 60 * 60 * 1000);   // daily thereafter
+            Sleep(kCheckIntervalMs);
         }
     }).detach();
 }

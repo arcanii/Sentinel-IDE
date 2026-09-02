@@ -591,8 +591,11 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     Settings modal open the offer correctly did **not** appear, then arrived 3.3 s after that modal
     closed; Skip wrote `skip_version=0.1.6.160` and a relaunch was not re-offered; and an
     already-current client saw no prompt at all in 125 s.
-    **Known and deliberate:** the poll runs 90 s after *every* launch (a ~1 KB GET) rather than
-    persisting a daily last-check, and `Later` means "ask again next launch" — Skip is the durable no.
+    **Cadence:** a 10 s startup settle (only to keep the first network call off the window-creation
+    path), then **hourly** — so a release published mid-session is noticed within the hour. The
+    request is a ~1 KB GET, so frequency is not the cost. Nothing is persisted across restarts, so a
+    launch always checks. `Later` means "ask again next launch" and the thread stops after one offer,
+    so hourly polling never becomes hourly nagging; **Skip this version** is the durable no.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
