@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// d2d_render_test — the pixel test for the Direct2D editor control (phase 46 slice 2).
+//
+// Build+run:  cmake --build build --target d2d_render_test && build\d2d_render_test.exe
+// or via ctest:  ctest --test-dir build -R d2d_render
+//
+// WHY THIS TEST EXISTS. Before it, the control's rendering had zero automated coverage: a
+// blank editor would have compiled, run, opened a window and passed every test in the repo.
+// A control destined to replace the editor in a SHIPPING IDE cannot rely on someone
+// remembering to look at a screenshot, and slices 4-7 (syntax colouring) are entirely about
+// pixels.
+//
+// scripts\capture.ps1 does capture this control correctly, so it is a fine way to LOOK at
+// it. It is not a way to TEST it: it needs a visible window, a human, and a judgement call.
+// This runs headless, is deterministic, and fails loudly. (An earlier note here claimed
+// PrintWindow could not capture Direct2D at all. That was wrong -- one capture came back
+// blank, most likely taken before the window had presented, and a general law got written
+// from a single observation. Re-measured: a magenta-cleared D2D window captures as magenta,
+// and this demo captures with its real text.)
+//
+// THE ASSERTION THAT IS THE POINT OF THE WHOLE FILE is case 4: a meaningful number of
+// pixels must DIFFER from the background. A control that renders a blank window — the
+// failure mode nothing else here can see, and the one an "it compiles and runs" check
+// waves straight through — fails that and only that.
+//
+// DELIBERATELY NOT BRITTLE. It asserts sizes, colour ranges and COUNTS, never glyph
+// positions or exact pixel values, so a different font, a different DPI or a theme flip
+// does not break it. The background and text colours come from Theme.h at runtime, so the
+// test follows the same light/dark decision the renderer made.
+//
+// SKIP, LOUDLY, is reserved for one thing: an environment that cannot create a D2D/WIC
+// render target at all (case 0 probes for exactly that and returns 0 with a printed
+// reason). A target that IS created and then yields a blank image is a FAILURE, not a skip.
+//
+// READ-ONLY on examples/: the input is opened GENERIC_READ and there is no write path to
+// it. crypto.sentinel is a committed SIGNED file (see editor_model_test case 10).
+#include <windows.h>
+
+#include <wincodec.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "host/win32/D2DEditor.h"
+#include "host/win32/D2DSupport.h"
+#include "host/win32/Theme.h"
+
+namespace {
+
+int gPass = 0, gFail = 0;
+void check(bool cond, const char* what) {
+    printf("  [%s] %s\n", cond ? "PASS" : "FAIL", what);
+    if (cond) gPass++; else gFail++;
+}
+
+// The window is created at this size and never shown; the assertions read the CLIENT rect
+// back rather than assuming it, because WS_HSCROLL|WS_VSCROLL eat some of it.
+constexpr int kWinW = 1100;
+constexpr int kWinH = 760;
+
+std::wstring toW(const char* s) {
+    if (!s || !*s) return std::wstring();
+    const int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    if (n <= 1) return std::wstring();
+    std::wstring w(static_cast<size_t>(n - 1), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), n);
+    return w;
+}
+
+std::wstring utf8ToW(const std::string& u8) {
+    if (u8.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, u8.data(), static_cast<int>(u8.size()), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, u8.data(), static_cast<int>(u8.size()), w.data(), n);
+    return w;
+}
+
+std::string readFileBytes(const wchar_t* path) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return std::string();
+    DWORD n = GetFileSize(f, nullptr), got = 0;
+    std::string s(n, '\0');
+    if (n) ReadFile(f, s.data(), n, &got, nullptr);
+    CloseHandle(f);
+    s.resize(got);
+    return s;
+}
+
+// ---- decoded image ----------------------------------------------------------
+
+struct Rgb {
+    int r = 0, g = 0, b = 0;
+};
+
+struct Image {
+    UINT w = 0, h = 0;
+    std::vector<BYTE> px;  // BGRA, tightly packed, stride == w * 4
+    Rgb at(UINT x, UINT y) const {
+        const size_t i = (static_cast<size_t>(y) * w + x) * 4;
+        return Rgb{px[i + 2], px[i + 1], px[i + 0]};
+    }
+};
+
+// Distance in the worst channel — a plain, explainable metric. Everything below asserts
+// against a threshold on this rather than on equality, because antialiasing means almost
+// no pixel is exactly either colour.
+int chanDist(const Rgb& a, const Rgb& b) {
+    const int dr = abs(a.r - b.r), dg = abs(a.g - b.g), db = abs(a.b - b.b);
+    return (dr > dg ? (dr > db ? dr : db) : (dg > db ? dg : db));
+}
+
+Rgb fromColorRef(COLORREF c) {
+    return Rgb{GetRValue(c), GetGValue(c), GetBValue(c)};
+}
+
+// Decode the PNG back off disk. Converting to a fixed 32bppBGRA means the reader never has
+// to care what the encoder negotiated.
+bool loadPng(IWICImagingFactory* wic, const wchar_t* path, Image& out, const char*& why) {
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    bool ok = false;
+    why = "";
+    if (FAILED(wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
+                                              WICDecodeMetadataCacheOnDemand, &dec)) ||
+        !dec) {
+        why = "CreateDecoderFromFilename failed (no PNG written?)";
+    } else if (FAILED(dec->GetFrame(0, &frame)) || !frame) {
+        why = "GetFrame(0) failed";
+    } else if (FAILED(frame->GetSize(&out.w, &out.h)) || out.w == 0 || out.h == 0) {
+        why = "GetSize failed or zero-sized";
+    } else if (FAILED(wic->CreateFormatConverter(&conv)) || !conv ||
+               FAILED(conv->Initialize(frame, GUID_WICPixelFormat32bppBGRA,
+                                       WICBitmapDitherTypeNone, nullptr, 0.0,
+                                       WICBitmapPaletteTypeCustom))) {
+        why = "CreateFormatConverter/Initialize failed";
+    } else {
+        const UINT stride = out.w * 4;
+        out.px.resize(static_cast<size_t>(stride) * out.h);
+        ok = SUCCEEDED(conv->CopyPixels(nullptr, stride,
+                                        static_cast<UINT>(out.px.size()), out.px.data()));
+        if (!ok) why = "CopyPixels failed";
+    }
+    sentinelide::SafeRelease(conv);
+    sentinelide::SafeRelease(frame);
+    sentinelide::SafeRelease(dec);
+    return ok;
+}
+
+// Can this machine make a D2D render target over a WIC bitmap AT ALL? If not, the control
+// is untestable here and the honest answer is a loud skip — not a red test that says the
+// editor is broken when it is the environment that is.
+bool probeD2DWic(IWICImagingFactory* wic, const char*& why) {
+    why = "";
+    if (!sentinelide::d2dFactory()) {
+        why = "D2D1CreateFactory returned nothing";
+        return false;
+    }
+    if (!sentinelide::dwriteFactory()) {
+        why = "DWriteCreateFactory returned nothing";
+        return false;
+    }
+    IWICBitmap* bmp = nullptr;
+    ID2D1RenderTarget* rt = nullptr;
+    bool ok = false;
+    if (FAILED(wic->CreateBitmap(8, 8, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad,
+                                 &bmp)) ||
+        !bmp) {
+        why = "IWICImagingFactory::CreateBitmap failed";
+    } else {
+        const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f,
+            96.0f);
+        ok = SUCCEEDED(sentinelide::d2dFactory()->CreateWicBitmapRenderTarget(bmp, props, &rt)) &&
+             rt != nullptr;
+        if (!ok) why = "ID2D1Factory::CreateWicBitmapRenderTarget failed";
+    }
+    sentinelide::SafeRelease(rt);
+    sentinelide::SafeRelease(bmp);
+    return ok;
+}
+
+// Drive one real WM_PAINT through the control's window procedure and report whether it took
+// the "device resources are good" branch.
+//
+// HOW THAT IS OBSERVABLE FROM OUTSIDE. paint() calls updateScrollbars ONLY inside that
+// branch, so clearing the vertical range first and finding it re-established afterwards
+// means the window's own ID2D1HwndRenderTarget was created (or survived) and the whole paint
+// body ran. That is the check that the offscreen render did not wreck the live device: if
+// d2dEditorRenderToPng had left st->rt aimed at the released WIC target, this would not
+// return false, it would take the process down inside BeginDraw.
+//
+// The window is HIDDEN, so WM_PAINT is sent directly — UpdateWindow does nothing for an
+// invisible window. BeginPaint/EndPaint are fine with that and paint() ignores ps.rcPaint.
+bool livePaint(HWND hwnd) {
+    SCROLLINFO clear{};
+    clear.cbSize = sizeof(clear);
+    clear.fMask = SIF_RANGE | SIF_PAGE | SIF_DISABLENOSCROLL;
+    SetScrollInfo(hwnd, SB_VERT, &clear, FALSE);
+    SendMessageW(hwnd, WM_PAINT, 0, 0);
+    SCROLLINFO got{};
+    got.cbSize = sizeof(got);
+    got.fMask = SIF_ALL;
+    if (!GetScrollInfo(hwnd, SB_VERT, &got)) return false;
+    return got.nMax > 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    // Paths come from the build (like editor_model_test's golden file) so the test does not
+    // depend on a working directory.
+    const std::wstring srcPath =
+        (argc > 1) ? toW(argv[1]) : std::wstring(L"G:\\SentinelIDE\\examples\\crypto.sentinel");
+    const std::wstring pngPath =
+        (argc > 2) ? toW(argv[2]) : std::wstring(L"G:\\SentinelIDE\\build\\d2d_render.png");
+
+    printf("D2DEditor offscreen render\n\n");
+
+    // Match the demo host: no .rc, so per-monitor-v2 has to be asserted in code or
+    // GetDpiForWindow reports a lie and every metric below is scaled wrong.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        printf("SKIP: CoInitializeEx failed - no COM apartment, WIC is unreachable.\n");
+        return 0;
+    }
+
+    IWICImagingFactory* wic = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&wic))) ||
+        !wic) {
+        printf("SKIP: no WIC imaging factory on this machine - cannot render or decode.\n");
+        CoUninitialize();
+        return 0;
+    }
+
+    printf("0. the environment can host a D2D render target over a WIC bitmap\n");
+    {
+        const char* why = "";
+        if (!probeD2DWic(wic, why)) {
+            printf("  [SKIP] %s\n", why);
+            printf("\nSKIPPED: this environment cannot create a D2D/WIC render target, so the\n"
+                   "         control is untestable here. This is NOT a pass - re-run somewhere\n"
+                   "         with Direct2D available before trusting the renderer.\n");
+            sentinelide::SafeRelease(wic);
+            CoUninitialize();
+            return 0;
+        }
+        check(true, "D2D + DWrite factories and a WIC bitmap render target");
+    }
+
+    const sentinelide::Theme& th = sentinelide::currentTheme();
+    const Rgb bg = fromColorRef(th.windowBg);
+    const Rgb fg = fromColorRef(th.textPrimary);
+    printf("     theme=%s  windowBg=(%d,%d,%d)  textPrimary=(%d,%d,%d)\n",
+           th.dark ? "dark" : "light", bg.r, bg.g, bg.b, fg.r, fg.g, fg.b);
+
+    printf("\n1. a hidden editor window renders examples/crypto.sentinel to a PNG\n");
+    const std::string bytes = readFileBytes(srcPath.c_str());
+    check(!bytes.empty(), "read the source file");
+
+    HWND hwnd = nullptr;
+    LONG clientW = 0, clientH = 0;
+    bool rendered = false;
+    {
+        HINSTANCE hInst = GetModuleHandleW(nullptr);
+        check(sentinelide::registerD2DEditorClass(hInst), "registered SentinelD2DEditor");
+        // A hidden top-level popup, NOT shown: the render path draws into a WIC bitmap, so
+        // nothing here needs the window on screen. That is the point -- the test runs with
+        // no desktop, no compositor and no human.
+        // WS_HSCROLL|WS_VSCROLL because the control drives both bars itself and relies on
+        // them existing (SIF_DISABLENOSCROLL).
+        hwnd = CreateWindowExW(0, sentinelide::kD2DEditorClass, L"", WS_POPUP | WS_HSCROLL | WS_VSCROLL,
+                               0, 0, kWinW, kWinH, nullptr, nullptr, hInst, nullptr);
+        check(hwnd != nullptr, "created a hidden editor window");
+        if (hwnd) {
+            sentinelide::d2dEditorSetText(hwnd, utf8ToW(bytes));
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            clientW = rc.right - rc.left;
+            clientH = rc.bottom - rc.top;
+            // A LIVE PAINT FIRST, and it is not decoration. d2dEditorRenderToPng parks the
+            // window's target and brushes and puts them back; if the control has never
+            // painted, that whole set is null and the swap proves nothing. Forcing a real
+            // WM_PAINT here creates the ID2D1HwndRenderTarget and its brushes, so case 5's
+            // repeat is testing the actual restore.
+            check(livePaint(hwnd), "a real WM_PAINT built the window's own D2D device");
+            rendered = sentinelide::d2dEditorRenderToPng(hwnd, pngPath.c_str());
+            check(rendered, "d2dEditorRenderToPng returned true");
+        }
+    }
+
+    Image im;
+    bool decoded = false;
+    if (rendered) {
+        printf("\n2. the PNG decodes and is the control's client size\n");
+        const char* why = "";
+        decoded = loadPng(wic, pngPath.c_str(), im, why);
+        if (!decoded) printf("     decode failure: %s\n", why);
+        check(decoded, "decoded the PNG back off disk");
+        if (decoded) {
+            printf("     image %ux%u, client %ldx%ld\n", im.w, im.h, clientW, clientH);
+            check(im.w == static_cast<UINT>(clientW) && im.h == static_cast<UINT>(clientH),
+                  "image size == client size");
+        }
+    }
+
+    if (decoded && im.w > 40 && im.h > 40) {
+        // Sample points chosen for ROBUSTNESS, not precision: all of them sit below and to
+        // the right of anything ~12 short lines of source could occupy, at any font or DPI
+        // this control plausibly runs at. Nothing here depends on where a glyph landed.
+        printf("\n3. the background is Theme windowBg well away from the text\n");
+        {
+            const UINT pts[][2] = {{im.w - 4, im.h - 4},         {im.w / 2, im.h - 4},
+                                   {4, im.h - 4},                {im.w - 4, im.h * 7 / 8},
+                                   {im.w / 2, im.h * 3 / 4},     {im.w - 4, im.h * 3 / 4}};
+            int worst = 0;
+            for (const auto& p : pts) {
+                const int d = chanDist(im.at(p[0], p[1]), bg);
+                if (d > worst) worst = d;
+            }
+            printf("     worst channel deviation across 6 sample points: %d\n", worst);
+            check(worst <= 2, "every background sample is Theme windowBg");
+        }
+
+        printf("\n4. TEXT WAS ACTUALLY DRAWN (the assertion this file exists for)\n");
+        {
+            long long nonBg = 0;
+            int bestFg = 255;  // closest any pixel gets to Theme textPrimary
+            for (UINT y = 0; y < im.h; ++y) {
+                for (UINT x = 0; x < im.w; ++x) {
+                    const Rgb p = im.at(x, y);
+                    if (chanDist(p, bg) > 8) ++nonBg;
+                    const int d = chanDist(p, fg);
+                    if (d < bestFg) bestFg = d;
+                }
+            }
+            const long long total = static_cast<long long>(im.w) * im.h;
+            printf("     %lld of %lld pixels differ from the background (%.3f%%)\n", nonBg, total,
+                   100.0 * static_cast<double>(nonBg) / static_cast<double>(total));
+            printf("     closest pixel to Theme textPrimary: %d channel-units away\n", bestFg);
+            // ~11 lines of source at 11pt is thousands of inked pixels; 500 is a floor low
+            // enough to survive a font or DPI change and high enough that a blank window,
+            // or a stray artefact, cannot clear it.
+            check(nonBg >= 500, "hundreds of non-background pixels -> the text really rendered");
+            // A solid fill in the wrong colour would also beat the floor above; this catches
+            // that by requiring the image to still be MOSTLY background.
+            check(nonBg < total / 2, "the image is still mostly background (not a solid fill)");
+            // <=48 is roughly ">=77% glyph coverage", i.e. at least one pixel is essentially
+            // pure text colour rather than a faint antialiased edge.
+            check(bestFg <= 48, "at least one pixel is close to Theme textPrimary");
+        }
+
+        printf("\n5. the LIVE window still paints after the offscreen render\n");
+        {
+            // THE regression this guards: d2dEditorRenderToPng parks the window's target and
+            // brushes, points EditorState at a WIC target for one draw, and restores them.
+            // Get that wrong -- release the window's brushes, leave st->rt on the freed WIC
+            // target -- and the editor is dead the next time it paints. Case 1 established a
+            // real hwnd device before the render, so this is the actual restored set.
+            check(livePaint(hwnd), "a real WM_PAINT after the offscreen render still succeeds");
+            // And the offscreen path itself still works after a live paint, byte for byte.
+            const bool again = sentinelide::d2dEditorRenderToPng(hwnd, pngPath.c_str());
+            check(again, "a second render through the same state still succeeds");
+            Image im2;
+            const char* why = "";
+            const bool ok2 = again && loadPng(wic, pngPath.c_str(), im2, why);
+            check(ok2, "and it decodes");
+            if (ok2 && im2.w == im.w && im2.h == im.h) {
+                long long same = 0, diff = 0;
+                for (size_t i = 0; i + 3 < im.px.size(); i += 4) {
+                    if (im.px[i] == im2.px[i] && im.px[i + 1] == im2.px[i + 1] &&
+                        im.px[i + 2] == im2.px[i + 2])
+                        ++same;
+                    else
+                        ++diff;
+                }
+                printf("     %lld pixels identical, %lld differ between the two renders\n", same,
+                       diff);
+                check(diff == 0, "byte-identical to the first render - device state intact");
+            } else {
+                check(false, "second image has the same dimensions");
+            }
+        }
+    }
+
+    if (hwnd) DestroyWindow(hwnd);
+    sentinelide::SafeRelease(wic);
+    CoUninitialize();
+
+    printf("\nPNG left at: %ls\n", pngPath.c_str());
+    printf("\n%d passed, %d failed\n", gPass, gFail);
+    return gFail == 0 ? 0 : 1;
+}

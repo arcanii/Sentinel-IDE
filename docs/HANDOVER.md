@@ -157,6 +157,19 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   in the **same** PowerShell call as `cmd /c` — keep them in separate calls.
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
+- **`capture.ps1` works on the Direct2D editor** — verified in phase 46 slice 2 by capturing
+  the live demo: dark ground, real text, **zero** white pixels in the client area
+  (`windowBg` 70,545 sampled / `pureWhite` 0). A magenta-cleared `ID2D1HwndRenderTarget`
+  probe also captures as magenta. **If a capture ever comes back with a blank client area,
+  re-run it** — the window had most likely not presented yet. Do not conclude the renderer is
+  broken, and do not conclude `PrintWindow` cannot see Direct2D.
+  *(A slice-2 session did exactly that: one blank capture became a written-down "PrintWindow
+  cannot capture D2D" law in four files, plus an accusation that two reviewers had fabricated
+  their pixel readings. Both were wrong — the reviewers were right. A single observation is
+  not a mechanism, and this repo's signature defect is a claim nobody re-measured.)*
+- For **testing** the renderer, prefer the offscreen WIC path regardless — `ctest -R d2d_render`,
+  or `build\d2d_editor_demo.exe --render out.png <file>`. It needs no window, no desktop and
+  no human, and it asserts rather than inviting you to look.
 
 ## Environment gotchas (this machine)
 
@@ -738,11 +751,40 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     come back **identical** — because that file is a committed *signed* demo, opens by default, and
     Build auto-saves it, so a CRLF slip would invalidate its `.sig` without anyone pressing Ctrl+S.
     None of it is linked into the exe yet.
-    **Remaining slices, in order:** 2 the no-wrap per-line D2D renderer with real horizontal scroll
-    (the widest-variance item, and mostly *not* ported — SQLTerminal's editor word-wraps); 3 the
+    **Slice 2 LANDED** — `src/host/win32/D2DEditor.{h,cpp}` (1,435 lines) + vendored
+    `D2DSupport.h`, `tests/d2d_editor_demo.cpp` (a standalone host) and `tests/d2d_render_test.cpp`.
+    No-wrap from the start: `DWRITE_WORD_WRAPPING_NO_WRAP`, one cached `IDWriteTextLayout` **per
+    line** created only for the visible range (a 20k-line file lays out ~40 lines, not 20,000),
+    `trimCache` bounding live layouts to visible + 2*64, a `lineStarts` index, `scrollX`/`scrollY`
+    with both bars via `SetScrollInfo`. Still **not linked into the exe** — that's slice 3.
+    Six defects found by review and fixed before it landed, two of them data-loss class:
+    **AltGr arrives as Ctrl+Alt**, so on a Polish/German/Czech layout typing an accented letter ran
+    `selectAll` and — because `TranslateMessage` has *already queued* the `WM_CHAR` — the next
+    insert **replaced the whole document with one character** (RichEdit gets this right today, so it
+    would have been a regression at slice 6); and **cut deleted even when the copy failed**
+    (`OpenClipboard` fails transiently whenever a clipboard manager holds it). Also: device loss
+    never rescheduled its paint; the cache trim sat inside the device-good branch, so with the
+    device lost, navigation could build one layout per line with nothing reclaiming them;
+    autoscroll ran from timers queued before the drag ended; and `ensureCaretVisible` mixed content
+    and scroll coordinates so Ctrl+Home never reached 0.
+    **Remaining slices, in order:** 3 the
     message dialect + the notification funnel + the `CreateWindowExW` switch, shipping default OFF;
     4 `computeSpans` + painted tints; 5 a full release of opt-in bake; 6 flip the default; 7 delete
     the RichEdit path.
+    **`ctest -R d2d_render` is the verification spine for slices 4-7.** It renders the control
+    offscreen through WIC — the *same* `drawContent` the window uses — decodes the PNG back and
+    asserts on real pixels: the background is Theme `windowBg`, and **>=500 pixels differ from it**
+    so a blank render FAILS. On `examples/crypto.sentinel` it measures **23,603 of 788,316 pixels
+    inked (2.99%)**. Verified by negative control: suppressing the draw gives `0 of 788316` and the
+    test fails, exit 1. It exists because rendering had NO automated coverage: a blank editor
+    would compile, run, open a window and pass every other test in the repo. `capture.ps1` can
+    show you the control — it works fine on it — but seeing is not asserting, and slice 4's
+    colouring needs a check that runs headless in CI and fails by itself.
+    One constraint it imposes: the per-line layouts must stay **device-independent** (no
+    `SetDrawingEffect`), which is what lets the window target and the WIC target share one cache.
+    Slice 4 must colour by drawing ranges, not by attaching effects to layouts, or the offscreen
+    path and the device-loss recovery path break together.
+
     **The two ways this can lose work, and how the plan stops them:** a missed `EN_CHANGE` leaves
     `g.dirty` false and the buffer is discarded with no prompt — stopped by 1(a) above plus a single
     `SendMessageW` notification funnel (never `Post`: `loadFileIntoEditor` and `closeProject` clear

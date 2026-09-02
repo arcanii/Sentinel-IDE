@@ -152,6 +152,57 @@ target_include_directories(editor_model_test PRIVATE src)
 set_target_properties(editor_model_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME editor_model COMMAND editor_model_test "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel")
 
+# d2d_editor_demo — a standalone WIN32 host for src/host/win32/D2DEditor.cpp, the no-wrap
+# Direct2D editor control (phase 46 slice 2). NOT a ctest test: interactively it opens a
+# window. It exists because slice 2 deliberately does not touch MainWindow.cpp or the
+# SentinelIDE target — the message dialect that lets the host drive this control is slice 3
+# — so this is the only way to run the renderer without putting the shipping exe at risk.
+#     (from a vcvars64 shell -- see scripts\build.bat -- or the link fails with
+#      LNK1181: cannot open input file 'd2d1.lib')
+#     cmake --build build --target d2d_editor_demo
+#     build\d2d_editor_demo.exe [file]     (default examples\crypto.sentinel, READ-ONLY)
+#     build\d2d_editor_demo.exe --render out.png [file]     (headless; exit 0 == wrote it)
+#     powershell -File scripts\capture.ps1 -Class SentinelD2DEditorDemo
+# capture.ps1 DOES work on this window (verified: dark ground, text, no white). If a capture
+# ever comes back with a blank client area, the window had most likely not presented yet --
+# re-run it, don't conclude the renderer is broken. --render below is still the better check
+# because it needs no window at all and asserts instead of asking you to look.
+# NOTE: D2DEditor.cpp is deliberately absent from the SentinelIDE target above. It joins
+# the exe in slice 3, behind the single CreateWindowExW in createControls.
+add_executable(d2d_editor_demo WIN32
+  tests/d2d_editor_demo.cpp
+  src/host/win32/D2DEditor.cpp
+  src/editor/EditorModel.cpp)
+target_include_directories(d2d_editor_demo PRIVATE src)
+# d2d1/dwrite: the renderer. imm32: IME composition-window placement. uxtheme+dwmapi:
+# Theme.h's SetWindowTheme (the scrollbars are the only non-D2D pixels) and the dark
+# title bar. shell32: CommandLineToArgvW. windowscodecs+ole32: the offscreen PNG path.
+target_link_libraries(d2d_editor_demo PRIVATE
+  d2d1 dwrite imm32 uxtheme dwmapi shell32 windowscodecs ole32)
+set_target_properties(d2d_editor_demo PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+# d2d_render_test — THE pixel test for the Direct2D editor, and the only coverage its
+# rendering has. A CONSOLE app (unlike the demo) so ctest can read its output: it creates a
+# HIDDEN editor window, renders it offscreen through d2dEditorRenderToPng, decodes the PNG
+# back with WIC and asserts on actual pixels — background colour, a floor on the number of
+# non-background pixels, and proximity to Theme textPrimary. It fails if the control renders
+# a blank window. capture.ps1 can show you that too, but only if a human looks at the PNG and
+# only if a window is up; this runs headless in CI and ASSERTS, which is what slices 4-7 need.
+# It SKIPS (printing why, exit 0) only when the machine cannot create a D2D/WIC target.
+#     cmake --build build --target d2d_render_test  &&  build\d2d_render_test.exe
+# The PNG is left at build/d2d_render.png on purpose — look at it.
+add_executable(d2d_render_test
+  tests/d2d_render_test.cpp
+  src/host/win32/D2DEditor.cpp
+  src/editor/EditorModel.cpp)
+target_include_directories(d2d_render_test PRIVATE src)
+target_link_libraries(d2d_render_test PRIVATE
+  d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 advapi32)
+set_target_properties(d2d_render_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME d2d_render COMMAND d2d_render_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel"
+  "${CMAKE_CURRENT_BINARY_DIR}/d2d_render.png")
+
 # diag_xcheck / trust_xcheck — prove the Sentinel parsers stay byte-identical to the
 # C++ oracles they replaced. Only defined when the Sentinel lib was built; they link
 # the same parsers.lib + system libs the app does.

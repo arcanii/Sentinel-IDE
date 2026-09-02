@@ -56,6 +56,19 @@ instead of SQLTerminal's ASCII-only [A-Za-z0-9_], so word navigation agrees with
 Sentinel's own tokenizer; and `textCrlf()` was added for the on-disk CRLF form.
 Same author, same GPL-3.0 licence, so no licence conflict arises.
 
+src/host/win32/D2DSupport.h is likewise VENDORED from that project (its
+src/ui/D2DSupport.h) — the shared Direct2D/DirectWrite factory helpers behind the
+same editor. Its code is byte-identical but for one change: `namespace sqlterm`
+becomes `namespace sentinelide`.
+
+src/host/win32/D2DEditor.cpp is DERIVED from that project's
+src/ui/SqlEditorControl.cpp rather than vendored: the device-resource lifecycle,
+clipboard, word selection, caret blink, IME positioning, surrogate-pair buffering
+and mouse-autoscroll code are carried over close to verbatim, while the layout,
+geometry and scrolling are written fresh, because SQLTerminal's editor word-wraps
+one whole-document text layout and a code editor must not. The provenance of each
+part is recorded in that file's header comment.
+
 
 Appcast format
 --------------
