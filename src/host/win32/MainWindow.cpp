@@ -25,6 +25,7 @@
 #include "host/win32/PasswordDialog.h"
 #include "host/win32/SaveChangesDialog.h"
 #include "host/win32/UpdateDialog.h"
+#include "host/win32/SingleInstance.h"
 #include "host/win32/Updater.h"
 
 #include <windows.h>
@@ -56,6 +57,8 @@ constexpr wchar_t kVersion[]   = SENTINEL_VERSION_DISPLAY_W;
 constexpr UINT WM_APP_LINE = WM_APP + 1;   // lParam = heap wchar_t* (UI frees)
 constexpr UINT WM_APP_DONE = WM_APP + 2;   // wParam = exit code
 constexpr UINT_PTR kUpdateOfferTimer = 1;   // retry the background update offer once no modal is up
+constexpr UINT_PTR kOpenPathTimer    = 2;   // retry an externally-delivered open once no modal is up
+constexpr UINT WM_APP_OPEN_PATH = WM_APP + 4;   // lParam = heap wchar_t* (UI frees): open this path
 constexpr UINT WM_APP_SIGN = WM_APP + 3;   // wParam = SignState, lParam = heap "file\tkey\tgrants" (UI frees)
 
 enum CtrlId : int { IDC_TREE = 2001, IDC_EDIT = 2002, IDC_OUT = 2003, IDC_PROBLEMS = 2004 };
@@ -94,6 +97,7 @@ struct AppState {
     int   target = 0;  // active build target (index into project.targets)
     std::wstring rootPath, curFilePath, curFileName, sncPath;
     std::wstring pendingUpdate;   // version offered by the background poll, held until no modal is up
+    std::wstring pendingOpenPath; // path handed in from outside (IPC / drag-drop), held until the UI is free
     std::wstring savedText;   // editor text as of the last load/save — the saved point undo can return to
     std::wstring statusLeft = L"Ln 1, Col 1", statusMsg = L"Open a folder to start", pendingMsg;
     std::vector<std::wstring> nodePaths;
@@ -1153,6 +1157,32 @@ void gotoLineCol(HWND hwnd, const std::wstring& file, int line, int col) {
     SendMessageW(g.hEdit, EM_SCROLLCARET, 0, 0); SetFocus(g.hEdit);
 }
 
+// Is it safe to open a window-modal dialog right now? IsWindowEnabled catches the seven
+// modals (they all EnableWindow(owner, FALSE)), but NOT a tracking popup menu: TrackPopupMenu
+// runs its own loop and leaves the owner enabled, so the ≡ menu, the tier ▾ / target ▾
+// dropdowns and the tree context menu would otherwise be interrupted mid-selection. Capture
+// (a splitter drag) is likewise a bad moment.
+bool uiIsBusy(HWND hwnd) {
+    if (!IsWindowEnabled(hwnd)) return true;
+    if (GetCapture() != nullptr) return true;
+    GUITHREADINFO gti{ sizeof(gti) };
+    if (GetGUIThreadInfo(GetCurrentThreadId(), &gti) &&
+        (gti.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE))) return true;
+    return false;
+}
+
+// The single entry point for a path arriving from OUTSIDE the UI: another instance handing
+// off its argv (WM_COPYDATA), or a file dropped on the window. It opens nothing itself —
+// it posts, so the work always happens on a clean stack in WndProc rather than inside
+// whatever loop delivered it. WM_COPYDATA in particular is a SENT message dispatched inside
+// every modal's null-filter GetMessageW while the sender blocks on it.
+void requestOpenPath(HWND hwnd, const std::wstring& path) {
+    if (path.empty()) return;
+    wchar_t full[MAX_PATH * 2] = L"";
+    if (!GetFullPathNameW(path.c_str(), MAX_PATH * 2, full, nullptr)) return;
+    PostMessageW(hwnd, WM_APP_OPEN_PATH, 0, (LPARAM)_wcsdup(full));
+}
+
 // Open a path given on the command line (or via a file-association double-click).
 // A folder opens directly; a file opens the nearest enclosing project (walk up to
 // a folder with a manifest, else its own folder). A manifest itself just opens the
@@ -1170,7 +1200,20 @@ void openPathArg(HWND hwnd, const std::wstring& arg) {
     std::wstring name = baseName(arg); size_t dot = name.find_last_of(L'.');
     bool isManifest = _wcsicmp(name.c_str(), L"sentinel.toml") == 0 ||
                       (dot != std::wstring::npos && _wcsicmp(name.c_str() + dot, L".sntproject") == 0);
+
+    // Already showing this project? Then this is a live instance being handed a file (IPC or
+    // drag-drop), and reloading the folder would needlessly rebuild the tree, reset the active
+    // target to 0 and bounce the sidebar view. Just open the file — through the GUARDED
+    // openFile, because unlike the reload path below nothing has prompted about the buffer yet.
+    if (g.folderOpen && _wcsicmp(root.c_str(), g.rootPath.c_str()) == 0) {
+        if (!isManifest) openFile(hwnd, arg);
+        return;
+    }
+
     if (!openFolderPath(hwnd, root)) return;   // cancelled — openFile would just ask again
+    // Unguarded on purpose: openFolderPath already prompted, and loadFolderPath has already
+    // replaced the buffer and reset g.savedText. Routing this through openFile would ask a
+    // second time about a file that is no longer open — phase 39 defect (i) in miniature.
     if (!isManifest) loadFileIntoEditor(hwnd, arg);
 }
 
@@ -1504,6 +1547,60 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_LBUTTONUP: if (g.dragV) { g.dragV = false; ReleaseCapture(); } return 0;
+    case WM_DROPFILES: {
+        HDROP drop = reinterpret_cast<HDROP>(wParam);
+        const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        // Only the first path: each open replaces the single editor buffer, so opening five
+        // dropped files would mean four guard prompts and only the last one surviving.
+        if (n > 0) {
+            const UINT len = DragQueryFileW(drop, 0, nullptr, 0);
+            std::wstring path(len + 1, 0);
+            if (DragQueryFileW(drop, 0, path.data(), len + 1)) {
+                path.resize(len);
+                requestOpenPath(hwnd, path);   // deferred + guarded, same as the IPC path
+            }
+        }
+        DragFinish(drop);
+        return 0;
+    }
+    case WM_COPYDATA: {
+        auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
+        if (!cds || cds->dwData != kCopyDataOpenPath) return 0;
+        // WM_COPYDATA is SENT — the other process is blocked on us, and its buffer is only
+        // valid until we return. Copy, acknowledge, and let requestOpenPath post the work so
+        // it never runs inside whatever loop delivered this (a modal's, for instance).
+        if (cds->cbData >= sizeof(wchar_t)) {
+            std::wstring path(reinterpret_cast<const wchar_t*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+            while (!path.empty() && path.back() == 0) path.pop_back();
+            if (!path.empty()) requestOpenPath(hwnd, path);
+        }
+        // Come to the front even for a bare second launch with no path.
+        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        return 1;   // non-zero: the sender takes this as "delivered"
+    }
+    case WM_APP_OPEN_PATH: {
+        wchar_t* p = reinterpret_cast<wchar_t*>(lParam);
+        if (p) { g.pendingOpenPath = p; free(p); }
+        if (g.pendingOpenPath.empty()) return 0;
+        // Mid-update-install the app is seconds from exiting; opening a file would race the
+        // auto-save in WM_CLOSE for no benefit.
+        if (updaterShutdownPending()) { g.pendingOpenPath.clear(); return 0; }
+        // Never act while a modal or a menu owns the UI — openPathArg can raise the
+        // unsaved-changes prompt, and a second modal over the first is the phase-41 defect.
+        if (uiIsBusy(hwnd)) { SetTimer(hwnd, kOpenPathTimer, 4000, nullptr); return 0; }
+        KillTimer(hwnd, kOpenPathTimer);
+        // Clear BEFORE opening: openPathArg can run a nested modal loop, which dispatches the
+        // retry timer, which would see a non-empty pending path and open the file twice.
+        const std::wstring path = g.pendingOpenPath;
+        g.pendingOpenPath.clear();
+        logMsg(LogLevel::Info, L"Opening externally-delivered path: " + path);
+        if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        openPathArg(hwnd, path);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
     case WM_APP_UPDATE_AVAILABLE: {
         // Our own appcast poll found something newer (WinSparkle's periodic check is off —
         // its prompt leads to the install path that does nothing). Offer it; accepting runs
@@ -1540,6 +1637,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_TIMER:
+        if (wParam == kOpenPathTimer) {
+            KillTimer(hwnd, kOpenPathTimer);
+            if (!g.pendingOpenPath.empty())
+                PostMessageW(hwnd, WM_APP_OPEN_PATH, 0, (LPARAM)_wcsdup(g.pendingOpenPath.c_str()));
+            return 0;
+        }
         if (wParam == kUpdateOfferTimer) {
             KillTimer(hwnd, kUpdateOfferTimer);
             if (!g.pendingUpdate.empty())
@@ -1780,6 +1883,7 @@ int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
     { UINT dpi = GetDpiForWindow(hwnd); SetWindowPos(hwnd, nullptr, 0, 0, MulDiv(1200, (int)dpi, 96), MulDiv(820, (int)dpi, 96), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
     applyWindowDarkMode(hwnd);
     applyMenuDarkMode();   // dark popup/context menus from first open
+    DragAcceptFiles(hwnd, TRUE);   // WM_DROPFILES → requestOpenPath (deferred + guarded)
     ShowWindow(hwnd, nCmdShow); UpdateWindow(hwnd);
 
     // Auto-update. Started after the window exists because WinSparkle's shutdown

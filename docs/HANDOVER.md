@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–41 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–42 built and verified.
 
 ---
 
@@ -178,7 +178,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–41 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–42 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -597,6 +597,44 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     launch always checks. `Later` means "ask again next launch" and the thread stops after one offer,
     so hourly polling never becomes hourly nagging; **Skip this version** is the durable no.
 
+42. **Single instance + drag-drop.** A double-click on an associated `.sentinel`/`.sntproject` used to
+    spawn a whole second IDE; now the second process hands its path to the running one and exits, and
+    files dropped on the window open too. Both converge on **one** deferred, guarded choke point:
+    `requestOpenPath` normalises the path and *posts* `WM_APP_OPEN_PATH`, and the handler opens
+    nothing while the UI is busy — it parks the path in `g.pendingOpenPath` and retries on a 4 s timer.
+    "Busy" is `uiIsBusy()`: `!IsWindowEnabled` (the seven modals) **plus** `GetCapture()` **plus**
+    `GUI_INMENUMODE|GUI_POPUPMENUMODE` — because `TrackPopupMenu` does **not** disable its owner, so
+    the phase-41 `IsWindowEnabled` test alone would let an open interrupt the ≡ menu or a tier ▾
+    dropdown mid-selection. The pending path is cleared **before** opening, or the nested modal loop
+    dispatches the retry timer and the file opens twice.
+    **Transport: named mutex + `WM_COPYDATA`, not a pipe.** One path, a single-UI-thread receiver, and
+    `SendMessageTimeoutW` gives a definite delivered/not-delivered answer for free where a pipe needs
+    an explicit ack and a whole connect/worker/ACL lifecycle. `WM_COPYDATA` is a *sent* message
+    dispatched inside every modal's null-filter `GetMessageW` while the sender blocks, so the handler
+    only copies, acknowledges and posts. **Drag-drop is `WM_DROPFILES`, not `IDropTarget`** — we never
+    need `DROPEFFECT`, non-file formats or drop highlighting, and `IDropTarget` would force
+    `CoInitializeEx` to become `OleInitialize` plus a COM object with revoke-before-destroy lifetime.
+    Only the first dropped file opens: each open replaces the single editor buffer, so five files
+    would mean four guard prompts and only the last surviving.
+    **Two environment traps cost most of the time here.** (i) `FindWindowW` returns **NULL** for
+    `SentinelIDEMainWindow` on this machine while `EnumWindows` finds that very window by that very
+    class name — so the lookup enumerates instead, which is wanted anyway to pick the right window when
+    a stray build is also running. (ii) **Comparing exe path *strings* is wrong on a mapped drive:**
+    `GetModuleFileNameW` reports the `G:` form while `QueryFullProcessImageNameW` reports the UNC
+    `\truenas.local\...` form for the same file, so the "is that window my build?" check rejected a
+    legitimate sibling and every hand-off silently fell back to a second window. It now compares
+    **file identity** (volume serial + file index via `GetFileInformationByHandle`), keeping the string
+    compare as a fast path.
+    The mutex is keyed on a hash of the lowercased exe path, so a dev build in `build\` and an
+    installed copy stay separate instances — without that, testing a local build would hand its argv to
+    whatever release the user has installed. Any failure falls through to a normal launch: an extra
+    window is a nuisance, a swallowed double-click is a bug. Only the **path** travels; `--settings`
+    and friends are ignored on a second launch, since honouring them would mean opening a modal in
+    response to an asynchronous message — exactly the phase-41 hazard.
+    **Verified:** a second launch with a different file leaves **one** process and opens the file in
+    the running instance; with unsaved edits it raises the unsaved-changes prompt rather than
+    discarding them; a synthesized `WM_DROPFILES` opens the dropped file. `ctest` 5/5.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -706,11 +744,8 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
   ~~per-target editing~~ (phase 22), ~~sign the built artifact~~ (phase 23), ~~recents + close project~~
   (phase 24), ~~sealed projects (password)~~ (phase 25), ~~file associations~~ (phase 26),
   ~~unsaved-changes guard~~ (phase 39) — all **done**.
-- **Single-instance / IPC:** a double-click (or a 2nd launch) currently spawns a new window; route the
-  path to an existing instance (named pipe / `WM_COPYDATA` to a `FindWindow` of the app class) so the
-  open project gains a file/tab instead. Also: drag-drop files onto the window; a shell "New ▸ Sentinel
-  Project" entry. **Unblocked now** — both swap the open file, and phase 39 landed the dirty-guard
-  they needed (`confirmSaveIfDirty`; route any new open through `openFile`, not `loadFileIntoEditor`).
+- ~~**Single-instance / IPC + drag-drop**~~ — **done, phase 42.** Still open from that bullet: a shell
+  "New ▸ Sentinel Project" entry, and honouring flags (not just the path) on a second launch.
 - **Unsaved-changes follow-ons** (guard shipped phase 39): ~~undo-to-original still leaves `●` set~~
   **fixed** — `g.dirty` is now a comparison against `g.savedText` (a snapshot taken at load and at
   save) rather than a one-way latch, so undoing back to the loaded *or* saved text clears the dot and
@@ -803,7 +838,7 @@ read the handover belongs in the handover body, not here._
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
-> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–41, Environment gotchas,
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–42, Environment gotchas,
 > the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not
