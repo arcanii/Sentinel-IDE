@@ -140,6 +140,18 @@ target_link_libraries(saveproject_test PRIVATE shell32 advapi32)
 set_target_properties(saveproject_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME saveproject COMMAND saveproject_test)
 
+# The pure text model behind the coming Direct2D editor (src/editor/EditorModel.*, vendored
+# from SQLTerminal-Win32). No Windows UI, so it is unit-testable before any pixel exists.
+# Case 10 is the load-bearing one: examples/crypto.sentinel is a COMMITTED SIGNED file that
+# opens by default and that Build auto-saves, so the model must round-trip it byte-for-byte
+# or saving would invalidate its .sig. The path is passed in so the test does not depend on
+# the working directory.
+#     cmake --build build --target editor_model_test  &&  build\editor_model_test.exe
+add_executable(editor_model_test tests/editor_model_test.cpp src/editor/EditorModel.cpp)
+target_include_directories(editor_model_test PRIVATE src)
+set_target_properties(editor_model_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME editor_model COMMAND editor_model_test "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel")
+
 # diag_xcheck / trust_xcheck — prove the Sentinel parsers stay byte-identical to the
 # C++ oracles they replaced. Only defined when the Sentinel lib was built; they link
 # the same parsers.lib + system libs the app does.

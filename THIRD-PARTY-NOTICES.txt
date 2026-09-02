@@ -47,6 +47,15 @@ dialog conventions, the tree/splitter handling, and the worker-thread build mode
 all originate there. This is why Sentinel-IDE is GPL-3.0-or-later rather than a
 more permissive licence.
 
+src/editor/EditorModel.{h,cpp} is VENDORED from that project (its
+src/editor/EditorModel.{h,cpp}) rather than merely derived from it: the pure,
+platform-free text model behind its Direct2D/DirectWrite editor. It is copied
+essentially verbatim, with one behavioural change and one addition, both marked in
+the source: the word-class predicate is Sentinel's `iswalnum(c) || c == '_'`
+instead of SQLTerminal's ASCII-only [A-Za-z0-9_], so word navigation agrees with
+Sentinel's own tokenizer; and `textCrlf()` was added for the on-disk CRLF form.
+Same author, same GPL-3.0 licence, so no licence conflict arises.
+
 
 Appcast format
 --------------

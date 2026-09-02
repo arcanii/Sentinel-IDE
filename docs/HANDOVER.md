@@ -725,9 +725,20 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     notification there means silently discarding a buffer. If it ever fires, the log says so at
     Error. (The design suggested a debug `assert`; that would be useless here — builds are Release
     with `NDEBUG` since phase 44, so it compiles to nothing. A log line is the detector that fires.)
-    **Remaining slices, in order:** 1(b–d) vendor `EditorModel` + a golden test asserting
-    `examples/crypto.sentinel` round-trips **byte-identically** (426 bytes, 12 CRLF — the test that
-    protects its committed `.sig`); 2 the no-wrap per-line D2D renderer with real horizontal scroll
+    **Slice 1(b–d) also landed.** `src/editor/EditorModel.{h,cpp}` is **vendored** from
+    SQLTerminal-Win32 (same author, same GPL-3.0; recorded in `THIRD-PARTY-NOTICES.txt`) with
+    exactly two changes, both marked at their site: the word-class predicate is Sentinel's
+    `iswalnum(c) || c == '_'` rather than SQLTerminal's ASCII-only `[A-Za-z0-9_]`, so word
+    navigation agrees with what `highlight()` calls an identifier — Sentinel sources really do carry
+    non-ASCII identifiers; and **`textCrlf()`** was added, the on-disk CRLF form that
+    `EM_GETTEXTEX`/`GT_USECRLF` will be built on so `saveFile` keeps working untouched against
+    either editor. `tests/editor_model_test.cpp` pins it with **39 assertions**, and
+    **`ctest` is now 8 tests**. The load-bearing one is case 10: it reads the real
+    `examples/crypto.sentinel` (426 bytes, 12 CRLF), `setText` → `textCrlf()`, and asserts the bytes
+    come back **identical** — because that file is a committed *signed* demo, opens by default, and
+    Build auto-saves it, so a CRLF slip would invalidate its `.sig` without anyone pressing Ctrl+S.
+    None of it is linked into the exe yet.
+    **Remaining slices, in order:** 2 the no-wrap per-line D2D renderer with real horizontal scroll
     (the widest-variance item, and mostly *not* ported — SQLTerminal's editor word-wraps); 3 the
     message dialect + the notification funnel + the `CreateWindowExW` switch, shipping default OFF;
     4 `computeSpans` + painted tints; 5 a full release of opt-in bake; 6 flip the default; 7 delete
