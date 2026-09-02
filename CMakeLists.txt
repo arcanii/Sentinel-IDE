@@ -129,6 +129,17 @@ target_link_libraries(seal_test PRIVATE bcrypt cabinet shell32 advapi32)
 set_target_properties(seal_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME seal_format COMMAND seal_test)
 
+# Characterization tests for Project.h::saveProject -- the comment-preserving manifest
+# WRITER, the last file-touching path still in C++. It had no coverage at all while being
+# the one piece of code that rewrites the user's manifest in place; these pin what it does
+# today so the planned Sentinel port has an oracle.
+#     cmake --build build --target saveproject_test  &&  build\saveproject_test.exe
+add_executable(saveproject_test tests/saveproject_test.cpp)
+target_include_directories(saveproject_test PRIVATE src/core src)
+target_link_libraries(saveproject_test PRIVATE shell32 advapi32)
+set_target_properties(saveproject_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME saveproject COMMAND saveproject_test)
+
 # diag_xcheck / trust_xcheck — prove the Sentinel parsers stay byte-identical to the
 # C++ oracles they replaced. Only defined when the Sentinel lib was built; they link
 # the same parsers.lib + system libs the app does.
