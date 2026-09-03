@@ -37,6 +37,10 @@ add_executable(SentinelIDE WIN32
   # than only into the EXCLUDE_FROM_ALL demo/test targets below.
   src/host/win32/D2DEditor.cpp
   src/editor/EditorModel.cpp
+  # Joined the exe in phase 46 slice 4: the syntax-colouring rules, lifted out of
+  # MainWindow.cpp::highlight() so BOTH editors run the same lexer. The RichEdit path turns
+  # its spans into EM_SETCHARFORMAT calls; the Direct2D control draws them.
+  src/editor/SyntaxLexer.cpp
   packaging/SentinelIDE.rc)
 
 # WinSparkle (auto-update) — vendored prebuilt DLL/lib/header, 0.9.3 official release
@@ -164,6 +168,20 @@ target_include_directories(editor_model_test PRIVATE src)
 set_target_properties(editor_model_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME editor_model COMMAND editor_model_test "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel")
 
+# syntax_lexer_test — the colouring rules on their own (phase 46 slice 4). They used to be
+# an inline loop inside MainWindow.cpp::highlight() with no coverage of any kind; they are
+# now src/editor/SyntaxLexer.{h,cpp} and BOTH editors run them, so a change here changes what
+# every user sees in both. Pure C++ — no Windows, no Direct2D — so it runs anywhere and fast.
+# The load-bearing cases are the ones that CROSS A LINE: a block comment and (per the rules
+# as they have always been) an unterminated string. The Direct2D control lexes one line at a
+# time from a cached start state, so "per-line == whole-buffer" is not a nicety, it is the
+# property that keeps the two editors showing the same file.
+#     cmake --build build --target syntax_lexer_test  &&  build\syntax_lexer_test.exe
+add_executable(syntax_lexer_test tests/syntax_lexer_test.cpp src/editor/SyntaxLexer.cpp)
+target_include_directories(syntax_lexer_test PRIVATE src)
+set_target_properties(syntax_lexer_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME syntax_lexer COMMAND syntax_lexer_test)
+
 # d2d_editor_demo — a standalone WIN32 host for src/host/win32/D2DEditor.cpp, the no-wrap
 # Direct2D editor control (phase 46 slice 2). NOT a ctest test: interactively it opens a
 # window. It exists because slice 2 deliberately does not touch MainWindow.cpp or the
@@ -190,7 +208,8 @@ add_test(NAME editor_model COMMAND editor_model_test "${CMAKE_CURRENT_SOURCE_DIR
 add_executable(d2d_editor_demo WIN32
   tests/d2d_editor_demo.cpp
   src/host/win32/D2DEditor.cpp
-  src/editor/EditorModel.cpp)
+  src/editor/EditorModel.cpp
+  src/editor/SyntaxLexer.cpp)
 target_include_directories(d2d_editor_demo PRIVATE src)
 # d2d1/dwrite: the renderer. imm32: IME composition-window placement. uxtheme+dwmapi:
 # Theme.h's SetWindowTheme (the scrollbars are the only non-D2D pixels) and the dark
@@ -203,16 +222,21 @@ set_target_properties(d2d_editor_demo PROPERTIES EXCLUDE_FROM_ALL TRUE)
 # rendering has. A CONSOLE app (unlike the demo) so ctest can read its output: it creates a
 # HIDDEN editor window, renders it offscreen through d2dEditorRenderToPng, decodes the PNG
 # back with WIC and asserts on actual pixels — background colour, a floor on the number of
-# non-background pixels, and proximity to Theme textPrimary. It fails if the control renders
-# a blank window. capture.ps1 can show you that too, but only if a human looks at the PNG and
-# only if a window is up; this runs headless in CI and ASSERTS, which is what slices 4-7 need.
+# non-background pixels, proximity to Theme textPrimary, and since phase 46 slice 4 the SYNTAX
+# COLOURS: all five Theme text colours present, on the right LINES (the bands are asked of the
+# control via EM_LINEINDEX + EM_POSFROMCHAR), plus the painted error-line tint. It fails if the
+# control renders a blank window, and it fails if the colouring regresses to monochrome —
+# deliberately two separate assertions, because a monochrome editor passes the first.
+# capture.ps1 can show you the same thing, but only with a window up and a human looking at
+# the PNG; this runs headless in CI and ASSERTS, which is what slices 4-7 need.
 # It SKIPS (printing why, exit 0) only when the machine cannot create a D2D/WIC target.
 #     cmake --build build --target d2d_render_test  &&  build\d2d_render_test.exe
 # The PNG is left at build/d2d_render.png on purpose — look at it.
 add_executable(d2d_render_test
   tests/d2d_render_test.cpp
   src/host/win32/D2DEditor.cpp
-  src/editor/EditorModel.cpp)
+  src/editor/EditorModel.cpp
+  src/editor/SyntaxLexer.cpp)
 target_include_directories(d2d_render_test PRIVATE src)
 target_link_libraries(d2d_render_test PRIVATE
   d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 advapi32)
@@ -230,14 +254,17 @@ add_test(NAME d2d_render COMMAND d2d_render_test
 # the same message shapes MainWindow.cpp sends. The two assertions it exists for: the golden
 # byte-identity round trip of examples/crypto.sentinel through saveFile's exact sequence, and
 # that EN_CHANGE is SYNCHRONOUS — a regression from SendMessageW to PostMessageW is failure
-# mode #1 for this migration and nothing else in the repo can see it.
+# mode #1 for this migration and nothing else in the repo can see it. Case 10 (slice 4) adds the
+# third: 65 characters typed WITH A REPAINT AFTER EACH must still be ONE undo step, which is the
+# whole reason the colouring paints instead of moving the selection.
 # It SKIPS (printing why, exit 0) only when the machine has no Direct2D/DirectWrite.
 # READ-ONLY on examples/: the golden path is opened GENERIC_READ and there is no write path.
 #     cmake --build build --target d2d_dialect_test  &&  build\d2d_dialect_test.exe
 add_executable(d2d_dialect_test
   tests/d2d_dialect_test.cpp
   src/host/win32/D2DEditor.cpp
-  src/editor/EditorModel.cpp)
+  src/editor/EditorModel.cpp
+  src/editor/SyntaxLexer.cpp)
 target_include_directories(d2d_dialect_test PRIVATE src)
 target_link_libraries(d2d_dialect_test PRIVATE
   d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 advapi32)

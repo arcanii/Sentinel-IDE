@@ -11,8 +11,13 @@
 // EN_CHANGE / EN_SELCHANGE / EN_VSCROLL / EN_HSCROLL funnel, and linked the control into
 // the Sentinel-IDE exe behind ONE CreateWindowExW in createControls, DEFAULT OFF
 // ([editor] d2d in settings.ini, or --d2d-editor / --richedit for one run).
-//   - no syntax colouring — slice 4. Plain single-colour text is correct here, and
-//     EM_SETCHARFORMAT with SCF_SELECTION is a deliberate no-op until then.
+// SLICE 4 added syntax colouring and the error-line tints, both PAINTED: the rules come
+// from src/editor/SyntaxLexer.h (the same unit the RichEdit path uses, so the two editors
+// cannot disagree about a file), and drawContent draws each coloured run by clipping the
+// ONE per-line layout — never IDWriteTextLayout::SetDrawingEffect, which would make the
+// shared, device-loss-surviving layout cache device-bound. EM_SETCHARFORMAT with
+// SCF_SELECTION stays a permanent no-op: the host does not send it to this control,
+// because its cost is undo granularity rather than pixels.
 // tests/d2d_editor_demo.cpp remains a standalone host for driving it without the IDE.
 //
 // WHY NOT THE REFERENCE'S SHAPE. SQLTerminal's SqlEditorControl builds ONE
@@ -28,6 +33,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 namespace sentinelide {
 
@@ -57,6 +63,21 @@ void d2dEditorApplyTheme(HWND edit);
 void d2dEditorUpdateDpi(HWND edit, UINT dpi);
 // Change the typeface/size (slice 3 wires this to Settings::editorFont).
 void d2dEditorSetFont(HWND edit, const wchar_t* face, float pointSize);
+
+// Which lines carry a build diagnostic, 0-BASED (the EM_LINEINDEX index space, i.e. the
+// host's `d.line - 1`). The control paints a band behind them in
+// blendColor(windowBg, diagError, 24) — the same colour RichEdit's CFM_BACKCOLOR tint
+// uses. An EMPTY vector clears them; that is clearErrorMarks' whole implementation here.
+//
+// WHY THIS EXISTS AT ALL rather than the host just sending EM_SETCHARFORMAT. The RichEdit
+// tint is applied by SELECTING each line and setting a character background, once per
+// diagnostic, immediately after a build. On this control that would reach
+// EditorModel::setSelection and clear typingRun_, so the next character typed would start
+// its own undo step — a user-visible regression bought for a background colour. Decoration
+// the control paints itself has no such coupling, and the host keeps its g.errorMarks
+// bookkeeping either way. (Duplicates are tolerated and sorted out here; two diagnostics on
+// one line is normal.)
+void d2dEditorSetErrorLines(HWND edit, const std::vector<int>& lines0Based);
 
 // ---- offscreen render (how this control's output is TESTED) -----------------
 // Renders the control's current view into a WIC bitmap the same size as its client

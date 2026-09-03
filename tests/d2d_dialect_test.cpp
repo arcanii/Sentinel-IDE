@@ -751,6 +751,72 @@ int main(int argc, char** argv) {
         check(got == 1 && one == L"a", "...and fetches back as exactly that character");
     }
 
+    // ---------------------------------------------------------------------------
+    printf("\n10. UNDO GRANULARITY survives slice 4's colouring and error tints\n");
+    {
+        // THE regression this exists to catch, and the reason the whole slice is shaped the
+        // way it is. RichEdit is coloured by SELECTING each token and setting a character
+        // format — ~500 EM_EXSETSELs per keystroke — and the error tints do the same thing
+        // once per diagnostic. On this control every one of those reaches
+        // EditorModel::setSelection, which clears typingRun_, and insertText only coalesces
+        // while that is still set. So a colouring scheme built on the selection would turn a
+        // typed word into one undo step PER CHARACTER, each pushing a whole-document
+        // snapshot, and with kMaxUndo = 200 the history would collapse to the last 200
+        // characters typed. Slice 4 therefore colours by PAINTING and tints by PAINTING.
+        //
+        // This measures the actual number rather than asserting the design.
+        const int kChars = 60;
+        SetWindowTextW(edit, L"");  // also clears the undo stack, as WM_SETTEXT must
+        for (int i = 0; i < kChars; ++i) {
+            SendMessageW(edit, WM_CHAR, static_cast<WPARAM>(L'a' + (i % 26)), 1);
+            // Every keystroke in the real app is followed by a repaint, and the repaint is
+            // where the colouring runs. Skipping it would measure a path nobody executes.
+            SendMessageW(edit, WM_PAINT, 0, 0);
+        }
+        // ...and a build lands in the middle of it. This is markErrorLines' whole
+        // implementation on this control; if it moved the selection, the run would break
+        // here and the count below would be 2, not 1.
+        std::vector<int> errLines;
+        errLines.push_back(0);
+        sentinelide::d2dEditorSetErrorLines(edit, errLines);
+        SendMessageW(edit, WM_PAINT, 0, 0);
+        for (int i = 0; i < 5; ++i) {
+            SendMessageW(edit, WM_CHAR, static_cast<WPARAM>(L'z'), 1);
+            SendMessageW(edit, WM_PAINT, 0, 0);
+        }
+        sentinelide::d2dEditorSetErrorLines(edit, std::vector<int>());
+
+        check(lengthEx(edit, GTL_NUMCHARS) == kChars + 5, "65 characters went in");
+        int steps = 0;
+        while (SendMessageW(edit, EM_CANUNDO, 0, 0) != 0 && steps < 200) {
+            SendMessageW(edit, EM_UNDO, 0, 0);
+            ++steps;
+        }
+        printf("     65 characters typed (with a repaint after each, and an error-tint set\n"
+               "     and cleared partway) = %d undo step(s)\n", steps);
+        check(steps == 1, "ONE undo step for the whole run - colouring did not break it");
+        check(lengthEx(edit, GTL_NUMCHARS) == 0, "and that one undo emptied the document");
+
+        // The other half of the claim, so the number above means something: do the SAME
+        // thing with a selection move between keystrokes — which is exactly what
+        // applyColor/applyBackColor do — and watch it fall apart. This is why highlight(),
+        // clearErrorMarks and markErrorLines are gated off this control rather than being
+        // left to be "a no-op that costs nothing".
+        SetWindowTextW(edit, L"");
+        for (int i = 0; i < kChars; ++i) {
+            SendMessageW(edit, WM_CHAR, static_cast<WPARAM>(L'a' + (i % 26)), 1);
+            setSel(edit, 0, 1);  // stand-in for applyColor's EM_EXSETSEL
+        }
+        int stormSteps = 0;
+        while (SendMessageW(edit, EM_CANUNDO, 0, 0) != 0 && stormSteps < 200) {
+            SendMessageW(edit, EM_UNDO, 0, 0);
+            ++stormSteps;
+        }
+        printf("     the same 60 characters WITH an EM_EXSETSEL between each = %d undo step(s)\n",
+               stormSteps);
+        check(stormSteps >= 10, "a selection-based highlighter really would shatter the run");
+    }
+
     DestroyWindow(edit);
     DestroyWindow(host);
 

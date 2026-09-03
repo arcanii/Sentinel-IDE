@@ -724,7 +724,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     separately — `snc verify` against a one-byte-flipped `.sig` exits non-zero, which is what makes
     `verifyFile` return `Invalid`.
 
-46. **Direct2D editor — designed, and the safety net landed (slice 1a of ~8-11 sessions).** The
+46. **Direct2D editor — slices 1-4 of ~8-11 sessions landed; it is in the exe, DEFAULT OFF.** The
     editor replacement is the largest remaining item and is genuinely multi-session, so it was
     designed before any code moved: three strategies proposed independently (parallel control,
     model-first, render-first), judged on regression risk / effort / how early something ships, then
@@ -863,8 +863,108 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     **Known difference, accepted:** dragging TEXT within the editor does nothing (RichEdit
     supports it). Dropping a FILE is fine — it falls through to the main window's handler, which
     is guarded by `confirmSaveIfDirty`.
+    **SLICE 4 LANDED — syntax colouring and the error tints, both PAINTED.** The rules moved out
+    of `MainWindow.cpp::highlight()` into **`src/editor/SyntaxLexer.{h,cpp}`** — pure, no Windows,
+    no `COLORREF` — exposing `computeSpans(text, len, LexState&, out)` with an explicit
+    line-start STATE, plus `advanceState` (the same scan with the spans thrown away) and
+    `isKeyword`. **Both editors now run it**: `highlight()` still paints
+    `applyColor(0, -1, textPrimary)` first and then one `applyColor` per span, so its call
+    sequence is unchanged, and slice 7 deletes only the consumer. Pinned by
+    **`ctest -R syntax_lexer` (89 assertions)**; **ctest is now 11 tests** (the brief said 12; 10
+    + 1 is 11).
+    **The extraction is provably behaviour-preserving on the RichEdit path.** HEAD's inline loop
+    was pasted into a throwaway harness with `applyColor(...)` replaced by `emit(...)`, and its
+    `(start, end, class)` sequence compared against `computeSpans` over every `.sentinel` file in
+    the repo *in the lone-CR form `editorText()` actually returns* plus 29 adversarial literals:
+    **33 cases, 0 mismatches**, including `parsers.sentinel` at **2,600 identical `applyColor`
+    calls**. That is a stronger claim than "it looks the same", and it is the only reason to
+    believe a refactor of a 45-phase-old hand lexer.
+    **HOW THE COLOUR IS APPLIED, and the two rules it must not break.** (1) **Never
+    `SetDrawingEffect`** — a drawing effect is a BRUSH, i.e. device-bound, and the per-line layout
+    cache is shared with the offscreen WIC target and survives device loss precisely because it
+    holds none. `drawContent` instead draws **the SAME one layout once per coloured run inside a
+    `PushAxisAlignedClip`** over that run's x-range, `D2D1_ANTIALIAS_MODE_ALIASED` so adjacent
+    runs share a boundary x, round to the same pixel and tile exactly. Same layout every time
+    means identical shaping, so painting and hit-testing cannot drift; the OUTER edges of a line
+    open out to the client edge so glyph ink that overhangs its advance width is not shaved. A
+    line with no spans takes the old single unclipped `DrawTextLayout`. (2) **Never colour by
+    moving the selection** — `applyColor`/`applyBackColor`'s `EM_EXSETSEL` reaches
+    `EditorModel::setSelection`, clears `typingRun_` and makes every keystroke its own undo step.
+    So **`highlight()`'s `g.d2dEditor` early-out is PERMANENT**, and this handover's own
+    prediction that slice 4 would delete all three gate lines was **wrong**: `markErrorLines`'
+    branch was *replaced* (as written), `clearErrorMarks`' became a one-line
+    `d2dEditorSetErrorLines(g.hEdit, {})`, and `highlight()`'s stays until slice 7 takes the
+    whole function.
+    **Two defects review caught in slice 4's own first cut, both fixed before it landed, both
+    worth knowing because they are the shape of mistake this migration keeps making.**
+    (a) `d2dEditorRenderToPng` parked THREE brushes; slice 4 had added five more to
+    `createBrushes` and `releaseBrushes` and missed the park. An offscreen render therefore
+    destroyed the window's five new brushes while the window still owned them, after which
+    `brushForClass` returned null, `drawRun` fell back to `brText`, and the live editor painted
+    **monochrome for the rest of its life** — no crash, no leak, nothing to see. Three places
+    had to agree about one set and one of them was updated by hand. All eight brushes now live
+    in an `EditorState::Brushes` struct, so park/restore is a struct copy that cannot omit a
+    member. **Do not flatten it back into loose fields.**
+    (b) `errorLines` holds ABSOLUTE line numbers and `setTextInternal` did not clear them, so
+    opening a clean file after a failed build painted red bands at the old file's line numbers
+    — and `loadFileIntoEditor` sets `g.errorMarks = false` without calling `clearErrorMarks`,
+    so no later keystroke could clear them either; only the next build. RichEdit cannot have
+    this bug (its tint is a `CFM_BACKCOLOR` character format that dies with the text). Painted
+    decoration has to be told: `setTextInternal` now clears them, which covers both
+    `loadFileIntoEditor` and `closeProject` since both go through `WM_SETTEXT`.
+    Also fixed: the per-run clip bounded **y** to the line box as well as x, so on lines that
+    happened to contain a span, glyph ink overhanging the box (accented and CJK identifiers —
+    which the lexer's own comment says Sentinel sources really carry) was shaved. Only x needs
+    bounding. And `syntax_lexer_test` only ever resumed a string with `"`, so a lexer that
+    hardcoded the double quote on resume passed 89/89; a mirror case resuming inside `'…'`
+    over a line containing `"` now catches it (verified against that exact injected fault).
+    **The tints are decoration**: `d2dEditorSetErrorLines(HWND, const std::vector<int>&)`
+    (0-based, empty clears), painted as a full-client-width band behind the text in
+    `blendColor(windowBg, diagError, 24)` — the *same* colour, now computed from **one copy of
+    `blendColor`, moved to `Theme.h`** so the two editors cannot tint differently. `g.errorMarks`
+    is honest again (`= !lines.empty()`). The band is deliberately full-width where RichEdit's
+    `CFM_BACKCOLOR` stops at the last character.
+    **NOT re-lexing per keystroke.** `EditorState` gained a per-line **lexer start-state prefix
+    cache** (`lineLexState` + `lexStateKnown`) beside `lineStarts`, and `rebuildLineIndex` — the
+    one place the text is known to have changed — only ever *lowers* the watermark, to the line
+    containing the first character that actually differs. It finds that line by `memcmp` against
+    `prevText`, a kept copy of the buffer. **The obvious cheap alternative, "invalidate from the
+    caret's line", is WRONG** for a paste over a multi-line selection (the caret lands below the
+    first changed line) and for undo (which can change anything), and a stale colouring cache is
+    a bug you only see on someone else's file. The painter also writes each line's out-state
+    forward, so a visible line is lexed once per paint, not twice.
+    **Measured**, driving the real control through the real dialect on a **20,041-line / 1.7 MB**
+    buffer, 100 keystrokes each with a repaint, against the slice-3 binary on the same harness:
+    typing on **line 1** 0.91 → **1.44 ms/keystroke**; on **line 19,000** 0.87 → **1.75**; the
+    one-off cold jump to line 19,000 (which lexes lines 0..19,000) 0.74 → **3.17 ms**. So the
+    cache is worth **~2.4 ms per keystroke** at line 19,000 and the `prevText` `memcmp` + copy it
+    rides on costs **~0.38 ms** there and **~0.07 ms** at line 1. Note which half is which:
+    the `memcmp` stops at the first difference, so it really is ~0 when you type at the top,
+    but the `prevText = text` copy is UNCONDITIONAL and O(document) wherever you type — an
+    earlier note here said "~0 at line 1" and was measuring only the compare. It also doubles
+    the resident size of the document, which is small beside EditorModel's 200 whole-document
+    undo snapshots but is not nothing.
+    O(document) per edit: the `'\n'` scan (pre-existing), the `memcmp`, the copy. O(visible):
+    everything else — layouts, `computeSpans`, the draws.
+    **`ctest -R d2d_render` now asserts on COLOUR (38 assertions, was 16).** All five Theme text
+    colours must be present with >= 25 attributed pixels each, and on the right LINES — bands
+    asked of the control through `EM_LINEINDEX` + `EM_POSFROMCHAR`, never hard-coded. A pixel is
+    attributed to the nearest of the five within 12 units; one honest limitation is written at
+    the site: in the dark theme `synComment` is very nearly a 70%-covered `synNumber` over the
+    background, so a partly-covered digit can be counted as a comment pixel — never the reverse,
+    which is why the only absence assertions sit on lines with no numbers. Case 7 sets an error
+    line, asserts the band is exactly the tint, that the syntax colours still show through it,
+    and that clearing returns the image **byte-identically** to the untinted render.
+    **Verified by negative control**: brush selection forced to `brText`, rebuilt, `d2d_render`
+    → **12 failures, exit 1** (`ctest` exit 8) — and note that **case 4 still PASSED** at 23,603
+    inked pixels, which is exactly the split that was wanted: a monochrome editor satisfies "text
+    was drawn" and fails "the editor is not monochrome". Reverted; `git diff` clean.
+    **Undo granularity is pinned, not asserted** — `d2d_dialect` case 10 (the file is now 101
+    assertions): 65 characters typed **with a repaint after each** and an error tint set and
+    cleared partway = **1 undo step**; the same 60 characters with an `EM_EXSETSEL` between them
+    = **60 undo steps**. The second half is what makes the first half mean something.
     **Remaining slices, in order:**
-    4 `computeSpans` + painted tints; 5 a full release of opt-in bake; 6 flip the default; 7 delete
+    5 a full release of opt-in bake; 6 flip the default; 7 delete
     the RichEdit path (the *editor* path only — `msftedit.dll`, `MSFTEDIT_CLASS` for `g.hOut` and
     the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all survive).
     **Slice 6's acceptance list, banked now:** dropping a file onto the editor AREA (RichEdit
@@ -1151,7 +1251,8 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Targets follow-ons (remaining):** per-target `lib_paths`; a definable output dir; add/remove
   `[[target]]` blocks from the form (today it edits existing blocks' name/entry/type in place).
 - **Undo/redo follow-up:** track the saved point so undo-to-clean clears `●`; toolbar button hover states.
-- **The Direct2D editor** — **designed + slice 1(a) landed, see phase 46**; dark **title-bar menu bar**; a
+- **The Direct2D editor** — **slices 1-4 landed (colouring included), opt-in and DEFAULT OFF; slices 5-7
+  remain, see phase 46**; dark **title-bar menu bar**; a
   project-templates picker (lib/exe/multi-target) for New Project.
 - **Reconcile the spines/PRD** to ADR-0061 signing + the project/tier model (un-park PRD work).
 

@@ -113,6 +113,18 @@ inline const Theme& currentTheme() {
     return useDark ? dark : light;
 }
 
+// pct% of b mixed over a. Lives here rather than in MainWindow.cpp (where it was born, and
+// where its only caller was the error-line tint) because phase 46 slice 4 gave that tint a
+// SECOND producer: the Direct2D control paints it as decoration while RichEdit sets it as a
+// character background. Both must land on the same pixel or the two editors tint
+// differently, so there is one copy of the arithmetic and no room to drift.
+inline COLORREF blendColor(COLORREF a, COLORREF b, int pct) {
+    const int ia = 100 - pct;
+    return RGB((GetRValue(a) * ia + GetRValue(b) * pct) / 100,
+               (GetGValue(a) * ia + GetGValue(b) * pct) / 100,
+               (GetBValue(a) * ia + GetBValue(b) * pct) / 100);
+}
+
 // Scale a 96-dpi design value to a window's DPI.
 inline int dpiScale(int v, UINT dpi) { return MulDiv(v, static_cast<int>(dpi), 96); }
 

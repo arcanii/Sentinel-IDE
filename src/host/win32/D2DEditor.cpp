@@ -31,11 +31,22 @@
 // MainWindow can drive this control with (almost) no feature branches. See "the RichEdit
 // dialect" section in D2DEditorProc below, and the funnel just above drawContent.
 //
-// NOT IN THIS SLICE: syntax colouring (slice 4). Plain single-colour text is correct here,
-// and EM_SETCHARFORMAT/SCF_SELECTION is deliberately a no-op until then. One quiet benefit
-// of that: with no per-span SetDrawingEffect, the per-line layouts hold no brushes, so they
-// are purely device-independent and SURVIVE device loss — unlike the reference's layout,
-// which had to be rebuilt whenever the brushes were recreated.
+// ADDED IN SLICE 4: syntax colouring and the error-line tints, both as PAINTED DECORATION.
+// Two rules govern how, and both are load-bearing rather than stylistic:
+//
+//   1. NEVER IDWriteTextLayout::SetDrawingEffect. A drawing effect is a BRUSH, i.e. a
+//      device resource, and the per-line layout cache is shared between the window's
+//      ID2D1HwndRenderTarget and the offscreen WIC target AND survives device loss
+//      precisely because it holds none. drawContent therefore colours by DRAWING: the same
+//      one layout is drawn once per coloured run inside an axis-aligned clip covering that
+//      run's x-range. Same layout every time means identical shaping and identical advance
+//      widths, so painting and hit-testing cannot drift apart.
+//   2. NEVER colour by moving the selection. That is RichEdit's EM_EXSETSEL storm, which
+//      reaches EditorModel::setSelection, clears typingRun_ and would make every keystroke
+//      its own undo step. Nothing in the colouring path touches the model at all.
+//
+// The rules themselves are NOT here: they live in src/editor/SyntaxLexer.{h,cpp}, which the
+// RichEdit path calls too, so the two editors cannot disagree about a file.
 #include "host/win32/D2DEditor.h"
 
 #include <windowsx.h>
@@ -63,6 +74,7 @@
 #include <vector>
 
 #include "editor/EditorModel.h"
+#include "editor/SyntaxLexer.h"
 #include "host/win32/D2DSupport.h"
 #include "host/win32/Theme.h"
 
@@ -115,9 +127,30 @@ struct EditorState {
     // double-release, i.e. a use-after-free on the next paint.
     ID2D1RenderTarget* rt = nullptr;
     ID2D1HwndRenderTarget* hwndRt = nullptr;
-    ID2D1SolidColorBrush* brText = nullptr;
-    ID2D1SolidColorBrush* brSelection = nullptr;
-    ID2D1SolidColorBrush* brCaret = nullptr;
+    // EVERY device-bound brush lives in ONE struct, and that is load-bearing rather than
+    // tidy. Three places must agree about the whole set — createBrushes, releaseBrushes, and
+    // d2dEditorRenderToPng's park-and-restore — and when the members were loose fields, slice
+    // 4 added five brushes to the first two and MISSED THE THIRD. The result was silent: an
+    // offscreen render destroyed the window's five new brushes while the window still owned
+    // them, brushForClass then returned null, drawRun fell back to brText, and the live
+    // editor painted MONOCHROME for the rest of its life with no crash and no leak. Grouped
+    // like this, park/restore is a struct copy that cannot omit a member, so adding a brush
+    // is one line in one place. Do not flatten this back out.
+    struct Brushes {
+        ID2D1SolidColorBrush* text = nullptr;
+        ID2D1SolidColorBrush* selection = nullptr;
+        ID2D1SolidColorBrush* caret = nullptr;
+        // Slice 4. One brush per SpanClass plus the error-line tint. They are DEVICE
+        // resources and live and die with the target, exactly like the three above — which
+        // is the whole reason the colours are applied by DRAWING rather than by hanging them
+        // off the (device-independent, cross-target, device-loss-surviving) layout cache.
+        ID2D1SolidColorBrush* comment = nullptr;
+        ID2D1SolidColorBrush* str = nullptr;
+        ID2D1SolidColorBrush* number = nullptr;
+        ID2D1SolidColorBrush* keyword = nullptr;
+        ID2D1SolidColorBrush* errorTint = nullptr;
+    };
+    Brushes br;
 
     // Device-independent text resources.
     IDWriteTextFormat* format = nullptr;
@@ -134,6 +167,39 @@ struct EditorState {
     // buffer we already own.
     std::vector<size_t> lineStarts;
     bool linesDirty = true;
+
+    // ---- the per-line lexer start-state cache (slice 4) ---------------------
+    // lineLexState[i] is the SyntaxLexer state at the first character of line i, so a
+    // visible line can be coloured on its own without lexing the document in front of it.
+    // It is a PREFIX cache: entries [0, lexStateKnown) are valid, lexStateKnown >= 1, and
+    // lineLexState[0] is always the default (start of document).
+    //
+    // WHY A PREFIX AND NOT A FULL REBUILD. Painting needs the state of the FIRST VISIBLE
+    // line, so a cache thrown away on every edit would re-lex everything above the caret on
+    // every keystroke — 19,000 lines if you are typing at line 19,000, which is the one
+    // cost this cache exists to remove. Instead rebuildLineIndex only ever *lowers* the
+    // watermark, to the line the edit actually touched, so an edit below the watermark
+    // costs no lexing at all and an edit above it costs the visible window.
+    std::vector<editor::LexState> lineLexState;
+    size_t lexStateKnown = 0;
+
+    // The document as it was when the line index was last rebuilt, kept ONLY to find the
+    // first character an edit changed (see rebuildLineIndex). One memcmp + one copy of the
+    // buffer per edit, which is the same order as the '\n' scan in that same function and
+    // the two full-document passes MainWindow::onEditChanged already makes per keystroke —
+    // and far cheaper than the re-lex it buys away. Deriving the edit position from the
+    // caret instead would be free, but wrong for paste-over-a-selection and undo, and a
+    // stale colouring cache is a bug you only see on someone else's file.
+    std::wstring prevText;
+
+    // Scratch for drawContent's per-line spans. A member, not a local, so painting 40 lines
+    // reuses one allocation instead of making 40.
+    std::vector<editor::Span> spanScratch;
+
+    // Lines (0-based) to tint as errors, sorted and unique. The host sets this from
+    // g.problems after a build; it is DECORATION — no selection is moved and no character
+    // format exists, which is exactly what keeps undo granularity intact around a build.
+    std::vector<int> errorLines;
 
     // ---- the per-line layout cache -----------------------------------------
     // lineLayouts is parallel to lineStarts and is almost entirely nullptr: 8 bytes a
@@ -268,9 +334,14 @@ void ensureFormat(EditorState* st) {
 // ---- brushes ----------------------------------------------------------------
 
 void releaseBrushes(EditorState* st) {
-    SafeRelease(st->brText);
-    SafeRelease(st->brSelection);
-    SafeRelease(st->brCaret);
+    SafeRelease(st->br.text);
+    SafeRelease(st->br.selection);
+    SafeRelease(st->br.caret);
+    SafeRelease(st->br.comment);
+    SafeRelease(st->br.str);
+    SafeRelease(st->br.number);
+    SafeRelease(st->br.keyword);
+    SafeRelease(st->br.errorTint);
 }
 
 // Returns false if any brush failed, so paint never runs with a partially-null set.
@@ -279,10 +350,36 @@ bool createBrushes(EditorState* st) {
     if (!st->rt) return false;
     const Theme& th = currentTheme();
     bool ok = true;
-    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.textPrimary), &st->brText));
-    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.selectionBg), &st->brSelection));
-    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.textPrimary), &st->brCaret));
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.textPrimary), &st->br.text));
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.selectionBg), &st->br.selection));
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.textPrimary), &st->br.caret));
+    // Slice 4. The syntax palette is the SAME Theme the RichEdit path colours with, read
+    // here rather than passed in by the host, so a light/dark flip repaints correctly with
+    // no host call — d2dEditorApplyTheme and WM_THEMECHANGED both land in this function.
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.synComment), &st->br.comment));
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.synString), &st->br.str));
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.synNumber), &st->br.number));
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(colorToD2D(th.synKeyword), &st->br.keyword));
+    // The error-line band. blendColor lives in Theme.h so this and markErrorLines'
+    // RichEdit branch are literally the same arithmetic on the same two tokens — the tint
+    // must not change when the editor does, since slice 6 flips which one you see.
+    ok &= SUCCEEDED(st->rt->CreateSolidColorBrush(
+        colorToD2D(blendColor(th.windowBg, th.diagError, 24)), &st->br.errorTint));
     return ok;
+}
+
+// The brush for a span class. Default is the ordinary text brush, which is why
+// SpanClass::Default is never emitted by the lexer and is synthesised by the painter for
+// the gaps between spans.
+ID2D1SolidColorBrush* brushForClass(EditorState* st, editor::SpanClass cls) {
+    switch (cls) {
+        case editor::SpanClass::Comment: return st->br.comment;
+        case editor::SpanClass::String:  return st->br.str;
+        case editor::SpanClass::Number:  return st->br.number;
+        case editor::SpanClass::Keyword: return st->br.keyword;
+        case editor::SpanClass::Default: break;
+    }
+    return st->br.text;
 }
 
 // ---- device resources (carried over from the reference) ---------------------
@@ -320,7 +417,8 @@ bool ensureDeviceResources(EditorState* st) {
         return false;
     }
     // NOTE: unlike the reference, the layouts are NOT invalidated here. They carry no
-    // drawing effects (no colouring until slice 4), so losing the device does not
+    // drawing effects — slice 4's colouring is applied by DRAWING each run with a
+    // different brush, never by SetDrawingEffect — so losing the device does not
     // invalidate a single one of them.
     return true;
 }
@@ -344,6 +442,41 @@ void rebuildLineIndex(EditorState* st) {
     }
     st->lineLayouts.assign(st->lineStarts.size(), nullptr);
     st->linesDirty = false;
+
+    // ---- and the lexer start-state cache, which is invalidated HERE and nowhere else ---
+    // The state at the start of line L depends only on text[0, lineStarts[L]), so every
+    // cached entry up to and including the line that contains the first CHANGED character
+    // is still exactly right. Find that character by comparing against the buffer as it was
+    // last time through here; everything from there down is dropped and re-lexed lazily.
+    //
+    // This is the whole reason typing at line 19,000 of a 20,000-line file does not re-lex
+    // 19,000 lines: the watermark stays at 19,000, and the visible window is above it.
+    // Doing it in this one function is deliberate — it is the single place the text is
+    // known to have changed, so no mutation path (paste, undo, WM_SETTEXT, a future one)
+    // can forget to invalidate. TRAP: the obvious cheap alternative, "invalidate from the
+    // caret's line", is WRONG for a paste over a multi-line selection (the caret ends below
+    // the first changed line) and for undo (which can change anything).
+    const size_t lim = (std::min)(st->prevText.size(), t.size());
+    size_t firstDiff = 0;
+    while (firstDiff < lim && st->prevText[firstDiff] == t[firstDiff]) ++firstDiff;
+    // Equal prefixes and equal lengths means nothing changed at all (an "edit" that
+    // replaced text with itself); anything else changed at firstDiff.
+    const bool identical = (firstDiff == lim && st->prevText.size() == t.size());
+    st->prevText = t;
+
+    st->lineLexState.resize(st->lineStarts.size());
+    if (st->lineLexState.empty()) st->lineLexState.push_back(editor::LexState{});
+    st->lineLexState[0] = editor::LexState{};
+    if (st->lexStateKnown < 1) st->lexStateKnown = 1;
+    if (!identical) {
+        // upper_bound - 1, the same arithmetic lineIndexForOffset uses; written out
+        // because lineIndexForOffset is defined below this function.
+        const auto it =
+            std::upper_bound(st->lineStarts.begin(), st->lineStarts.end(), firstDiff);
+        const size_t changedLine = static_cast<size_t>(it - st->lineStarts.begin()) - 1;
+        st->lexStateKnown = (std::min)(st->lexStateKnown, changedLine + 1);
+    }
+    st->lexStateKnown = (std::min)(st->lexStateKnown, st->lineLexState.size());
 }
 
 void ensureLineIndex(EditorState* st) {
@@ -360,6 +493,36 @@ size_t lineEndOffset(EditorState* st, size_t i) {
 size_t lineIndexForOffset(EditorState* st, size_t off) {
     const auto it = std::upper_bound(st->lineStarts.begin(), st->lineStarts.end(), off);
     return static_cast<size_t>(it - st->lineStarts.begin()) - 1;  // lineStarts[0] == 0
+}
+
+// The lexer state at the first character of line i, extending the prefix cache as far as
+// it has to and no further. THE COST MODEL, in one place:
+//   * a cache HIT (the usual case while typing, because rebuildLineIndex only lowers the
+//     watermark to the edited line) is a vector index — O(1);
+//   * a MISS costs one pass of advanceState over the lines between the watermark and i,
+//     which happens when you scroll into territory this document has not been coloured in
+//     yet, or type ABOVE the window. Typing on line 1 of a 20,000-line file drops the
+//     watermark to 1 and the next paint re-lexes only the ~40 lines it is about to draw.
+// Nothing here allocates: advanceState is the span-free half of the same lexer.
+const editor::LexState& lineStartState(EditorState* st, size_t i) {
+    ensureLineIndex(st);
+    if (st->lexStateKnown < 1) {  // ensureLineIndex always leaves this >= 1; belt and braces
+        st->lineLexState.resize((std::max<size_t>)(1, st->lineStarts.size()));
+        st->lineLexState[0] = editor::LexState{};
+        st->lexStateKnown = 1;
+    }
+    const std::wstring& t = st->model.text();
+    while (st->lexStateKnown <= i && st->lexStateKnown < st->lineStarts.size()) {
+        const size_t prev = st->lexStateKnown - 1;
+        editor::LexState s = st->lineLexState[prev];
+        const size_t a = st->lineStarts[prev];
+        const size_t b = lineEndOffset(st, prev);  // excludes the '\n', as the lexer expects
+        editor::advanceState(t.c_str() + a, b - a, s);
+        st->lineLexState[st->lexStateKnown] = s;
+        ++st->lexStateKnown;
+    }
+    const size_t k = (i < st->lineLexState.size()) ? i : 0;
+    return st->lineLexState[k];
 }
 
 // ---- the per-line layout cache ---------------------------------------------
@@ -693,7 +856,7 @@ void flushViewNotifications(EditorState* st) {
 //
 // Caller's contract: between BeginDraw and EndDraw, with the line index already current
 // (ensureLineIndex) and the scroll clamped. The BRUSHES still come from `st`, so `rt` and
-// st->brText/brSelection/brCaret must belong to the same device — d2dEditorRenderToPng
+// st->br.text/brSelection/brCaret must belong to the same device — d2dEditorRenderToPng
 // swaps the whole set together for exactly that reason.
 void drawContent(EditorState* st, ID2D1RenderTarget* rt) {
     const Theme& th = currentTheme();
@@ -704,12 +867,13 @@ void drawContent(EditorState* st, ID2D1RenderTarget* rt) {
     const float ox = static_cast<float>(dpx(st, kInsetX) - st->scrollX);
     const float oy = static_cast<float>(dpx(st, kInsetY) - st->scrollY);
     const float lh = (std::max)(1.0f, st->lineH);
+    const float viewW = static_cast<float>(clientW(st));
 
     size_t first = 0, last = 0;
     visibleRange(st, first, last);
     const editor::Selection sel = st->model.selection();
 
-    if (!st->brText) return;
+    if (!st->br.text) return;
     for (size_t i = first; i <= last; ++i) {
         IDWriteTextLayout* layout = layoutForLine(st, i);
         if (!layout) continue;
@@ -717,27 +881,84 @@ void drawContent(EditorState* st, ID2D1RenderTarget* rt) {
         const size_t a = st->lineStarts[i];
         const size_t b = lineEndOffset(st, i);
 
+        // Error-line tint (slice 4), BEHIND everything else on the line. The band spans the
+        // full client width, where RichEdit's CFM_BACKCOLOR only reaches as far as the
+        // line's characters do — a deliberate difference (a band is what a code editor
+        // draws), on the identical colour, which is the part that must not drift.
+        if (st->br.errorTint && !st->errorLines.empty() &&
+            std::binary_search(st->errorLines.begin(), st->errorLines.end(),
+                               static_cast<int>(i))) {
+            rt->FillRectangle(D2D1::RectF(0.0f, y, viewW, y + lh), st->br.errorTint);
+        }
+
         // Selection band for this line's slice of the selection. A selection that runs
         // THROUGH the line break gets a trailing stub so a selected empty line is still
         // visible — otherwise it would be a zero-width rectangle.
-        if (!sel.empty() && st->brSelection && sel.max() > a && sel.min() <= b) {
+        if (!sel.empty() && st->br.selection && sel.max() > a && sel.min() <= b) {
             const size_t sa = (std::max)(sel.min(), a);
             const size_t sb = (std::min)(sel.max(), b);
             float x1 = xInLine(st, i, sa);
             float x2 = xInLine(st, i, sb);
             if (sel.max() > b) x2 += st->spaceW;
-            if (x2 > x1) rt->FillRectangle(D2D1::RectF(ox + x1, y, ox + x2, y + lh), st->brSelection);
+            if (x2 > x1) rt->FillRectangle(D2D1::RectF(ox + x1, y, ox + x2, y + lh), st->br.selection);
         }
 
-        rt->DrawTextLayout(D2D1::Point2F(ox, y), layout, st->brText, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        // ---- syntax colouring (slice 4) --------------------------------------
+        // ONE layout, drawn once per coloured run inside a clip covering that run's
+        // x-range. Read the two rules at the top of this file before changing any of it:
+        // no SetDrawingEffect (the layout must stay device-independent), and the same
+        // layout for every run so painting and hit-testing share one set of advance widths
+        // — a second, per-run layout could shape differently and drift the caret off the
+        // glyphs. The clip is ALIASED so adjacent runs, which share a boundary x, round to
+        // the same pixel and tile exactly: no seam and no double-drawn glyph edge.
+        const std::wstring& t = st->model.text();
+        const size_t n = b - a;
+        editor::LexState ls = lineStartState(st, i);
+        editor::computeSpans(t.c_str() + a, n, ls, st->spanScratch);
+        // `ls` now holds the state for line i + 1 — hand it to the cache so the next
+        // visible line is a hit instead of re-lexing this one to find the same answer.
+        if (st->lexStateKnown == i + 1 && i + 1 < st->lineLexState.size()) {
+            st->lineLexState[i + 1] = ls;
+            st->lexStateKnown = i + 2;
+        }
+
+        const auto drawRun = [&](size_t from, size_t to, editor::SpanClass cls) {
+            if (to <= from) return;
+            ID2D1SolidColorBrush* br = brushForClass(st, cls);
+            if (!br) br = st->br.text;
+            if (from == 0 && to == n) {  // the whole line is one colour — no clip needed
+                rt->DrawTextLayout(D2D1::Point2F(ox, y), layout, br, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                return;
+            }
+            const float rx1 = ox + xInLine(st, i, a + from);
+            const float rx2 = ox + xInLine(st, i, a + to);
+            if (rx2 <= 0.0f || rx1 >= viewW) return;  // this run is off-screen; skip the draw
+            // The OUTER edges open out to the client edge so a glyph whose ink overhangs
+            // its advance width is not shaved at the start or end of the line. Interior
+            // boundaries stay exact, because that is where two runs meet.
+            const float x1 = (from == 0) ? 0.0f : rx1;
+            const float x2 = (to == n) ? viewW : rx2;
+            rt->PushAxisAlignedClip(D2D1::RectF(x1, 0.0f, x2, static_cast<float>(clientH(st))), D2D1_ANTIALIAS_MODE_ALIASED);
+            rt->DrawTextLayout(D2D1::Point2F(ox, y), layout, br, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            rt->PopAxisAlignedClip();
+        };
+
+        size_t pos = 0;
+        for (const editor::Span& sp : st->spanScratch) {
+            drawRun(pos, sp.begin, editor::SpanClass::Default);  // the gap before it
+            drawRun(sp.begin, sp.end, sp.cls);
+            pos = sp.end;
+        }
+        drawRun(pos, n, editor::SpanClass::Default);  // ...and the tail (the whole line if
+                                                     // there were no spans at all)
     }
 
-    if (st->hasFocus && st->caretOn && st->brCaret) {
+    if (st->hasFocus && st->caretOn && st->br.caret) {
         const size_t cl = lineIndexForOffset(st, st->model.caret());
         const float cx = ox + xInLine(st, cl, st->model.caret());
         const float cy = oy + static_cast<float>(cl) * lh;
         const float w = static_cast<float>((std::max)(1, dpx(st, 1)));
-        rt->FillRectangle(D2D1::RectF(cx, cy, cx + w, cy + lh), st->brCaret);
+        rt->FillRectangle(D2D1::RectF(cx, cy, cx + w, cy + lh), st->br.caret);
     }
 }
 
@@ -769,6 +990,14 @@ void paint(EditorState* st) {
         // Slice 3 (a change notification) and slice 4 (a highlighter callback) are precisely
         // the changes that can break this; re-check it then. No assert: builds are Release
         // with NDEBUG since phase 44, so an assert here would compile to nothing.
+        //
+        // RE-CHECKED FOR SLICE 4, and it still holds. The colouring added two calls inside
+        // the loop and NEITHER can rebuild the index: lineStartState calls ensureLineIndex,
+        // which is a no-op while linesDirty is false (it is — set only by afterEdit, and no
+        // edit can arrive mid-paint), and then only reads model.text() and writes the
+        // lineLexState prefix; computeSpans is pure and touches no D2D or DWrite object at
+        // all. The colouring is also the one thing here that must NEVER call back into the
+        // model, which is why the lexer takes a (pointer, length) rather than the control.
         //
         // RE-CHECKED FOR SLICE 3, and it still holds, for two reasons that must both stay
         // true. (a) The funnel never fires from inside paint: notifyChanged is only called
@@ -871,6 +1100,13 @@ void setTextInternal(EditorState* st, const std::wstring& s) {
     st->scrollY = 0;
     st->pendingHigh = 0;
     st->maxLineW = 0;  // every measured width belongs to the old document
+    // ERROR TINTS DIE WITH THE DOCUMENT. errorLines holds ABSOLUTE line numbers, so leaving
+    // them across a whole-document replacement paints red bands at those line numbers in an
+    // innocent file — and MainWindow's loadFileIntoEditor sets g.errorMarks = false without
+    // calling clearErrorMarks, so nothing downstream could ever clear them either; only the
+    // next build would. RichEdit cannot have this bug: its tint is a CFM_BACKCOLOR character
+    // format, so it dies with the text automatically. Painted decoration has to be told.
+    st->errorLines.clear();
     afterEdit(st);
 }
 
@@ -1642,9 +1878,12 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case EM_SETCHARFORMAT: {
             if (wParam != SCF_ALL) {
                 // SCF_SELECTION is the ~500-calls-per-keystroke colouring path (applyColor
-                // :516) and the error tints (applyBackColor :529). SLICE 4 replaces both
-                // with computeSpans() + painted decoration; until then this is a no-op that
-                // reports success. Nobody checks the return.
+                // :516) and the error tints (applyBackColor :529). SLICE 4 REPLACED BOTH —
+                // colouring is computeSpans() in drawContent and the tints are
+                // d2dEditorSetErrorLines — so this stays a no-op that reports success, and
+                // permanently: the host gates both of those paths off this control rather
+                // than sending them, because the storm's real cost is undo granularity, not
+                // pixels. Nobody checks the return.
                 //
                 // It must NOT raise EN_CHANGE, unlike RichEdit — a deliberate divergence.
                 // Formatting changes no text and g.dirty is a pure comparison over text, so
@@ -1799,7 +2038,26 @@ void d2dEditorApplyTheme(HWND edit) {
     if (st->rt) {
         if (!createBrushes(st)) discardDeviceResources(st);  // recreate cleanly on next paint
     }
-    // No layout invalidation: the layouts carry no colour (slice 4 changes that).
+    // No layout invalidation, and slice 4 did NOT change that — it is the point. The
+    // syntax palette lives in the BRUSHES, which are recreated on the line above; the
+    // layouts still carry no colour of their own, so a theme flip repaints without
+    // reshaping a single line (and the offscreen/device-loss sharing survives).
+    InvalidateRect(edit, nullptr, FALSE);
+}
+
+void d2dEditorSetErrorLines(HWND edit, const std::vector<int>& lines0Based) {
+    EditorState* st = state(edit);
+    if (!st) return;
+    // Painted DECORATION, and that is the entire design. RichEdit tints error lines with
+    // EM_EXSETSEL + EM_SETCHARFORMAT/CFM_BACKCOLOR, once per diagnostic, right after a
+    // build — which reaches EditorModel::setSelection, clears typingRun_ and would make the
+    // next character its own undo step, at exactly the moment someone starts typing again.
+    // Nothing here touches the model, the selection or the undo stack: the host says which
+    // lines, drawContent paints a band, and clearing is the same call with an empty vector.
+    st->errorLines = lines0Based;
+    std::sort(st->errorLines.begin(), st->errorLines.end());
+    st->errorLines.erase(std::unique(st->errorLines.begin(), st->errorLines.end()),
+                         st->errorLines.end());
     InvalidateRect(edit, nullptr, FALSE);
 }
 
@@ -1884,39 +2142,37 @@ bool d2dEditorRenderToPng(HWND edit, const wchar_t* outPath) {
             // put the original back VERBATIM — nothing is released except the temporaries, so
             // the live window still paints afterwards with exactly the resources it had.
             ID2D1RenderTarget* const savedRt = st->rt;
-            ID2D1SolidColorBrush* const savedText = st->brText;
-            ID2D1SolidColorBrush* const savedSel = st->brSelection;
-            ID2D1SolidColorBrush* const savedCaret = st->brCaret;
+            const EditorState::Brushes saved = st->br;   // the WHOLE set, by value
             st->rt = rt;
-            st->brText = nullptr;  // createBrushes releases through these; null so the parked
-            st->brSelection = nullptr;  // set is NOT what gets freed
-            st->brCaret = nullptr;
+            st->br = EditorState::Brushes{};  // createBrushes releases through these; cleared
+                                              // so the parked set is NOT what gets freed
 
             if (createBrushes(st)) {
                 // Same preconditions paint() establishes before its BeginDraw.
                 ensureLineIndex(st);
                 clampScroll(st);
                 // WHY THE LAYOUT CACHE CAN BE SHARED ACROSS TWO DEVICES: the per-line
-                // IDWriteTextLayouts carry no drawing effects (no SetDrawingEffect — there is
-                // no colouring until slice 4), so they hold no brushes and are purely
-                // device-INDEPENDENT. That is the whole reason this function can reuse the
-                // window's cache instead of building a parallel one.
-                // SLICE 4 MUST KEEP THAT TRUE. The moment a highlighter attaches brushes to a
-                // layout via SetDrawingEffect, every cached layout becomes device-bound, this
-                // sharing becomes a cross-device draw, and both this path and the device-loss
-                // path (which likewise does not invalidate layouts) break together. If
-                // colouring cannot be done with per-line DrawTextLayout ranges alone, the
-                // effects must be applied per target, not baked into the cache.
+                // IDWriteTextLayouts carry no drawing effects (no SetDrawingEffect), so they
+                // hold no brushes and are purely device-INDEPENDENT. That is the whole reason
+                // this function can reuse the window's cache instead of building a parallel
+                // one.
+                // SLICE 4 KEPT THAT TRUE, and it is the reason its colouring is shaped the
+                // way it is: drawContent draws the SAME layout once per coloured run under an
+                // axis-aligned clip, with the brush chosen per run, so every brush belongs to
+                // whichever target is drawing and nothing device-bound is ever attached to a
+                // cached layout. The moment someone "simplifies" that to SetDrawingEffect,
+                // every cached layout becomes device-bound, this sharing becomes a
+                // cross-device draw, and both this path and the device-loss path (which
+                // likewise does not invalidate layouts) break together — with this test being
+                // the only thing that would notice.
                 rt->BeginDraw();
                 drawContent(st, rt);
                 drawn = SUCCEEDED(rt->EndDraw());
             }
 
-            releaseBrushes(st);  // the temporaries only — the parked set was nulled above
+            releaseBrushes(st);  // the temporaries only — the parked set was cleared above
             st->rt = savedRt;
-            st->brText = savedText;
-            st->brSelection = savedSel;
-            st->brCaret = savedCaret;
+            st->br = saved;
         }
     }
 

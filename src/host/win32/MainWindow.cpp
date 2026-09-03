@@ -28,6 +28,8 @@
 #include "host/win32/SingleInstance.h"
 #include "host/win32/Updater.h"
 #include "host/win32/D2DEditor.h"   // the opt-in Direct2D editor (phase 46 slice 3)
+#include "editor/SyntaxLexer.h"     // the shared colouring rules (phase 46 slice 4) — the
+                                    // ONE copy, so the two editors cannot disagree
 
 #include <windows.h>
 #include <windowsx.h>
@@ -501,17 +503,20 @@ void onPaint(HWND hwnd) {
 }
 
 // ---- syntax highlighting --------------------------------------------------
-const std::unordered_set<std::wstring>& keywords() {
-    static const std::unordered_set<std::wstring> k = {
-        L"fn",L"let",L"mut",L"const",L"static",L"return",L"if",L"else",L"for",L"while",
-        L"loop",L"match",L"struct",L"enum",L"impl",L"trait",L"pub",L"use",L"mod",L"type",
-        L"as",L"in",L"break",L"continue",L"true",L"false",L"self",L"Self",L"where",L"move",
-        L"ref",L"async",L"await",L"unsafe",L"extern",L"crate",L"super",L"dyn",
-        L"secret",L"effect",L"effects",L"borrow",L"capability",L"cap",L"declassify",
-        L"u8",L"u16",L"u32",L"u64",L"usize",L"i8",L"i16",L"i32",L"i64",L"isize",
-        L"f32",L"f64",L"bool",L"char",L"str",L"void",
-    };
-    return k;
+// The RULES are not here any more. Phase 46 slice 4 lifted them into
+// src/editor/SyntaxLexer.{h,cpp} — pure, unit-tested, and shared with the Direct2D
+// control, which colours by DRAWING the same spans. This file keeps only the RichEdit
+// half: turn a span into an EM_SETCHARFORMAT. At slice 7 that half is deleted and the
+// lexer does not change at all.
+COLORREF colorForSpan(const Theme& th, editor::SpanClass cls) {
+    switch (cls) {
+        case editor::SpanClass::Comment: return th.synComment;
+        case editor::SpanClass::String:  return th.synString;
+        case editor::SpanClass::Number:  return th.synNumber;
+        case editor::SpanClass::Keyword: return th.synKeyword;
+        case editor::SpanClass::Default: break;
+    }
+    return th.textPrimary;
 }
 void applyColor(HWND h, LONG a, LONG b, COLORREF color, bool withFont) {
     CHARRANGE cr{ a, b }; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&cr);
@@ -519,12 +524,9 @@ void applyColor(HWND h, LONG a, LONG b, COLORREF color, bool withFont) {
     if (withFont) { cf.dwMask |= CFM_FACE | CFM_SIZE; cf.yHeight = 11 * 20; wcscpy_s(cf.szFaceName, g.settings.editorFont.c_str()); }
     SendMessageW(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
 }
-COLORREF blendColor(COLORREF a, COLORREF b, int pct) {  // pct% of b mixed over a
-    int ia = 100 - pct;
-    return RGB((GetRValue(a) * ia + GetRValue(b) * pct) / 100,
-               (GetGValue(a) * ia + GetGValue(b) * pct) / 100,
-               (GetBValue(a) * ia + GetBValue(b) * pct) / 100);
-}
+// blendColor moved to Theme.h in phase 46 slice 4 — the Direct2D control needs the SAME
+// arithmetic for its painted error band, and two copies of a tint formula is exactly how
+// the two editors would end up tinting differently.
 // Set the character background of [a,b) (b=-1 → to end). Used for error-line tints.
 void applyBackColor(LONG a, LONG b, COLORREF color) {
     CHARRANGE save; SendMessageW(g.hEdit, EM_EXGETSEL, 0, (LPARAM)&save);
@@ -549,16 +551,16 @@ std::wstring editorText() {
 }
 void highlight() {
     if (g.highlighting || !g.hEdit) return;
-    // d2d: SLICE 4 DELETES THIS LINE, when computeSpans() colours by drawing ranges instead.
-    // Until then every EM_SETCHARFORMAT below is a no-op on that control, so the loop is
-    // ~500 pointless round-trips per keystroke — but the real reason for the early-out is
-    // undo, not cost. applyColor's EM_EXSETSEL reaches EditorModel::setSelection, which
-    // clears typingRun_; insertText only coalesces while that is still set. Running this on
-    // every EN_CHANGE would therefore make EVERY KEYSTROKE ITS OWN UNDO STEP, each pushing a
-    // whole-document snapshot, and with kMaxUndo = 200 the history would collapse to the
-    // last 200 characters. That is a user-visible regression at slice 6, so it is bought now
-    // for one line. (Slice 4's rule, from the same root: colour by drawing ranges, NEVER by
-    // moving the selection.)
+    // d2d: THIS EARLY-OUT IS PERMANENT — slice 4 did not delete it, and the handover's
+    // prediction that it would was wrong. The Direct2D control colours itself, in
+    // drawContent, from the SAME editor::computeSpans called below; there is nothing here
+    // for it to do. And the storm below must never run against it whatever the pixels look
+    // like, because its real cost is UNDO: applyColor's EM_EXSETSEL reaches
+    // EditorModel::setSelection, which clears typingRun_, and insertText only coalesces
+    // while that is still set. On every EN_CHANGE that makes EVERY KEYSTROKE ITS OWN UNDO
+    // STEP, each pushing a whole-document snapshot, and with kMaxUndo = 200 the history
+    // collapses to the last 200 characters. Slice 7 deletes the rest of this function; this
+    // line goes with it, not before it.
     if (g.d2dEditor) return;
     g.highlighting = true;
     suspendUndo();   // keep the re-colorize off the native undo stack
@@ -566,16 +568,14 @@ void highlight() {
     std::wstring s = editorText();
     CHARRANGE save; SendMessageW(g.hEdit, EM_EXGETSEL, 0, (LPARAM)&save);
     SendMessageW(g.hEdit, WM_SETREDRAW, FALSE, 0);
+    // Paint everything the ordinary text colour first (and the font, which is what the
+    // `withFont` arm is for), then override only the spans the lexer returned. That is the
+    // same two-pass shape this had inline, so the call sequence RichEdit sees is unchanged
+    // — the refactor is meant to be invisible on this path.
     applyColor(g.hEdit, 0, -1, th.textPrimary, true);
-    LONG i = 0, len = (LONG)s.size();
-    while (i < len) {
-        wchar_t c = s[i];
-        if (c == L'/' && i + 1 < len && s[i + 1] == L'/') { LONG j = i; while (j < len && s[j] != L'\r' && s[j] != L'\n') j++; applyColor(g.hEdit, i, j, th.synComment, false); i = j; continue; }
-        if (c == L'/' && i + 1 < len && s[i + 1] == L'*') { LONG j = i + 2; while (j + 1 < len && !(s[j] == L'*' && s[j + 1] == L'/')) j++; j = (j + 2 <= len) ? j + 2 : len; applyColor(g.hEdit, i, j, th.synComment, false); i = j; continue; }
-        if (c == L'"' || c == L'\'') { wchar_t q = c; LONG j = i + 1; while (j < len && s[j] != q) { if (s[j] == L'\\' && j + 1 < len) j += 2; else j++; } if (j < len) j++; applyColor(g.hEdit, i, j, th.synString, false); i = j; continue; }
-        if (iswdigit(c)) { LONG j = i; while (j < len && (iswalnum(s[j]) || s[j] == L'.' || s[j] == L'_')) j++; applyColor(g.hEdit, i, j, th.synNumber, false); i = j; continue; }
-        if (iswalpha(c) || c == L'_') { LONG j = i; while (j < len && (iswalnum(s[j]) || s[j] == L'_')) j++; if (keywords().count(s.substr(i, j - i))) applyColor(g.hEdit, i, j, th.synKeyword, false); i = j; continue; }
-        i++;
+    editor::LexState ls;   // start of document
+    for (const editor::Span& sp : editor::computeSpans(s, ls)) {
+        applyColor(g.hEdit, (LONG)sp.begin, (LONG)sp.end, colorForSpan(th, sp.cls), false);
     }
     SendMessageW(g.hEdit, EM_EXSETSEL, 0, (LPARAM)&save);
     SendMessageW(g.hEdit, WM_SETREDRAW, TRUE, 0);
@@ -591,15 +591,16 @@ std::wstring dirName(const std::wstring& p) { size_t s = p.find_last_of(L"\\/");
 // ---- error-line highlight + edit tracking ---------------------------------
 void clearErrorMarks() {
     if (!g.errorMarks || !g.hEdit) return;
-    // d2d: GATED FOR THE SAME REASON AS highlight(), and this was the inconsistency slice 3
-    // shipped with. applyBackColor has the identical EM_EXGETSEL / EM_EXSETSEL /
-    // EM_SETCHARFORMAT / EM_EXSETSEL shape as applyColor, so it reaches
-    // EditorModel::setSelection just the same, clears typingRun_ and collapses undo
-    // granularity — quietly, around every build, which is when it runs. Gating it costs
-    // nothing on that control because the tint it clears was never drawn: SCF_SELECTION is a
-    // no-op there until slice 4. The state line stays OUTSIDE the branch — g.errorMarks must
-    // still go false or onEditChanged calls this on every keystroke forever.
-    if (!g.d2dEditor) {
+    // d2d: the tints are painted DECORATION on that control, so clearing them is one call
+    // that moves no selection — which is the point. applyBackColor has the identical
+    // EM_EXGETSEL / EM_EXSETSEL / EM_SETCHARFORMAT / EM_EXSETSEL shape as applyColor, so it
+    // reaches EditorModel::setSelection just the same, clears typingRun_ and collapses undo
+    // granularity — quietly, around every build, which is exactly when it runs. The state
+    // line stays OUTSIDE the branch — g.errorMarks must still go false or onEditChanged
+    // calls this on every keystroke forever.
+    if (g.d2dEditor) {
+        d2dEditorSetErrorLines(g.hEdit, {});   // empty == clear; it invalidates itself
+    } else {
         g.highlighting = true;   // suppress the EN_CHANGE that EM_SETCHARFORMAT raises
         suspendUndo();           // ...and keep the tint clear off the native undo stack
         SendMessageW(g.hEdit, WM_SETREDRAW, FALSE, 0);
@@ -614,20 +615,28 @@ void clearErrorMarks() {
 // Tint the lines that have diagnostics in the open file (after a build).
 void markErrorLines(HWND hwnd) {
     if (!g.hEdit || !g.fileOpen) return;
-    // d2d: same gate, same reason (see clearErrorMarks and highlight()) — applyBackColor's
-    // EM_EXSETSEL storm would clear typingRun_ once per diagnostic, and it fires right after
-    // a build, i.e. exactly where someone is about to keep typing. g.errorMarks := false is
-    // the honest bookkeeping, not a shortcut: nothing was tinted, so there is nothing for
-    // clearErrorMarks to undo later. The gutter invalidate is editor-agnostic (the Problems
-    // list just changed) and is kept. SLICE 4 REPLACES THIS BRANCH, not deletes it: the tints
-    // come back as painted decoration driven off g.problems, never off the selection.
+    const Theme& th = currentTheme();
+    COLORREF tint = blendColor(th.windowBg, th.diagError, 24);
+    // d2d: SLICE 4 REPLACED THIS BRANCH rather than deleting it. The tints are back, as
+    // painted decoration driven off g.problems — the control is TOLD which lines and paints
+    // a band itself, so no selection moves and undo granularity survives a build, which is
+    // the moment someone is most likely to keep typing. The line arithmetic is deliberately
+    // the same EM_GETLINECOUNT/`d.line - 1` shape as the RichEdit branch below, and the
+    // colour is literally the same `tint` above (the control recomputes it from Theme so a
+    // light/dark flip repaints without a host call — see createBrushes).
     if (g.d2dEditor) {
-        g.errorMarks = false;
+        std::vector<int> lines;
+        LONG total = (LONG)SendMessageW(g.hEdit, EM_GETLINECOUNT, 0, 0);
+        for (auto& d : g.problems) {
+            if (_wcsicmp(baseName(d.file).c_str(), g.curFileName.c_str()) != 0) continue;
+            LONG ln = d.line - 1; if (ln < 0 || ln >= total) continue;
+            lines.push_back((int)ln);
+        }
+        g.errorMarks = !lines.empty();   // honest again: something really was tinted
+        d2dEditorSetErrorLines(g.hEdit, lines);
         if (g.lineNumbers) InvalidateRect(hwnd, &g.rGutter, FALSE);
         return;
     }
-    const Theme& th = currentTheme();
-    COLORREF tint = blendColor(th.windowBg, th.diagError, 24);
     g.highlighting = true;   // suppress the EN_CHANGE that EM_SETCHARFORMAT raises
     suspendUndo();           // ...and keep the tinting off the native undo stack
     SendMessageW(g.hEdit, WM_SETREDRAW, FALSE, 0);
