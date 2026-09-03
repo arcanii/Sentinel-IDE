@@ -916,6 +916,55 @@ int main(int argc, char** argv) {
         check(caretOwner() != edit, "kill-focus destroyed it - a caret is a per-THREAD object");
     }
 
+    // ---- 12 -----------------------------------------------------------------
+    // A MONITOR MOVE RESCALES THE CONTROL. This was on slice 6's acceptance list as
+    // "verify, do not assume", and it had been measured exactly once, by hand, in a session
+    // transcript -- which is this project's signature defect wearing a different hat. It is
+    // a test now.
+    //
+    // Child windows NEVER receive WM_DPICHANGED: it goes to the top-level window only, so
+    // the control cannot learn about a monitor move by itself and MainWindow forwards it
+    // (MainWindow.cpp:2015, inside WM_DPICHANGED, before SetWindowPos/layout so the metrics
+    // are already rescaled when the resize arrives). If that forward is ever dropped, the
+    // em-size, lineH, spaceW and the layout cache all stay at the old scale -- and the
+    // line-number gutter, which reads EM_POSFROMCHAR, follows them into the wrong scale, so
+    // the numbers drift off their lines. Assert the RATIO, not the pixels: the pitch is a
+    // float and the font's own rounding is not ours to predict.
+    printf("\n12. a DPI change rescales the control's metrics (the gutter reads these)\n");
+    {
+        auto posFromChar = [](HWND e, LONG off) -> POINTL {
+            POINTL p{ -9999, -9999 };
+            SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, static_cast<LPARAM>(off));
+            return p;
+        };
+        struct { UINT dpi; LONG pitch; } m[3] = { {96, 0}, {144, 0}, {192, 0} };
+        for (auto& e : m) {
+            sentinelide::d2dEditorUpdateDpi(edit, e.dpi);
+            e.pitch = posFromChar(edit, lineIndex(edit, 3)).y -
+                      posFromChar(edit, lineIndex(edit, 2)).y;
+            printf("     %u dpi -> line pitch %ld px\n", e.dpi, e.pitch);
+        }
+        check(m[0].pitch > 0 && m[1].pitch > 0 && m[2].pitch > 0,
+              "every scale reports a usable line pitch");
+        check(m[1].pitch > m[0].pitch && m[2].pitch > m[1].pitch,
+              "the pitch GROWS with DPI - metrics really were rebuilt");
+        // 96 -> 144 is x1.5 and 96 -> 192 is x2. Allow a generous band: what must not
+        // happen is the pitch staying put (a dropped forward) or scaling by the wrong
+        // factor (a partial rebuild).
+        const double r15 = (double)m[1].pitch / (double)m[0].pitch;
+        const double r20 = (double)m[2].pitch / (double)m[0].pitch;
+        printf("     ratios: 144/96 = %.3f (want ~1.5), 192/96 = %.3f (want ~2.0)\n", r15, r20);
+        check(r15 > 1.35 && r15 < 1.65, "144 dpi is ~1.5x the 96 dpi pitch");
+        check(r20 > 1.85 && r20 < 2.15, "192 dpi is ~2.0x the 96 dpi pitch");
+
+        // Back to where we started, and the metrics must come back with us -- a rescale
+        // that only works one way would leave a laptop wrong after unplugging a monitor.
+        sentinelide::d2dEditorUpdateDpi(edit, 96);
+        const LONG back = posFromChar(edit, lineIndex(edit, 3)).y -
+                          posFromChar(edit, lineIndex(edit, 2)).y;
+        check(back == m[0].pitch, "returning to 96 dpi restores the original pitch exactly");
+    }
+
     DestroyWindow(edit);
     DestroyWindow(host);
 
