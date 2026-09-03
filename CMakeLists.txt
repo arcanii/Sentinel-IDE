@@ -31,6 +31,12 @@ add_executable(SentinelIDE WIN32
   src/host/win32/SaveChangesDialog.cpp
   src/host/win32/UpdateDialog.cpp
   src/host/win32/Updater.cpp
+  # Joined the exe in phase 46 slice 3, behind the single CreateWindowExW in
+  # createControls ([editor] d2d, DEFAULT OFF). This is the first time these two are
+  # compiled as part of BUILD_OK — Release /MT with NDEBUG, /W4 /permissive- — rather
+  # than only into the EXCLUDE_FROM_ALL demo/test targets below.
+  src/host/win32/D2DEditor.cpp
+  src/editor/EditorModel.cpp
   packaging/SentinelIDE.rc)
 
 # WinSparkle (auto-update) — vendored prebuilt DLL/lib/header, 0.9.3 official release
@@ -92,7 +98,13 @@ set_target_properties(SentinelIDE PROPERTIES OUTPUT_NAME "Sentinel-IDE")
 
 target_include_directories(SentinelIDE PRIVATE src "${SENTINEL_GENERATED_DIR}")
 target_link_libraries(SentinelIDE PRIVATE
-  comctl32 dwmapi uxtheme gdi32 user32 shell32 ole32 bcrypt cabinet advapi32 wininet)
+  comctl32 dwmapi uxtheme gdi32 user32 shell32 ole32 bcrypt cabinet advapi32 wininet
+  # D2DEditor.cpp (slice 3): d2d1+dwrite the renderer, imm32 the IME composition window,
+  # windowscodecs the offscreen PNG path. windowscodecs is kept even though only the test
+  # calls d2dEditorRenderToPng — WindowsCodecs.dll is present on every supported Windows,
+  # and #ifdef-ing it out would mean the shipping binary and the tested binary differ in
+  # exactly the file this slice is about.
+  d2d1 dwrite imm32 windowscodecs)
 
 # Sentinel-native parsers (src/sentinel/parsers.sentinel — the diagnostic + trust
 # parsers). scripts\build.bat compiles them to build/generated/parsers.lib via
@@ -163,12 +175,18 @@ add_test(NAME editor_model COMMAND editor_model_test "${CMAKE_CURRENT_SOURCE_DIR
 #     build\d2d_editor_demo.exe [file]     (default examples\crypto.sentinel, READ-ONLY)
 #     build\d2d_editor_demo.exe --render out.png [file]     (headless; exit 0 == wrote it)
 #     powershell -File scripts\capture.ps1 -Class SentinelD2DEditorDemo
-# capture.ps1 DOES work on this window (verified: dark ground, text, no white). If a capture
-# ever comes back with a blank client area, the window had most likely not presented yet --
-# re-run it, don't conclude the renderer is broken. --render below is still the better check
-# because it needs no window at all and asserts instead of asking you to look.
-# NOTE: D2DEditor.cpp is deliberately absent from the SentinelIDE target above. It joins
-# the exe in slice 3, behind the single CreateWindowExW in createControls.
+# capture.ps1 DOES work on this window (verified: dark ground, text, no white) -- but only
+# while the window is FOREGROUND. A D2D swap chain that has never been composited has nothing
+# for PrintWindow to copy, so a background or minimised window captures BLANK every time, and
+# a background process cannot foreground it (SetForegroundWindow is refused unless the caller
+# owns the foreground). Re-running does not help; a human has to put the window in front.
+# --render below is the better check anyway because it needs no window at all and asserts
+# instead of asking you to look.
+# NOTE: since slice 3, D2DEditor.cpp is ALSO compiled into the SentinelIDE target above.
+# This demo remains the way to drive the control with no IDE around it — in particular it
+# has no accelerator table, so onKeyDown's Ctrl+Z / Ctrl+Y arms are reachable here and
+# reachable nowhere else (in the exe, TranslateAcceleratorW claims them first and undo goes
+# through EM_UNDO/EM_REDO instead).
 add_executable(d2d_editor_demo WIN32
   tests/d2d_editor_demo.cpp
   src/host/win32/D2DEditor.cpp
@@ -202,6 +220,30 @@ set_target_properties(d2d_render_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME d2d_render COMMAND d2d_render_test
   "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel"
   "${CMAKE_CURRENT_BINARY_DIR}/d2d_render.png")
+
+# d2d_dialect_test — THE test for the RichEdit MESSAGE DIALECT (phase 46 slice 3), i.e. the
+# arithmetic the bytes on disk actually pass through. editor_model_test pins
+# setText -> textCrlf(); this pins EM_GETTEXTLENGTHEX's return and EM_GETTEXTEX's
+# `cb / sizeof(wchar_t)` and `min(size, cap - 1)`, which is where a save gets truncated or
+# an editorText() buffer gets overrun. A CONSOLE app (like d2d_render_test) so ctest can read
+# its output; it creates a REAL parent window and a REAL WS_CHILD control and drives them with
+# the same message shapes MainWindow.cpp sends. The two assertions it exists for: the golden
+# byte-identity round trip of examples/crypto.sentinel through saveFile's exact sequence, and
+# that EN_CHANGE is SYNCHRONOUS — a regression from SendMessageW to PostMessageW is failure
+# mode #1 for this migration and nothing else in the repo can see it.
+# It SKIPS (printing why, exit 0) only when the machine has no Direct2D/DirectWrite.
+# READ-ONLY on examples/: the golden path is opened GENERIC_READ and there is no write path.
+#     cmake --build build --target d2d_dialect_test  &&  build\d2d_dialect_test.exe
+add_executable(d2d_dialect_test
+  tests/d2d_dialect_test.cpp
+  src/host/win32/D2DEditor.cpp
+  src/editor/EditorModel.cpp)
+target_include_directories(d2d_dialect_test PRIVATE src)
+target_link_libraries(d2d_dialect_test PRIVATE
+  d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 advapi32)
+set_target_properties(d2d_dialect_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME d2d_dialect COMMAND d2d_dialect_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel")
 
 # diag_xcheck / trust_xcheck — prove the Sentinel parsers stay byte-identical to the
 # C++ oracles they replaced. Only defined when the Sentinel lib was built; they link

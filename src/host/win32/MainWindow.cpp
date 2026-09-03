@@ -27,6 +27,7 @@
 #include "host/win32/UpdateDialog.h"
 #include "host/win32/SingleInstance.h"
 #include "host/win32/Updater.h"
+#include "host/win32/D2DEditor.h"   // the opt-in Direct2D editor (phase 46 slice 3)
 
 #include <windows.h>
 #include <windowsx.h>
@@ -88,6 +89,10 @@ struct AppState {
     int   sidebarW = 240, dockH = 200;
     bool  folderOpen = false, fileOpen = false, dragV = false, highlighting = false, building = false;
     bool  dirty = false, loadingFile = false, lineNumbers = false, errorMarks = false;
+    // Which editor control g.hEdit actually is. Decided ONCE in createControls and never
+    // re-derived: the choice is baked into a window class, and every SendMessageW(g.hEdit,…)
+    // in this file assumes one fixed dialect for the life of the window.
+    bool  d2dEditor = false;
     bool  tbCanUndo = false, tbCanRedo = false;   // last-painted undo/redo button state (repaint on change)
     bool  restoringTreeSel = false;   // re-selecting after a cancelled open — ignore the TVN_SELCHANGED it raises
     int   gutterW = 0;          // line-number gutter width (0 = off / no file)
@@ -165,6 +170,30 @@ void styleEditor(HWND hEdit, COLORREF bg) {
     if (guard) resumeUndo();
 }
 
+// Which editor to build. DEFAULT OFF: RichEdit ships until slice 6 flips it.
+// [editor] d2d=1 in settings.ini turns it on persistently; --d2d-editor / --richedit force
+// one run either way without touching the file (the same shape as --tier overriding the
+// project's default), which is what makes an A/B against the shipping path a relaunch
+// rather than an edit.
+//
+// The argv scan is HERE and not in runApp's loop (:2064) because that loop runs AFTER
+// CreateWindowExW → WM_CREATE → createControls, by which time the control already exists —
+// far too late to choose a window class. runApp still gets a consuming arm for both flags,
+// because its `else openArg = a;` catch-all would otherwise hand an unrecognised token to
+// openPathArg and, if it came last, overwrite a real path argument.
+bool wantD2DEditor() {
+    bool on = g.settings.d2dEditor;
+    int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        for (int i = 1; i < argc; i++) {
+            if      (!lstrcmpiW(argv[i], L"--d2d-editor")) on = true;
+            else if (!lstrcmpiW(argv[i], L"--richedit"))   on = false;
+        }
+        LocalFree(argv);
+    }
+    return on;
+}
+
 void createControls(HWND hwnd) {
     const Theme& th = currentTheme();
     g.hTree = CreateWindowExW(0, WC_TREEVIEW, L"",
@@ -187,11 +216,37 @@ void createControls(HWND hwnd) {
     SHGetFileInfoW(L"f.toml", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES); if (sfi.hIcon) { ImageList_AddIcon(g.himl, sfi.hIcon); DestroyIcon(sfi.hIcon); }   // IMG_TOML
     TreeView_SetImageList(g.hTree, g.himl, TVSIL_NORMAL);
 
+    // UNCONDITIONAL, and it must stay that way even after slice 7 deletes the RichEdit
+    // *editor*: the Output pane below is MSFTEDIT_CLASS and stays RichEdit (it is the
+    // EN_LINK → parseDiag → gotoLineCol chain). Moving this into the else-branch would kill
+    // the Output pane with no visible error.
     LoadLibraryW(L"Msftedit.dll");
-    g.hEdit = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
-        WS_CHILD | ES_MULTILINE | ES_NOHIDESEL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL,
-        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_EDIT, g.hInst, nullptr);
-    if (th.dark) SetWindowTheme(g.hEdit, L"DarkMode_Explorer", nullptr);
+    // THE SWITCH — the whole of slice 3's host surface, plus the four one-liners marked
+    // "d2d:" elsewhere in this file. The D2D control speaks RichEdit's message dialect, so
+    // every SendMessageW(g.hEdit, …) below and throughout stays exactly as it was.
+    g.d2dEditor = wantD2DEditor() && registerD2DEditorClass(g.hInst);
+    if (g.d2dEditor) {
+        // No ES_* styles: they are class-private low style bits and meaningless to a custom
+        // class. WS_VSCROLL|WS_HSCROLL ARE load-bearing — the control's updateScrollbars
+        // calls SetScrollInfo on both bars with SIF_DISABLENOSCROLL, and without the style
+        // bits the bars never exist. The IDC_EDIT id is mandatory: the notification funnel
+        // reports GetDlgCtrlID and the host dispatches on it (:1919-1925, :1931-1932), so a
+        // wrong id means every notification is silently ignored — i.e. a lost buffer.
+        g.hEdit = CreateWindowExW(0, kD2DEditorClass, L"", WS_CHILD | WS_VSCROLL | WS_HSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_EDIT, g.hInst, nullptr);
+        if (!g.hEdit) { g.d2dEditor = false; logMsg(LogLevel::Error, L"Direct2D editor could not be created — falling back to RichEdit"); }
+    }
+    if (!g.hEdit) {
+        g.hEdit = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
+            WS_CHILD | ES_MULTILINE | ES_NOHIDESEL | ES_WANTRETURN | WS_VSCROLL | WS_HSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_EDIT, g.hInst, nullptr);
+    }
+    // d2d: d2dEditorApplyTheme does BOTH halves the scrollbars need (uxtheme ordinal 133
+    // AllowDarkModeForWindow, then SetWindowTheme) and handles light as well as dark, so it
+    // is unconditional where the RichEdit line is `if (th.dark)`.
+    if (g.d2dEditor) d2dEditorApplyTheme(g.hEdit);
+    else if (th.dark) SetWindowTheme(g.hEdit, L"DarkMode_Explorer", nullptr);
+    logMsg(LogLevel::Info, std::wstring(L"Editor control: ") + (g.d2dEditor ? L"Direct2D (opt-in)" : L"RichEdit"));
     SendMessageW(g.hEdit, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE | ENM_SCROLL);
     SendMessageW(g.hEdit, EM_SETTARGETDEVICE, 0, 1);   // no word-wrap → width changes don't reflow (code-editor default; smooth splitter)
     styleEditor(g.hEdit, th.windowBg);
@@ -339,6 +394,16 @@ void onPaint(HWND hwnd) {
         LONG total = (LONG)SendMessageW(g.hEdit, EM_GETLINECOUNT, 0, 0);
         const int edH = g.rGutter.bottom - g.rGutter.top;
         HGDIOBJ oldF = SelectObject(mem, g.mono); SetBkMode(mem, TRANSPARENT);
+        // The loop's `if (pt.y > edH) break` guards the BOTTOM edge only, and it got away
+        // with that because RichEdit scrolls by whole lines, so pt.y for the first visible
+        // line is never negative. An editor that scrolls by PIXELS (the Direct2D control
+        // does — wheel, thumb-track and ensureCaretVisible can all land mid-line) makes it
+        // negative, and this DrawTextW goes into the whole-window back buffer with no clip
+        // of its own — so the top line's number paints ABOVE the gutter, over the file-tab
+        // strip, which onPaint drew a few lines earlier. Observed on screen before this
+        // clip was added. Editor-agnostic (a no-op on RichEdit) and it keeps the partial
+        // top line's number visible-but-clipped rather than dropping it.
+        const int clipped = IntersectClipRect(mem, g.rGutter.left, g.rGutter.top, g.rGutter.right, g.rGutter.bottom);
         for (LONG i = first; i < total; i++) {
             POINTL pt{}; LONG ci = (LONG)SendMessageW(g.hEdit, EM_LINEINDEX, i, 0);
             SendMessageW(g.hEdit, EM_POSFROMCHAR, (WPARAM)&pt, (LPARAM)ci);
@@ -348,6 +413,7 @@ void onPaint(HWND hwnd) {
             std::wstring num = std::to_wstring(i + 1);
             DrawTextW(mem, num.c_str(), -1, &lr, DT_RIGHT | DT_TOP | DT_SINGLELINE);
         }
+        if (clipped != ERROR) SelectClipRgn(mem, nullptr);   // g.memDC is CACHED across paints — never leave a clip on it
         SelectObject(mem, oldF);
     }
 
@@ -483,6 +549,17 @@ std::wstring editorText() {
 }
 void highlight() {
     if (g.highlighting || !g.hEdit) return;
+    // d2d: SLICE 4 DELETES THIS LINE, when computeSpans() colours by drawing ranges instead.
+    // Until then every EM_SETCHARFORMAT below is a no-op on that control, so the loop is
+    // ~500 pointless round-trips per keystroke — but the real reason for the early-out is
+    // undo, not cost. applyColor's EM_EXSETSEL reaches EditorModel::setSelection, which
+    // clears typingRun_; insertText only coalesces while that is still set. Running this on
+    // every EN_CHANGE would therefore make EVERY KEYSTROKE ITS OWN UNDO STEP, each pushing a
+    // whole-document snapshot, and with kMaxUndo = 200 the history would collapse to the
+    // last 200 characters. That is a user-visible regression at slice 6, so it is bought now
+    // for one line. (Slice 4's rule, from the same root: colour by drawing ranges, NEVER by
+    // moving the selection.)
+    if (g.d2dEditor) return;
     g.highlighting = true;
     suspendUndo();   // keep the re-colorize off the native undo stack
     const Theme& th = currentTheme();
@@ -514,19 +591,41 @@ std::wstring dirName(const std::wstring& p) { size_t s = p.find_last_of(L"\\/");
 // ---- error-line highlight + edit tracking ---------------------------------
 void clearErrorMarks() {
     if (!g.errorMarks || !g.hEdit) return;
-    g.highlighting = true;   // suppress the EN_CHANGE that EM_SETCHARFORMAT raises
-    suspendUndo();           // ...and keep the tint clear off the native undo stack
-    SendMessageW(g.hEdit, WM_SETREDRAW, FALSE, 0);
-    applyBackColor(0, -1, currentTheme().windowBg);
-    SendMessageW(g.hEdit, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(g.hEdit, nullptr, TRUE);
-    resumeUndo();
+    // d2d: GATED FOR THE SAME REASON AS highlight(), and this was the inconsistency slice 3
+    // shipped with. applyBackColor has the identical EM_EXGETSEL / EM_EXSETSEL /
+    // EM_SETCHARFORMAT / EM_EXSETSEL shape as applyColor, so it reaches
+    // EditorModel::setSelection just the same, clears typingRun_ and collapses undo
+    // granularity — quietly, around every build, which is when it runs. Gating it costs
+    // nothing on that control because the tint it clears was never drawn: SCF_SELECTION is a
+    // no-op there until slice 4. The state line stays OUTSIDE the branch — g.errorMarks must
+    // still go false or onEditChanged calls this on every keystroke forever.
+    if (!g.d2dEditor) {
+        g.highlighting = true;   // suppress the EN_CHANGE that EM_SETCHARFORMAT raises
+        suspendUndo();           // ...and keep the tint clear off the native undo stack
+        SendMessageW(g.hEdit, WM_SETREDRAW, FALSE, 0);
+        applyBackColor(0, -1, currentTheme().windowBg);
+        SendMessageW(g.hEdit, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g.hEdit, nullptr, TRUE);
+        resumeUndo();
+        g.highlighting = false;
+    }
     g.errorMarks = false;
-    g.highlighting = false;
 }
 // Tint the lines that have diagnostics in the open file (after a build).
 void markErrorLines(HWND hwnd) {
     if (!g.hEdit || !g.fileOpen) return;
+    // d2d: same gate, same reason (see clearErrorMarks and highlight()) — applyBackColor's
+    // EM_EXSETSEL storm would clear typingRun_ once per diagnostic, and it fires right after
+    // a build, i.e. exactly where someone is about to keep typing. g.errorMarks := false is
+    // the honest bookkeeping, not a shortcut: nothing was tinted, so there is nothing for
+    // clearErrorMarks to undo later. The gutter invalidate is editor-agnostic (the Problems
+    // list just changed) and is kept. SLICE 4 REPLACES THIS BRANCH, not deletes it: the tints
+    // come back as painted decoration driven off g.problems, never off the selection.
+    if (g.d2dEditor) {
+        g.errorMarks = false;
+        if (g.lineNumbers) InvalidateRect(hwnd, &g.rGutter, FALSE);
+        return;
+    }
     const Theme& th = currentTheme();
     COLORREF tint = blendColor(th.windowBg, th.diagError, 24);
     g.highlighting = true;   // suppress the EN_CHANGE that EM_SETCHARFORMAT raises
@@ -705,6 +804,18 @@ bool saveFile(HWND hwnd) {
     GETTEXTEX gt{}; gt.cb = (DWORD)(s.size() * sizeof(wchar_t)); gt.flags = GT_USECRLF; gt.codepage = 1200;
     LONG got = (LONG)SendMessageW(g.hEdit, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)s.data());
     s.resize(got < 0 ? 0 : got);
+    // A non-empty buffer that fetches as ZERO characters is a BROKEN FETCH, not an empty
+    // file — writing it would truncate the document, and on examples/crypto.sentinel (a
+    // committed signed file that opens by default) also destroy its .sig, without anyone
+    // pressing Ctrl+S, because runBuild auto-saves. Same polarity as slice 1(a)'s dirty
+    // re-derive: this can only ever REFUSE to write, never write something wrong. Provably
+    // a no-op on RichEdit; it is insurance against a cb/return-value slip in the new
+    // EM_GETTEXTEX handler, whose blast radius is a signature.
+    if (n > 0 && got <= 0) {
+        logMsg(LogLevel::Error, L"saveFile: the editor returned 0 characters for a " + std::to_wstring(n) +
+               L"-character buffer — refusing to write " + g.curFileName);
+        g.statusMsg = L"Could not save " + g.curFileName; InvalidateRect(hwnd, &g.rStatus, FALSE); return false;
+    }
     if (!writeUtf8(g.curFilePath, s)) { g.statusMsg = L"Could not save " + g.curFileName; InvalidateRect(hwnd, &g.rStatus, FALSE); return false; }
     g.savedText = editorText();   // the saved point moves to what we just wrote
     g.dirty = false;
@@ -1498,7 +1609,13 @@ void applyTheme(HWND hwnd) {
     applyMenuDarkMode();   // keep popup/context menus matched to the theme
     const wchar_t* sub = th.dark ? L"DarkMode_Explorer" : L"Explorer";
     TreeView_SetBkColor(g.hTree, th.panelBg); TreeView_SetTextColor(g.hTree, th.textPrimary); SetWindowTheme(g.hTree, sub, nullptr);
-    SetWindowTheme(g.hEdit, sub, nullptr); styleEditor(g.hEdit, th.windowBg); highlight();
+    // d2d: same reason as at creation — the D2D control needs both uxtheme halves, and its
+    // own WM_THEMECHANGED handler must never call this itself (SetWindowTheme re-sends
+    // WM_THEMECHANGED; that recursion cost a stack-overflow crash to find). styleEditor
+    // stays on the SAME line for both: it is how the theme background and the
+    // Settings→editor font reach the D2D control, via EM_SETBKGNDCOLOR + SCF_ALL.
+    if (g.d2dEditor) d2dEditorApplyTheme(g.hEdit); else SetWindowTheme(g.hEdit, sub, nullptr);
+    styleEditor(g.hEdit, th.windowBg); highlight();
     SetWindowTheme(g.hOut, sub, nullptr); styleEditor(g.hOut, th.windowBg);
     SetWindowTheme(g.hProblems, sub, nullptr);
     ListView_SetBkColor(g.hProblems, th.panelBg); ListView_SetTextColor(g.hProblems, th.textPrimary); ListView_SetTextBkColor(g.hProblems, th.panelBg);
@@ -1880,6 +1997,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int old = g.dpi; g.dpi = HIWORD(wParam);
         if (old > 0) { g.sidebarW = MulDiv(g.sidebarW, g.dpi, old); g.dockH = MulDiv(g.dockH, g.dpi, old); }
         createFonts(); SendMessageW(g.hTree, WM_SETFONT, (WPARAM)g.ui, TRUE); SendMessageW(g.hProblems, WM_SETFONT, (WPARAM)g.ui, TRUE);
+        // d2d: CHILD WINDOWS NEVER RECEIVE WM_DPICHANGED — it goes to the top-level window
+        // only — so the control has no way to learn this by itself. Without it the em-size,
+        // lineH, spaceW, the layout cache and maxLineW all stay at the old scale after a
+        // monitor move, and the gutter (which reads EM_POSFROMCHAR) follows it into the
+        // wrong scale. RichEdit needs nothing here, which is why this site was silent about
+        // the editor until now.
+        if (g.d2dEditor) d2dEditorUpdateDpi(g.hEdit, (UINT)g.dpi);
         RECT* nr = reinterpret_cast<RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, nr->left, nr->top, nr->right - nr->left, nr->bottom - nr->top, SWP_NOZORDER | SWP_NOACTIVATE);
         layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
@@ -1945,6 +2069,9 @@ int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
         else if (a == L"--signing") autoSigning = true;
         else if (a == L"--about") autoAbout = true;
         else if (a == L"--tier" && i + 1 < argc) tierArg = argv[++i];
+        // Consumed in wantD2DEditor(), which had to run back in WM_CREATE — matched here
+        // only so the catch-all below does not mistake the flag for a path to open.
+        else if (a == L"--d2d-editor" || a == L"--richedit") {}
         else openArg = a;
     }
     if (argv) LocalFree(argv);

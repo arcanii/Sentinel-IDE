@@ -27,20 +27,36 @@
 // not harder — and it is why WM_SIZE here does not invalidate any layout: changing the
 // width cannot re-wrap anything.
 //
-// NOT IN THIS SLICE: the RichEdit message dialect (slice 3) and syntax colouring
-// (slice 4). Plain single-colour text is correct here. One quiet benefit of that: with no
-// per-span SetDrawingEffect, the per-line layouts hold no brushes, so they are purely
-// device-independent and SURVIVE device loss — unlike the reference's layout, which had to
-// be rebuilt whenever the brushes were recreated.
+// ADDED IN SLICE 3: the RichEdit message dialect and the parent-notification funnel, so
+// MainWindow can drive this control with (almost) no feature branches. See "the RichEdit
+// dialect" section in D2DEditorProc below, and the funnel just above drawContent.
+//
+// NOT IN THIS SLICE: syntax colouring (slice 4). Plain single-colour text is correct here,
+// and EM_SETCHARFORMAT/SCF_SELECTION is deliberately a no-op until then. One quiet benefit
+// of that: with no per-span SetDrawingEffect, the per-line layouts hold no brushes, so they
+// are purely device-independent and SURVIVE device loss — unlike the reference's layout,
+// which had to be rebuilt whenever the brushes were recreated.
 #include "host/win32/D2DEditor.h"
 
 #include <windowsx.h>
 #include <imm.h>
 #include <wincodec.h>  // WIC — the offscreen render path only (d2dEditorRenderToPng)
 
+// AFTER D2DEditor.h (which includes <windows.h> first) — NEVER before it, and this is not
+// stylistic. richedit.h guards EM_POSFROMCHAR and EM_SCROLLCARET with #ifndef, so whichever
+// header is seen first wins: windows.h gives 0x00D6 / 0x00B7, richedit.h alone would give
+// WM_USER+38 / WM_USER+49. MainWindow.cpp includes windows.h at :32 and richedit.h at :35,
+// so it SENDS 0x00D6. Get the order wrong here and this file compiles `case EM_POSFROMCHAR:`
+// as a different number, the message falls through to DefWindowProcW returning 0, the POINTL
+// is left {0,0} — and every line number in the gutter draws stacked at y=0 while the loop's
+// only exit test (`if (pt.y > edH) break`, MainWindow.cpp:410) never fires, so it walks the
+// whole document on every repaint. Zero warnings, zero errors, one very confused reader.
+#include <richedit.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <new>
 #include <string>
@@ -148,6 +164,42 @@ struct EditorState {
     wchar_t pendingHigh = 0;  // buffered high surrogate from WM_CHAR
     UINT_PTR blinkTimer = 0;
     UINT_PTR autoTimer = 0;
+
+    // ---- the RichEdit dialect (slice 3) -------------------------------------
+    // EM_SETEVENTMASK's mask. THE DEFAULT IS EVERY BIT SET, NOT ZERO, and that is the
+    // whole point of writing it out: a mask that starts empty and then somehow misses
+    // that one call (a reorder of createControls, say) is SILENT — no EN_CHANGE, g.dirty
+    // never set, buffers discarded with no prompt. Failing towards "too many
+    // notifications" costs a few repaints; failing the other way costs a user's work.
+    DWORD eventMask = ENM_CHANGE | ENM_SELCHANGE | ENM_SCROLL;
+
+    // WM_SETREDRAW(FALSE) nesting depth. What the COUNTER buys over a bool is correct
+    // NESTING (clearErrorMarks/markErrorLines run inside highlight()'s window in the
+    // RichEdit path, so the inner TRUE must not un-mute the outer window) and immunity to
+    // a stray extra TRUE (it floors at 0 instead of going negative). It buys NOTHING
+    // against an unbalanced FALSE — quite the reverse: an unbalanced FALSE parks this at 1
+    // forever and EN_SELCHANGE is muted for the life of the window, where a bool would be
+    // cleared by the very next TRUE. The host's four windows are all straight-line
+    // FALSE…TRUE pairs with no early return between them, which is why that is acceptable;
+    // it is a precondition on the caller, not a property of the counter. See the
+    // WM_SETREDRAW case for what the flag is actually used for (it is not redraw
+    // suppression).
+    int redrawOff = 0;
+
+    // >0 while the host is re-entering this control from inside one of our own
+    // notifications. Suppresses the *view* notifications only — never a mutation, and
+    // never EN_CHANGE, which must be impossible to lose.
+    int notifyDepth = 0;
+
+    // Last values actually reported to the parent, for the diff in flushViewNotifications.
+    int notifiedScrollX = 0;
+    int notifiedScrollY = 0;
+    editor::Selection notifiedSel{};
+
+    // EM_SETBKGNDCOLOR. Stored rather than ignored so this and drawContent's clear cannot
+    // drift apart; unset means "whatever the current Theme says".
+    COLORREF bkColor = 0;
+    bool haveBkColor = false;
 };
 
 EditorState* state(HWND h) {
@@ -188,6 +240,12 @@ void measureMetrics(EditorState* st) {
     st->format->SetIncrementalTabStop(st->spaceW * kTabColumns);
 }
 
+// Idempotent, and the ONLY producer of st->lineH / st->spaceW (via measureMetrics). Every
+// function that divides by or multiplies with those must therefore call this first, or it
+// silently computes against lineH == 0. Cheap after the first call — one pointer test —
+// so the rule is "call it, don't reason about who called it for you". See EM_POSFROMCHAR,
+// visibleRange and contentHeight, which are reachable from the PARENT's paint before this
+// control has ever laid a line out.
 void ensureFormat(EditorState* st) {
     if (st->format) return;
     IDWriteFactory* dw = dwriteFactory();
@@ -396,6 +454,7 @@ int clientH(EditorState* st) {
 
 int contentHeight(EditorState* st) {
     ensureLineIndex(st);
+    ensureFormat(st);  // lineH, or the whole document measures zero pixels tall
     return static_cast<int>(static_cast<float>(lineCount(st)) * st->lineH) + dpx(st, kInsetY) * 2;
 }
 int contentWidth(EditorState* st) {
@@ -414,6 +473,7 @@ void clampScroll(EditorState* st) {
 // rather than to the file.
 void visibleRange(EditorState* st, size_t& first, size_t& last) {
     ensureLineIndex(st);
+    ensureFormat(st);  // lineH is the divisor below; EM_GETFIRSTVISIBLELINE reaches here
     const size_t n = lineCount(st);
     const float lh = (std::max)(1.0f, st->lineH);
     const float top = static_cast<float>(st->scrollY - dpx(st, kInsetY));
@@ -477,6 +537,153 @@ void updateScrollbars(EditorState* st) {
     SetScrollInfo(st->hwnd, SB_HORZ, &si, TRUE);
 }
 
+// Defined below (the parent-notification funnel). Forward-declared because the funnel's
+// contract is "ANY change of scrollY/scrollX reports here, whatever caused it", and two of
+// the paths that can change them — setFontInternal and d2dEditorUpdateDpi — are written
+// above it. A contract that only holds for the callers that happen to sit downstream of
+// the definition is not a contract.
+void flushViewNotifications(EditorState* st);
+
+// ---- font (one place, so EM_SETCHARFORMAT and d2dEditorSetFont cannot drift) -
+void setFontInternal(EditorState* st, const std::wstring& face, float pointSize) {
+    const std::wstring f = face.empty() ? st->face : face;
+    const float p = (pointSize > 0.0f) ? pointSize : st->pointSize;
+    // Only rebuild on a REAL change. styleEditor runs on every file open (MainWindow.cpp
+    // :738) and every theme/settings flip (:1618), and an unconditional rebuild would drop
+    // the whole layout cache and reset the horizontal high-water mark each time.
+    if (f == st->face && p == st->pointSize) return;
+    st->face = f;
+    st->pointSize = p;
+    SafeRelease(st->format);  // the em-size and every metric derived from it are stale
+    st->lineH = 0;
+    st->spaceW = 0;
+    ensureFormat(st);
+    dropLayoutCache(st);  // every cached layout was shaped at the old face/size
+    st->maxLineW = 0;     // and so was the horizontal high-water mark
+    clampScroll(st);      // a smaller font shrinks contentHeight, which can move scrollY
+    InvalidateRect(st->hwnd, nullptr, FALSE);
+    flushViewNotifications(st);  // ...and a moved scrollY is a stale gutter — see the funnel
+}
+
+// ---- the parent-notification funnel -----------------------------------------
+// THE part of slice 3 that can lose a user's work, so it is written out at length.
+//
+// MainWindow's g.dirty is a pure function of (editorText(), g.savedText) and EN_CHANGE is
+// only the trigger to RECOMPUTE it. A change this control fails to report therefore leaves
+// g.dirty false and the buffer is discarded WITH NO PROMPT. confirmSaveIfDirty
+// (MainWindow.cpp:758) re-derives as insurance, but four readers of g.dirty do not go
+// through it: Ctrl+S / ID_SAVE (:1954), the Save button (:1661), the build auto-save
+// (:1244) and the update-install auto-save (:2017). A missed notification makes Ctrl+S a
+// silent no-op and lets WinSparkle restart the app with the last edit gone.
+//
+// SendMessageW, NEVER PostMessageW, and the reason cuts both ways. loadFileIntoEditor
+// (MainWindow.cpp:736-740) and closeProject (:1441) set g.loadingFile, set the text and
+// clear the flag again on one straight line with no message pump between: a SENT
+// notification lands inside that window and is correctly suppressed, a POSTED one lands
+// after it and is processed as a user edit — so the guard the codebase has relied on since
+// phase 39 would silently stop working. In the other direction a posted notification for a
+// REAL edit can be dispatched inside a modal's pump (every dialog here pumps with a null
+// filter, SaveChangesDialog included) after confirmSaveIfDirty has already asked, be
+// swallowed by the guard, and never be recomputed — there is no retry. Sending also means
+// the host observes the post-edit state of the very edit that fired it. And EN_SELCHANGE
+// cannot be posted at all: its lParam points at a stack SELCHANGE.
+//
+// WM_COMMAND for EN_CHANGE/EN_VSCROLL/EN_HSCROLL and WM_NOTIFY for EN_SELCHANGE is not a
+// preference, it is RichEdit's OWN split — EN_CHANGE (0x0300), EN_HSCROLL (0x0601) and
+// EN_VSCROLL (0x0602) are WinUser.h edit-control codes delivered by WM_COMMAND, while
+// EN_SELCHANGE (0x0702) is a richedit code carrying a SELCHANGE payload and has no
+// WM_COMMAND form (sent that way it falls out of MainWindow's WM_COMMAND handler
+// unmatched, silently, and the Ln/Col readout freezes forever). Matching the split exactly
+// means the host runs the SAME branch for both editors (:1931 and :1921), so any
+// behavioural difference between them is attributable to the control, never to the
+// dialect. Sending BOTH forms is wrong for a different reason: MainWindow handles each
+// (:1919 and :1931), so onEditChanged — and highlight() inside it — would run twice per
+// keystroke.
+//
+// TRAP: MainWindow.cpp:1931 begins `if (lParam != 0 && ...)` to tell a control notification
+// from a menu command, so lParam MUST be the control's HWND. A WM_COMMAND with lParam == 0
+// is skipped in full, and that failure is indistinguishable from having no funnel at all.
+
+// Raised while a notification is in flight, released by scope so an early return in the
+// host cannot strand it (exactly the trap MainWindow's plain-bool g.highlighting has).
+struct NotifyScope {
+    EditorState* st;
+    explicit NotifyScope(EditorState* s) : st(s) { ++st->notifyDepth; }
+    ~NotifyScope() { --st->notifyDepth; }
+    NotifyScope(const NotifyScope&) = delete;
+    NotifyScope& operator=(const NotifyScope&) = delete;
+};
+
+void notifyParentCommand(EditorState* st, UINT code) {
+    HWND parent = GetParent(st->hwnd);
+    if (!parent) return;  // standalone host (tests/d2d_render_test.cpp) — nothing to tell
+    NotifyScope guard(st);
+    SendMessageW(parent, WM_COMMAND,
+                 MAKEWPARAM(GetDlgCtrlID(st->hwnd), code),
+                 reinterpret_cast<LPARAM>(st->hwnd));
+}
+
+// The ONE place the host is told the text changed. Every model mutation reaches it through
+// afterEdit(); nothing else may mutate the buffer.
+void notifyChanged(EditorState* st) {
+    if (!(st->eventMask & ENM_CHANGE)) return;
+    // Deliberately NOT gated on notifyDepth. The host does not edit the buffer from inside
+    // onEditChanged (highlight() only formats), so this cannot recurse — and an EN_CHANGE
+    // that can be suppressed by anything is an EN_CHANGE that can be lost.
+    notifyParentCommand(st, EN_CHANGE);
+}
+
+// Report a SETTLED view change: scroll first (the host repaints the line-number gutter off
+// it), then the selection (the Ln/Col readout). Diff-based on purpose — scrollX, scrollY
+// and the selection are written in a dozen places between them, and a per-site notify is a
+// list that will eventually be got wrong; here an extra call is a no-op and a missing one
+// only defers the report to the next.
+//
+// EN_VSCROLL/EN_HSCROLL are a deliberate SUPERSET of RichEdit, which documents them as
+// firing for scrollbar interaction only — which is why arrowing off the bottom of the view
+// can leave a stale gutter today. Any change of scrollY/scrollX reports here, whatever
+// caused it. The consumer is one InvalidateRect of the gutter rect (MainWindow.cpp:1932),
+// so over-sending costs a repaint and under-sending costs a wrong gutter.
+void flushViewNotifications(EditorState* st) {
+    if (st->notifyDepth > 0) return;  // re-entrant: leave the diff, report the NET change
+
+    if (st->scrollX != st->notifiedScrollX) {
+        st->notifiedScrollX = st->scrollX;
+        if (st->eventMask & ENM_SCROLL) notifyParentCommand(st, EN_HSCROLL);
+    }
+    if (st->scrollY != st->notifiedScrollY) {
+        st->notifiedScrollY = st->scrollY;
+        if (st->eventMask & ENM_SCROLL) notifyParentCommand(st, EN_VSCROLL);
+    }
+
+    const editor::Selection sel = st->model.selection();
+    if (sel == st->notifiedSel) return;
+    // Gated on redraw, which is EXACT rather than heuristic: every programmatic selection
+    // storm in the host sits inside a WM_SETREDRAW(FALSE) window (highlight
+    // MainWindow.cpp:569-579 — one EM_EXSETSEL per token, hundreds per keystroke;
+    // clearErrorMarks :605-607; markErrorLines :633-646), and gotoLineCol (:1287), which
+    // DOES want the status bar to move, is not. Not recording the value either is the
+    // other half: the storm's net effect is a restore to the selection it started from, so
+    // the flush at WM_SETREDRAW(TRUE) then correctly finds nothing to report.
+    if (st->redrawOff > 0) return;
+    st->notifiedSel = sel;
+    if (!(st->eventMask & ENM_SELCHANGE)) return;
+    HWND parent = GetParent(st->hwnd);
+    if (!parent) return;
+    SELCHANGE sc{};
+    sc.nmhdr.hwndFrom = st->hwnd;
+    sc.nmhdr.idFrom = static_cast<UINT_PTR>(GetDlgCtrlID(st->hwnd));
+    sc.nmhdr.code = EN_SELCHANGE;
+    // Normalised, never reversed and never negative: MainWindow.cpp:1925 computes
+    // Col = cpMin - lineStart + 1 and would otherwise print a negative column.
+    sc.chrg.cpMin = static_cast<LONG>(sel.min());
+    sc.chrg.cpMax = static_cast<LONG>(sel.max());
+    sc.seltyp = static_cast<WORD>(sel.empty() ? SEL_EMPTY : SEL_TEXT);
+    NotifyScope guard(st);
+    SendMessageW(parent, WM_NOTIFY, static_cast<WPARAM>(sc.nmhdr.idFrom),
+                 reinterpret_cast<LPARAM>(&sc));
+}
+
 // ---- painting ---------------------------------------------------------------
 
 // EVERYTHING this control draws, and the only place it is written. Takes the target as a
@@ -490,7 +697,9 @@ void updateScrollbars(EditorState* st) {
 // swaps the whole set together for exactly that reason.
 void drawContent(EditorState* st, ID2D1RenderTarget* rt) {
     const Theme& th = currentTheme();
-    rt->Clear(colorToD2D(th.windowBg));
+    // EM_SETBKGNDCOLOR wins when the host has set one; it only ever sets Theme::windowBg,
+    // so this is the same pixel either way — reading it here is what keeps it that way.
+    rt->Clear(colorToD2D(st->haveBkColor ? st->bkColor : th.windowBg));
 
     const float ox = static_cast<float>(dpx(st, kInsetX) - st->scrollX);
     const float oy = static_cast<float>(dpx(st, kInsetY) - st->scrollY);
@@ -560,6 +769,19 @@ void paint(EditorState* st) {
         // Slice 3 (a change notification) and slice 4 (a highlighter callback) are precisely
         // the changes that can break this; re-check it then. No assert: builds are Release
         // with NDEBUG since phase 44, so an assert here would compile to nothing.
+        //
+        // RE-CHECKED FOR SLICE 3, and it still holds, for two reasons that must both stay
+        // true. (a) The funnel never fires from inside paint: notifyChanged is only called
+        // by afterEdit, and flushViewNotifications only by afterEdit/caretMoved/onScroll/
+        // the wheel handlers/onAutoScroll/EM_EXSETSEL/EM_SCROLLCARET/WM_SETREDRAW/WM_SIZE/
+        // setFontInternal/d2dEditorUpdateDpi — none of which paint() reaches. (The last
+        // three are the ones that make the funnel's "any change of scrollY/scrollX reports
+        // here" literally true; they all come from the host, never from a paint.)
+        // (b) Every message the host sends back from inside a
+        // notification is non-mutating of the index: EM_GETTEXTLENGTHEX, EM_GETTEXTEX,
+        // EM_EXGETSEL, EM_EXSETSEL, EM_SETCHARFORMAT, EM_GETLINECOUNT, EM_LINEINDEX,
+        // EM_CANUNDO, EM_CANREDO, WM_SETREDRAW. EM_EXSETSEL is the one to watch: it goes to
+        // EditorModel::setSelection and InvalidateRect and NOTHING else.
         st->rt->BeginDraw();
         drawContent(st, st->rt);
         if (st->rt->EndDraw() == D2DERR_RECREATE_TARGET) {
@@ -597,6 +819,17 @@ void paint(EditorState* st) {
 
 // ---- post-edit / caret-move bookkeeping -------------------------------------
 
+// EVERY model mutation ends here — typing, Enter, Tab, Backspace/Delete (plain and by
+// word), cut, paste, IME commit, EM_UNDO/EM_REDO, WM_SETTEXT. That is by construction, not
+// by inspection: nothing else in this file touches st->model's text, so the notification
+// below cannot be forgotten by slices 4-7 either.
+//
+// NOT in that list, because the path does not exist: DROP. This control registers no OLE
+// drop target and handles no WM_DROPFILES, so dragging a FILE onto the editor falls
+// through to the main window's handler (which is guarded by confirmSaveIfDirty, so the
+// open buffer is safe) and dragging TEXT within the editor does nothing at all. RichEdit
+// supports the latter; this is a KNOWN DIFFERENCE to accept or close deliberately at slice
+// 6, not something afterEdit silently covers.
 void afterEdit(EditorState* st) {
     st->linesDirty = true;
     st->desiredX = -1;
@@ -604,6 +837,16 @@ void afterEdit(EditorState* st) {
     ensureLineIndex(st);  // text changed -> the index must be current for caret geometry
     ensureCaretVisible(st);
     InvalidateRect(st->hwnd, nullptr, FALSE);
+    // ORDER IS THE CONTRACT, and EN_CHANGE goes LAST. onEditChanged (MainWindow.cpp:666)
+    // re-enters this control SYNCHRONOUSLY — EM_GETTEXTLENGTHEX + EM_GETTEXTEX for the
+    // dirty comparison, EM_CANUNDO/EM_CANREDO for the toolbar — and its InvalidateRect of
+    // the gutter makes the parent ask EM_GETFIRSTVISIBLELINE / EM_LINEINDEX /
+    // EM_POSFROMCHAR on its next paint. Notify before the line index is rebuilt or the
+    // scroll has settled and the host reads a half-updated editor. Never from inside
+    // paint(): drawContent holds a raw IDWriteTextLayout* across xInLine calls (see the
+    // invariant there), and none of the messages the host sends back drop that cache.
+    flushViewNotifications(st);
+    notifyChanged(st);
 }
 
 void caretMoved(EditorState* st, bool resetDesiredX) {
@@ -611,6 +854,24 @@ void caretMoved(EditorState* st, bool resetDesiredX) {
     st->caretOn = true;
     ensureCaretVisible(st);
     InvalidateRect(st->hwnd, nullptr, FALSE);
+    flushViewNotifications(st);  // EN_SELCHANGE (+ EN_VSCROLL if the view followed), never EN_CHANGE
+}
+
+// The ONE path that replaces the whole buffer, so WM_SETTEXT and d2dEditorSetText cannot
+// drift into two copies of it — and, more to the point, so neither can become a silent text
+// replacement that skips the funnel. RichEdit raises EN_CHANGE for WM_SETTEXT (which is
+// exactly why g.loadingFile exists), and both of the host's call sites (MainWindow.cpp:737,
+// :1441) bracket it with that guard and then write the post-conditions by hand — so it is
+// provably suppressed there either way. It fires for fidelity, and so that a third
+// SetWindowTextW added later is covered without anyone remembering to cover it.
+void setTextInternal(EditorState* st, const std::wstring& s) {
+    st->model.setText(s);          // also clears undo/redo, as RichEdit's WM_SETTEXT does:
+    st->model.setCaret(0, false);  // loadFileIntoEditor:744 relies on that ("SetWindowText
+    st->scrollX = 0;               // cleared the undo buffer") when it resets the toolbar.
+    st->scrollY = 0;
+    st->pendingHigh = 0;
+    st->maxLineW = 0;  // every measured width belongs to the old document
+    afterEdit(st);
 }
 
 // Vertical navigation: index arithmetic, because visual line == logical line.
@@ -939,7 +1200,14 @@ void onAutoScroll(EditorState* st) {
     const int cy = (std::min)((std::max)(static_cast<int>(pt.y), 0), static_cast<int>(rc.bottom));
     const int cx = (std::min)((std::max)(static_cast<int>(pt.x), 0), static_cast<int>(rc.right));
     st->model.setCaret(offsetFromPoint(st, cx, cy), true);
+    // Same rule as EM_EXSETSEL and caretMoved(…, true): this MOVED THE CARET, so a sticky
+    // column from an earlier Up/Down no longer describes it. Found while auditing the
+    // EM_EXSETSEL omission — this arm hand-rolls the tail of caretMoved (it must, because
+    // it owns the scroll) and had inherited the same gap: drag-autoscroll out of the
+    // window, release, press Down, and the caret jumps to the pre-drag column.
+    st->desiredX = -1;
     InvalidateRect(st->hwnd, nullptr, FALSE);
+    flushViewNotifications(st);
 }
 
 // ---- scrollbars -------------------------------------------------------------
@@ -970,6 +1238,7 @@ void onScroll(EditorState* st, int bar, WPARAM wParam) {
         st->scrollX = pos;
     clampScroll(st);
     InvalidateRect(st->hwnd, nullptr, FALSE);
+    flushViewNotifications(st);  // the gutter is painted by the PARENT and repaints on this
 }
 
 // ---- window procedure -------------------------------------------------------
@@ -1006,6 +1275,15 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // line's shaping. This is the reference's rebuildLayout-on-resize, deleted.
             clampScroll(st);
             InvalidateRect(hwnd, nullptr, FALSE);
+            // GROWING THE VIEW MOVES THE VIEW. clampScroll's ceiling is
+            // contentHeight - clientH, so dragging the horizontal splitter down (or
+            // maximising) can drop scrollY by hundreds of pixels with nobody scrolling —
+            // measured: first visible line 381 -> 331. The funnel says every change of
+            // scrollY/scrollX reports, so this reports. It was harmless only because every
+            // host caller of layout() happens to repaint the whole window afterwards; that
+            // is a property of today's callers, not of this control, and a contract that
+            // holds only while nobody adds a caller is not a contract.
+            flushViewNotifications(st);
             return 0;
         }
         case WM_CHAR: onChar(st, static_cast<wchar_t>(wParam)); return 0;
@@ -1058,6 +1336,7 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             }
             clampScroll(st);
             InvalidateRect(hwnd, nullptr, FALSE);
+            flushViewNotifications(st);
             return 0;
         }
         case WM_MOUSEHWHEEL: {  // tilt wheel / precision touchpad
@@ -1066,6 +1345,7 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             st->scrollX += (delta / WHEEL_DELTA) * 6 * unit;
             clampScroll(st);
             InvalidateRect(hwnd, nullptr, FALSE);
+            flushViewNotifications(st);
             return 0;
         }
         case WM_VSCROLL: onScroll(st, SB_VERT, wParam); return 0;
@@ -1120,13 +1400,7 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return DefWindowProcW(hwnd, msg, wParam, lParam);
         case WM_SETTEXT: {
             const wchar_t* s = reinterpret_cast<const wchar_t*>(lParam);
-            st->model.setText(s ? s : L"");
-            st->model.setCaret(0, false);  // external set: caret and view to the top
-            st->scrollX = 0;
-            st->scrollY = 0;
-            st->pendingHigh = 0;
-            st->maxLineW = 0;  // every measured width belongs to the old document
-            afterEdit(st);
+            setTextInternal(st, s ? s : L"");
             return TRUE;
         }
         case WM_GETTEXTLENGTH: return static_cast<LRESULT>(st->model.length());
@@ -1140,6 +1414,319 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             buf[n] = L'\0';
             return static_cast<LRESULT>(n);
         }
+        // ===== the RichEdit message dialect (slice 3) ============================
+        // Exactly the messages MainWindow.cpp sends to g.hEdit, and nothing else. Grepped:
+        // there is no Find/Replace and no printing in this product, so EM_FINDTEXT*,
+        // EM_FORMATRANGE, EM_STREAM*, EM_SETZOOM, EM_GETMODIFY, EM_LIMITTEXT,
+        // EM_CHARFROMPOS, EM_GETSEL/EM_SETSEL and EM_LINEFROMCHAR are deliberately absent —
+        // implementing messages nobody sends is untested code pretending to be a contract.
+        // EM_SETREADONLY / EM_REPLACESEL / EM_GETTEXTRANGE / ENM_LINK belong to g.hOut, the
+        // Output pane, which stays RichEdit through slice 7.
+
+        // ---- text retrieval: the two messages examples/crypto.sentinel's signature
+        //      ultimately rides on ---------------------------------------------------
+        case EM_GETTEXTLENGTHEX: {
+            // BE LENIENT, NEVER FAIL CLOSED. editorText() does s.resize(n + 1) and
+            // saveFile() does s.resize(n*2 + 16) straight off this answer
+            // (MainWindow.cpp:544, :803). A NEGATIVE return (an HRESULT, say, because the
+            // host asks GTL_NUMCHARS without GTL_PRECISE/GTL_CLOSE — technically an
+            // incomplete combination) resizes to near SIZE_MAX and throws mid-save; a ZERO
+            // return for a non-empty document makes saveFile write an EMPTY file over
+            // examples/crypto.sentinel, a committed SIGNED file that opens by default and
+            // that Build auto-saves. So unknown flags are ignored, never rejected.
+            auto* gtl = reinterpret_cast<const GETTEXTLENGTHEX*>(wParam);
+            const DWORD flags = gtl ? gtl->flags : static_cast<DWORD>(GTL_NUMCHARS);
+            if (flags & GTL_USECRLF) return static_cast<LRESULT>(st->model.textCrlf().size());
+            return static_cast<LRESULT>(st->model.length());
+        }
+        case EM_GETTEXTEX: {
+            auto* gt = reinterpret_cast<const GETTEXTEX*>(wParam);
+            auto* buf = reinterpret_cast<wchar_t*>(lParam);
+            if (!gt || !buf) return 0;
+            // gt->cb is a BYTE capacity INCLUDING room for the terminator; the return value
+            // is a CHARACTER count EXCLUDING it. Both call sites then do s.resize(got)
+            // (MainWindow.cpp:547, :806). Reading cb as a character count would grant twice
+            // the capacity in editorText()'s buffer of exactly n+1 wchar_t — a heap overrun
+            // on every keystroke, since editorText() runs on every EN_CHANGE.
+            const size_t cap = static_cast<size_t>(gt->cb) / sizeof(wchar_t);
+            if (cap == 0) return 0;
+            // THE CRLF FORK. GT_DEFAULT (0) is the internal form editorText() compares
+            // against g.savedText; GT_USECRLF (1) is the on-disk form saveFile hands
+            // straight to writeUtf8 with no transformation. The two are NEVER compared with
+            // each other (MainWindow.cpp:536-539), which is what lets this control's
+            // internal line break be '\n' where RichEdit's is a lone '\r': each
+            // representation only has to be self-consistent, and in both a break is ONE
+            // character, which is what keeps highlight()'s offsets aligned with the
+            // EM_EXSETSEL index space. GT_SELECTION/GT_RAWTEXT/GT_NOHIDDENTEXT are never
+            // sent; ignore rather than fail (see the empty-file hazard above).
+            const bool crlf = (gt->flags & GT_USECRLF) != 0;
+            const std::wstring conv = crlf ? st->model.textCrlf() : std::wstring();
+            const std::wstring& src = crlf ? conv : st->model.text();
+            const size_t n = (std::min)(src.size(), cap - 1);
+            std::memcpy(buf, src.c_str(), n * sizeof(wchar_t));
+            buf[n] = L'\0';
+            return static_cast<LRESULT>(n);
+        }
+
+        // ---- selection ----------------------------------------------------------
+        case EM_EXGETSEL: {
+            auto* cr = reinterpret_cast<CHARRANGE*>(lParam);
+            if (!cr) return 0;
+            // Normalised (cpMin <= cpMax), as RichEdit reports it. The anchor direction is
+            // not observable through this message in either control, so a right-to-left
+            // drag survives the host's save/restore pairs as a forward selection — fidelity,
+            // not a regression, and unobservable in practice (those pairs only run after an
+            // edit, which has already collapsed the selection).
+            const editor::Selection sel = st->model.selection();
+            cr->cpMin = static_cast<LONG>(sel.min());
+            cr->cpMax = static_cast<LONG>(sel.max());
+            return 0;
+        }
+        case EM_EXSETSEL: {
+            auto* cr = reinterpret_cast<const CHARRANGE*>(lParam);
+            if (!cr) return 0;
+            const LONG len = static_cast<LONG>(st->model.length());
+            LONG a = cr->cpMin, b = cr->cpMax;
+            if (b < 0) b = len;  // cpMax == -1 means "to the end of the text" — that is how
+            if (a < 0) a = 0;    // applyColor(0,-1,..) (:569) and applyBackColor(0,-1,..)
+            if (a > len) a = len;  // (:606, :634) say "select all".
+            if (b > len) b = len;  // gotoLineCol (:1285-1286) computes lineStart + col - 1
+            if (a > b) {           // with NO upper bound, so a diagnostic whose column runs
+                const LONG t = a;  // past the line end lands here — clamp, never index out
+                a = b;             // of range, never assert.
+                b = t;
+            }
+            st->model.setSelection(static_cast<size_t>(a), static_cast<size_t>(b));
+            // THE STICKY COLUMN MUST DIE WITH THE SELECTION. desiredX is the line-local x
+            // that Up/Down hold on to across lines, and it is only valid for the caret that
+            // set it — every other caret-moving path clears it (afterEdit, caretMoved(true)).
+            // Miss it here and gotoLineCol's EM_EXSETSEL + EM_SCROLLCARET leaves the OLD
+            // column armed: double-click a build diagnostic, press Down, and the caret lands
+            // in the column you were in before the jump. Measured against RichEdit: Ln 2 Col 3
+            // there, Ln 2 Col 31 here. -1 means "recompute from the caret on the next
+            // vertical move", which is exactly right for a caret someone else just placed.
+            st->desiredX = -1;
+            // Deliberately does NOT scroll: that is EM_SCROLLCARET's job, which is exactly
+            // why gotoLineCol sends it immediately afterwards (MainWindow.cpp:1287-1288).
+            // Route this through ensureCaretVisible and highlight()'s per-token storm would
+            // drag the viewport across the whole document on every character typed. It also
+            // must not set linesDirty or drop the layout cache — selection is not text, and
+            // the host sends this back at us from inside our own notification.
+            st->caretOn = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            flushViewNotifications(st);
+            return 0;
+        }
+        case EM_SCROLLCARET:
+            // The sole reason double-clicking a Problem, or an Output file:line:col link,
+            // actually SHOWS you the line (MainWindow.cpp:1288).
+            // Does NOT clear desiredX, and that is correct rather than an omission: this
+            // moves the VIEW, never the caret, so a sticky column set by Up/Down is still
+            // the column that caret is in. (EM_EXSETSEL, which does move it, clears it —
+            // see there.)
+            ensureCaretVisible(st);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            flushViewNotifications(st);
+            return 0;
+
+        // ---- line geometry: everything the line-number gutter is built on --------
+        // All four are STRICTLY READ-ONLY of the view. They are serviced from inside the
+        // PARENT's WM_PAINT (MainWindow.cpp:389-417), so if one of them mutated scrollX/
+        // scrollY (clampScroll does; ensureLineIndex does not) and that raised EN_VSCROLL,
+        // the parent's handler would InvalidateRect the gutter during its own paint — the
+        // window re-dirties itself the instant it validates, a WM_PAINT loop at 100% CPU.
+        case EM_GETLINECOUNT:
+            ensureLineIndex(st);
+            return static_cast<LRESULT>(lineCount(st));  // always >= 1 (empty doc == 1 line)
+        case EM_LINEINDEX: {
+            ensureLineIndex(st);
+            LONG line = static_cast<LONG>(wParam);
+            // wParam is unsigned, but gotoLineCol passes `line - 1` unchecked
+            // (MainWindow.cpp:1285) — a diagnostic reporting line 0 arrives here as
+            // (WPARAM)-1. RichEdit's documented meaning for -1 is "the caret's line".
+            if (line < 0) line = static_cast<LONG>(lineIndexForOffset(st, st->model.caret()));
+            if (line < 0 || static_cast<size_t>(line) >= lineCount(st)) return -1;
+            // -1 past the end is DEPENDED ON at markErrorLines :641 (`if (start < 0)
+            // continue`) and :643 (`next < 0 ? -1 : next`) and gotoLineCol :1286.
+            return static_cast<LRESULT>(st->lineStarts[static_cast<size_t>(line)]);
+        }
+        case EM_EXLINEFROMCHAR: {
+            // Note the parameter swap versus EM_LINEFROMCHAR: wParam unused, lParam is the
+            // offset. Must be the EXACT inverse of EM_LINEINDEX or MainWindow.cpp:1925
+            // prints a negative column (it computes cpMin - lineIndex(exLineFromChar)).
+            ensureLineIndex(st);
+            LONG off = static_cast<LONG>(lParam);
+            if (off < 0) off = static_cast<LONG>(st->model.caret());  // -1 == current line
+            if (static_cast<size_t>(off) > st->model.length())
+                off = static_cast<LONG>(st->model.length());
+            return static_cast<LRESULT>(lineIndexForOffset(st, static_cast<size_t>(off)));
+        }
+        case EM_GETFIRSTVISIBLELINE: {
+            // Computed by CALLING visibleRange, not by re-deriving its arithmetic: the
+            // gutter's whole correctness is that this and EM_POSFROMCHAR agree about where
+            // the first visible line is, and two copies of the formula is how they drift.
+            size_t first = 0, last = 0;
+            visibleRange(st, first, last);
+            return static_cast<LRESULT>(first);
+        }
+        case EM_POSFROMCHAR: {
+            // RichEdit's convention, which is what the host uses (MainWindow.cpp:409):
+            // wParam = POINTL* (out), lParam = character index, return value ignored.
+            auto* pt = reinterpret_cast<POINTL*>(wParam);
+            if (!pt) return 0;
+            ensureLineIndex(st);
+            // ensureFormat, NOT just ensureLineIndex, and it is not belt-and-braces. The
+            // pitch below is st->lineH, which only measureMetrics ever sets and only
+            // ensureFormat ever calls. Before this line the arithmetic was correct purely by
+            // ACCIDENT of ordering — WM_SETTEXT happens to run afterEdit -> ensureCaretVisible
+            // -> xInLine -> layoutForLine -> ensureFormat before the parent's first paint can
+            // ask. Any reordering that lets the gutter query a control that has not laid a
+            // single line out yet gives lineH == 0 and stacks every line number at y ~ 0, on
+            // top of each other, with the loop's `pt.y > edH` exit never firing so it walks
+            // the whole document on every repaint. One idempotent pointer test buys that away.
+            ensureFormat(st);
+            LONG raw = static_cast<LONG>(lParam);
+            if (raw < 0) raw = 0;
+            size_t off = static_cast<size_t>(raw);
+            if (off > st->model.length()) off = st->model.length();
+            const size_t line = lineIndexForOffset(st, off);
+            // EXACTLY drawContent's origin, so the gutter's numbers sit on the editor's
+            // lines by construction — that is what "query each visible line's y from the
+            // editor (no drift)" at MainWindow.cpp:390 means. Editor-CLIENT device pixels,
+            // already DPI-scaled, and UNCLAMPED: the gutter loop's only early exit is
+            // `if (pt.y > edH) break` (:410), so clamping y would make it walk every line
+            // in the document on every repaint.
+            const float lh = (std::max)(1.0f, st->lineH);
+            pt->y = static_cast<LONG>(static_cast<float>(dpx(st, kInsetY) - st->scrollY) +
+                                      static_cast<float>(line) * lh);
+            // Short-circuit the line start — the only x the gutter ever asks for — so a
+            // parent repaint does not build an IDWriteTextLayout per visible line and churn
+            // the very cache trimCache exists to bound.
+            const float x = (off <= st->lineStarts[line]) ? 0.0f : xInLine(st, line, off);
+            pt->x = static_cast<LONG>(static_cast<float>(dpx(st, kInsetX) - st->scrollX) + x);
+            return 0;
+        }
+
+        // ---- undo / redo --------------------------------------------------------
+        // THE ONLY undo path in the shipping exe. runApp's accelerator table claims Ctrl+Z
+        // and Ctrl+Y (MainWindow.cpp:2089-2090) and TranslateAcceleratorW runs before
+        // DispatchMessageW (:2104) for hwnd AND its descendants, so those keystrokes become
+        // WM_COMMAND ID_UNDO/ID_REDO on the MAIN window and never reach onKeyDown's 'Z'/'Y'
+        // arms at all — that code is live only in tests/d2d_editor_demo.cpp, which has no
+        // accelerator table. (Ctrl+Shift+Z DOES reach them: accelerator modifier matching
+        // is exact and there is no FSHIFT entry. So Ctrl+Shift+Z redoes here where RichEdit
+        // does nothing — a bonus, not a bug.) Both routes end in afterEdit, i.e. the same
+        // funnel: an undo that moves the buffer AWAY from the saved point without an
+        // EN_CHANGE leaves g.dirty false and the buffer is discarded with no prompt.
+        // EM_CANUNDO/EM_CANREDO GATE the action, they do not merely grey the button
+        // (:1958-1959, :1662-1663) — returning 0 would make undo unreachable, silently.
+        case EM_CANUNDO: return st->model.canUndo() ? TRUE : FALSE;
+        case EM_CANREDO: return st->model.canRedo() ? TRUE : FALSE;
+        case EM_UNDO:
+            if (!st->model.canUndo()) return FALSE;
+            st->model.undo();
+            afterEdit(st);
+            return TRUE;
+        case EM_REDO:
+            if (!st->model.canRedo()) return FALSE;
+            st->model.redo();
+            afterEdit(st);
+            return TRUE;
+
+        // ---- configuration / formatting -----------------------------------------
+        case EM_SETEVENTMASK: {
+            const LRESULT prev = static_cast<LRESULT>(st->eventMask);
+            st->eventMask = static_cast<DWORD>(lParam);
+            return prev;  // see EditorState::eventMask for why the DEFAULT is all-on
+        }
+        case EM_SETCHARFORMAT: {
+            if (wParam != SCF_ALL) {
+                // SCF_SELECTION is the ~500-calls-per-keystroke colouring path (applyColor
+                // :516) and the error tints (applyBackColor :529). SLICE 4 replaces both
+                // with computeSpans() + painted decoration; until then this is a no-op that
+                // reports success. Nobody checks the return.
+                //
+                // It must NOT raise EN_CHANGE, unlike RichEdit — a deliberate divergence.
+                // Formatting changes no text and g.dirty is a pure comparison over text, so
+                // nothing depends on those spurious notifications; whereas the host's
+                // g.highlighting guard is a plain bool that clearErrorMarks (:610) and
+                // markErrorLines (:650) clear UNCONDITIONALLY, so a notification raised from
+                // here could drop an outer guard mid-highlight.
+                return TRUE;
+            }
+            // SCF_ALL is NOT a no-op: styleEditor (MainWindow.cpp:160-171) is the ONLY
+            // channel by which the host tells the editor its typeface and size — g.hEdit
+            // never receives a WM_SETFONT anywhere in the program. Ignore it and
+            // Settings -> editor font silently stops working. CHARFORMAT2W is a strict
+            // superset of CHARFORMATW with the identical leading layout, so reading the
+            // shared prefix needs no cbSize branch. yHeight is TWIPS (the host sends
+            // 11 * 20); CFM_COLOR is ignored because the base text colour already comes
+            // from Theme::textPrimary in createBrushes.
+            auto* cf = reinterpret_cast<const CHARFORMATW*>(lParam);
+            if (!cf) return TRUE;
+            std::wstring face;
+            if (cf->dwMask & CFM_FACE)
+                face.assign(cf->szFaceName, wcsnlen(cf->szFaceName, LF_FACESIZE));
+            const float pts =
+                (cf->dwMask & CFM_SIZE) ? static_cast<float>(cf->yHeight) / 20.0f : 0.0f;
+            setFontInternal(st, face, pts);
+            return TRUE;
+        }
+        case EM_SETBKGNDCOLOR: {
+            // wParam == 0 means "use lParam"; non-zero means "the system window colour",
+            // which for this control means "go back to whatever the Theme says".
+            const COLORREF prev = st->haveBkColor ? st->bkColor : currentTheme().windowBg;
+            st->haveBkColor = (wParam == 0);
+            st->bkColor = static_cast<COLORREF>(lParam);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return static_cast<LRESULT>(prev);
+        }
+        case EM_SETTARGETDEVICE:
+            // The host's no-word-wrap idiom, (hDC = NULL, lineWidth = 1) at :251. Accepted
+            // and ignored: DWRITE_WORD_WRAPPING_NO_WRAP is unconditional here and strictly
+            // stronger. Not silently accepting lParam == 0 (wrap-to-window) as if it worked
+            // would be better still, but the host never sends it.
+            return TRUE;
+        case EM_GETOLEINTERFACE:
+            // No OLE interface, deliberately: editorDoc() (MainWindow.cpp:150-156) then
+            // returns nullptr and phase 18's suspendUndo/resumeUndo become no-ops at all
+            // eight of their call sites with NO host edit, and WM_DESTROY's Release is
+            // skipped because g.textDoc was never set. That is CORRECT here, not merely
+            // tolerated: they exist only to keep programmatic EM_SETCHARFORMAT off
+            // RichEdit's undo stack, and EditorModel's stack snapshots text + selection
+            // only, so a format is structurally incapable of entering it. Written out (and
+            // the out-param nulled) rather than left to DefWindowProcW, so the contract does
+            // not rest on the caller having initialised its pointer.
+            if (lParam) *reinterpret_cast<void**>(lParam) = nullptr;
+            return 0;
+        case WM_SETREDRAW:
+            // Handled here rather than by DefWindowProcW, which implements WM_SETREDRAW by
+            // toggling WS_VISIBLE — on a WS_CLIPCHILDREN parent (MainWindow.cpp:2047) that
+            // lets the parent paint over the editor's rect mid-highlight, flicker RichEdit
+            // does not have. There is nothing to suppress here anyway: this control only
+            // ever InvalidateRects, and no WM_PAINT can be dispatched inside the host's
+            // straight-line redraw-off windows because nothing pumps in them.
+            //
+            // So the flag earns its keep as something else entirely — it is the host's own
+            // EXACT (not heuristic) marker for "programmatic bookkeeping, stay quiet", used
+            // by flushViewNotifications to suppress EN_SELCHANGE. A depth COUNTER because
+            // the host's windows NEST (clearErrorMarks and markErrorLines run inside
+            // highlight()'s on the RichEdit path) and because an extra TRUE must not go
+            // negative — NOT because it is safer against an unbalanced FALSE. It is
+            // strictly worse there: an unbalanced FALSE leaves this at 1 forever and mutes
+            // EN_SELCHANGE permanently, where a bool would be cleared by the next TRUE.
+            // See EditorState::redrawOff.
+            if (wParam) {
+                if (st->redrawOff > 0) --st->redrawOff;
+                if (st->redrawOff == 0) {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    flushViewNotifications(st);  // report the NET change the storm left
+                }
+            } else {
+                ++st->redrawOff;
+            }
+            return 0;
+
         case WM_NCDESTROY:
             stopBlink(st);
             if (st->autoTimer) KillTimer(hwnd, kAutoScrollTimer);
@@ -1183,13 +1770,10 @@ std::wstring d2dEditorTextCrlf(HWND edit) {
 void d2dEditorSetText(HWND edit, const std::wstring& s) {
     EditorState* st = state(edit);
     if (!st) return;
-    st->model.setText(s);
-    st->model.setCaret(0, false);
-    st->scrollX = 0;
-    st->scrollY = 0;
-    st->pendingHigh = 0;
-    st->maxLineW = 0;
-    afterEdit(st);
+    // The SAME helper WM_SETTEXT uses. These were two copies of six lines before slice 3;
+    // whichever one had not been given the notification funnel would have been a silent
+    // text replacement, which is exactly how a buffer is discarded with no prompt.
+    setTextInternal(st, s);
 }
 
 LONG d2dEditorCaretOffset(HWND edit) {
@@ -1229,23 +1813,19 @@ void d2dEditorUpdateDpi(HWND edit, UINT dpi) {
     ensureFormat(st);
     dropLayoutCache(st);  // every cached layout was shaped at the old size
     st->maxLineW = 0;     // and so was the horizontal high-water mark
-    clampScroll(st);
+    clampScroll(st);      // the whole document just changed height — scrollY can move
     InvalidateRect(edit, nullptr, FALSE);
+    flushViewNotifications(st);  // same funnel contract as WM_SIZE / setFontInternal
 }
 
 void d2dEditorSetFont(HWND edit, const wchar_t* face, float pointSize) {
     EditorState* st = state(edit);
     if (!st) return;
-    if (face && *face) st->face = face;
-    if (pointSize > 0) st->pointSize = pointSize;
-    SafeRelease(st->format);
-    st->lineH = 0;
-    st->spaceW = 0;
-    ensureFormat(st);
-    dropLayoutCache(st);
-    st->maxLineW = 0;
-    clampScroll(st);
-    InvalidateRect(edit, nullptr, FALSE);
+    // Shares setFontInternal with EM_SETCHARFORMAT/SCF_ALL, which is how the host's
+    // Settings -> editor font actually reaches this control (styleEditor, MainWindow.cpp
+    // :169). Since slice 3 that is the live path; this entry point stays for the demo host
+    // and for anything that wants to set the font without speaking the dialect.
+    setFontInternal(st, face ? std::wstring(face) : std::wstring(), pointSize);
 }
 
 // ---- offscreen render -------------------------------------------------------

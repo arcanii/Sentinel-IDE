@@ -157,19 +157,31 @@ powershell -File scripts\capture.ps1 -Class SentinelProjectDlg   :: a modal dial
   in the **same** PowerShell call as `cmd /c` — keep them in separate calls.
 - **Screenshots:** the app isn't an installed app, so the screenshot MCP can't allowlist it.
   Use `scripts\capture.ps1` (WMI-detached launch + DPI-aware `PrintWindow`).
-- **`capture.ps1` works on the Direct2D editor** — verified in phase 46 slice 2 by capturing
-  the live demo: dark ground, real text, **zero** white pixels in the client area
-  (`windowBg` 70,545 sampled / `pureWhite` 0). A magenta-cleared `ID2D1HwndRenderTarget`
-  probe also captures as magenta. **If a capture ever comes back with a blank client area,
-  re-run it** — the window had most likely not presented yet. Do not conclude the renderer is
-  broken, and do not conclude `PrintWindow` cannot see Direct2D.
-  *(A slice-2 session did exactly that: one blank capture became a written-down "PrintWindow
-  cannot capture D2D" law in four files, plus an accusation that two reviewers had fabricated
-  their pixel readings. Both were wrong — the reviewers were right. A single observation is
-  not a mechanism, and this repo's signature defect is a claim nobody re-measured.)*
-- For **testing** the renderer, prefer the offscreen WIC path regardless — `ctest -R d2d_render`,
-  or `build\d2d_editor_demo.exe --render out.png <file>`. It needs no window, no desktop and
-  no human, and it asserts rather than inviting you to look.
+- **`capture.ps1` works on the Direct2D editor — WITH ONE CONDITION: the window must be
+  FOREGROUND.** Verified in phase 46 slice 2 by capturing the live demo in the foreground:
+  dark ground, real text, **zero** white pixels in the client area (`windowBg` 70,545 sampled
+  / `pureWhite` 0). A magenta-cleared `ID2D1HwndRenderTarget` probe also captures as magenta.
+  `PrintWindow` **can** see Direct2D; that is settled and re-measured.
+  **The condition is the part that keeps being lost, and it is not "try again".** A D2D swap
+  chain that has never been composited to the screen has nothing for `PrintWindow` to copy, so
+  a background or minimised window gives a **blank client area every time** — a reviewer got
+  blank 3/3 that way. The house rule is *launch GUI apps in the background*, and a background
+  process **cannot** bring a window to the foreground (`SetForegroundWindow` is refused unless
+  the caller owns the foreground). So an automated/agent run genuinely cannot capture this
+  control, and re-running changes nothing: either a human puts the window in front first, or
+  the capture is the wrong tool. (The frame-not-yet-presented case is real too, but it is a
+  first-capture-after-launch race, not the usual cause of a blank shot.)
+  *(A slice-2 session went the other way and wrote down a "PrintWindow cannot capture D2D" law
+  in four files from a single blank capture, plus an accusation that two reviewers had
+  fabricated their pixel readings. That was wrong and is retracted — the reviewers were right.
+  A single observation is not a mechanism; neither is a single retraction.)*
+- **For testing the renderer, use `ctest -R d2d_render` — it ASSERTS.** The offscreen WIC path
+  (also `build\d2d_editor_demo.exe --render out.png <file>`) needs no window, no foreground,
+  no desktop and no human, and it fails by itself instead of inviting you to look. Anything a
+  screenshot would have told you about whether the control drew, that test already checks.
+  `ctest -R d2d_dialect` is the equivalent for the message dialect. Reach for `capture.ps1`
+  only to LOOK at something (layout, theme, a visual judgement call), from a session that can
+  actually put the window in front.
 
 ## Environment gotchas (this machine)
 
@@ -767,10 +779,120 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     device lost, navigation could build one layout per line with nothing reclaiming them;
     autoscroll ran from timers queued before the drag ended; and `ensureCaretVisible` mixed content
     and scroll coordinates so Ctrl+Home never reached 0.
-    **Remaining slices, in order:** 3 the
-    message dialect + the notification funnel + the `CreateWindowExW` switch, shipping default OFF;
+    **SLICE 3 LANDED — the control is in the shipping exe, DEFAULT OFF.** `D2DEditor.cpp` +
+    `EditorModel.cpp` now compile into the `SentinelIDE` target (Release `/MT`, `/W4`, zero
+    warnings) and `createControls` picks the class at ONE `CreateWindowExW`: `[editor] d2d=1` in
+    `settings.ini`, or `--d2d-editor` / `--richedit` to force one run. The flag is scanned in
+    `wantD2DEditor()` and **not** in `runApp`'s argv loop, because that loop runs *after*
+    `WM_CREATE` has already built the control; it still gets a consuming arm there so the
+    catch-all `else openArg = a` cannot mistake the flag for a path. Deliberately **not** in the
+    Settings dialog until slice 5 — with no colouring yet a checkbox would advertise something
+    visibly worse (`lineNumbers` is the precedent for an `[editor]` key the dialog does not show).
+    **The dialect is ~20 messages**, each with its trap written at the site. Load-bearing ones:
+    `EM_GETTEXTEX` forks on `GT_USECRLF` → `textCrlf()` vs `text()` (`cb` is BYTES in, a CHARACTER
+    count out — reading it as characters would overrun `editorText()`'s `n+1` buffer on every
+    keystroke); `EM_GETTEXTLENGTHEX` is deliberately LENIENT about unknown flags because a 0 there
+    makes `saveFile` write an **empty file** and a negative one throws inside `s.resize`;
+    `EM_EXSETSEL` clamps, treats `cpMax == -1` as "to end", and **must not scroll** (that is
+    `EM_SCROLLCARET`, which is why `gotoLineCol` sends it next); `EM_LINEINDEX` returns **-1** past
+    the last line, which three call sites test for; `EM_POSFROMCHAR` returns exactly
+    `drawContent`'s origin so the gutter needs no line-height arithmetic; `EM_SETCHARFORMAT` is a
+    no-op for `SCF_SELECTION` (slice 4) but **not** for `SCF_ALL`, which is the *only* channel
+    `Settings → editor font` has (`g.hEdit` never gets a `WM_SETFONT`); and `EM_GETOLEINTERFACE`
+    returns 0 so `editorDoc()` is null and `suspendUndo`/`resumeUndo` become no-ops with no host
+    edit — correct, not merely tolerated, since `EditorModel`'s undo stack snapshots text +
+    selection only and a format cannot enter it.
+    **The funnel is one function called from one place**, the tail of `afterEdit()`, which every
+    text mutation already passed through — coverage by construction, not by inspection.
+    `SendMessageW`, never `Post`. `WM_COMMAND` carries `EN_CHANGE`/`EN_VSCROLL`/`EN_HSCROLL` and
+    `WM_NOTIFY` carries `EN_SELCHANGE`, which is **RichEdit's own split**, so the host runs the
+    *same* branch for both editors and any difference is the control, not the dialect. `lParam`
+    must be the HWND (`MainWindow.cpp:1931` tests `lParam != 0`). Scroll and selection are reported
+    by DIFF rather than per-site, because they are written in a dozen places each; `EN_CHANGE` is
+    not — it is explicit and gated on nothing. `EN_VSCROLL` is a deliberate SUPERSET of RichEdit
+    (any scroll change, not just scrollbar clicks), which also fixes the stale gutter on
+    keyboard-only scrolling. **`EM_UNDO`/`EM_REDO` funnel too, and that is not optional**: the
+    accelerator table claims Ctrl+Z/Ctrl+Y before the control ever sees them, so `ID_UNDO`/`ID_REDO`
+    is the *only* undo path in the exe and `D2DEditor`'s own `'Z'`/`'Y'` arms are live only in the
+    demo host. (Ctrl+Shift+Z does reach them — no `FSHIFT` entry — so it redoes, where RichEdit does
+    nothing.) `EN_SELCHANGE` is gated on `WM_SETREDRAW`, which is the host's own *exact* marker for
+    programmatic bookkeeping: every selection storm sits in a redraw-off window and `gotoLineCol`
+    does not.
+    **Host branches: six, plus the switch.** `applyTheme` and `WM_DPICHANGED` call
+    `d2dEditorApplyTheme` / `d2dEditorUpdateDpi` (child windows never receive `WM_DPICHANGED`, so
+    the control cannot learn it alone); the argv arm; and **three gates that must move together —
+    `highlight()`, `clearErrorMarks()` and `markErrorLines()`.** **The gate is about UNDO, not
+    cost** — `applyColor`'s `EM_EXSETSEL` reaches `EditorModel::setSelection`, which clears
+    `typingRun_`, so running it on every `EN_CHANGE` would make every keystroke its own undo step
+    and collapse the history to the last 200 characters (`kMaxUndo`). Slice 3 first shipped with
+    only `highlight()` gated, which was an inconsistency with a real cost: `applyBackColor` has the
+    *identical* `EM_EXGETSEL`/`EM_EXSETSEL`/`EM_SETCHARFORMAT` shape, so undo granularity quietly
+    degraded around **every build** — the moment someone is most likely to keep typing. Both error
+    paths are now gated the same way; their colouring was a visual no-op on that control anyway.
+    The state bookkeeping deliberately stays OUTSIDE the gate (`g.errorMarks := false`, and the
+    gutter invalidate), or `clearErrorMarks` would be re-entered on every keystroke forever.
+    Slice 4 deletes all three lines, and inherits the rule: **colour by drawing ranges, never by
+    moving the selection.**
+    **Two things found by putting it on screen.** (1) The line-number gutter painted the top
+    partial line's number OVER the file-tab strip — `DrawTextW` into the whole-window back buffer
+    with no clip, and the loop only ever guarded its BOTTOM edge, which was safe while RichEdit
+    scrolled by whole lines and stopped being safe the moment an editor scrolled by pixels. Fixed
+    unconditionally with an `IntersectClipRect` on `g.rGutter` (a no-op on RichEdit; the cached
+    `g.memDC` is reset afterwards). (2) `saveFile` now refuses to write when a non-empty buffer
+    fetches as zero characters — same one-way polarity as 1(a), it can only ever REFUSE.
+    **Found by review, after the fact, and fixed:** (a) **`EM_EXSETSEL` did not clear the sticky
+    vertical column `desiredX`** — every other caret-moving path does. Double-click a build
+    diagnostic (which sends `EM_EXSETSEL` + `EM_SCROLLCARET`) and press Down and the caret landed
+    in the column you were in *before* the jump; A/B'd against RichEdit as `Ln 2 Col 3` vs
+    `Ln 2 Col 31`. `onAutoScroll` had the same omission (it hand-rolls the tail of `caretMoved`
+    because it owns the scroll) and is fixed with it; `EM_SCROLLCARET` correctly does *not* clear
+    it, because it moves the view and never the caret. Pinned by `d2d_dialect` case 7.
+    (b) **`WM_SIZE`, `setFontInternal` and `d2dEditorUpdateDpi` changed the view through
+    `clampScroll` without reporting it**, contradicting the funnel's own "any change of
+    scrollY/scrollX reports here" — measured, the first visible line moved 381 → 331 with an
+    `EN_VSCROLL` delta of 0. Harmless only because every host caller repaints anyway, which is a
+    property of the callers, not the control; they all flush now. (c) `EM_POSFROMCHAR` derived its
+    line pitch from `st->lineH` but called only `ensureLineIndex`, so it was correct purely by the
+    accident that `WM_SETTEXT` happens to run `ensureFormat` first; `ensureFormat` is now called
+    at the three sites that consume `lineH` (`EM_POSFROMCHAR`, `visibleRange`, `contentHeight`).
+    (d) Two comments were wrong and are rewritten: the `WM_SETREDRAW` counter buys correct
+    NESTING and immunity to an extra TRUE, **not** protection from an unbalanced FALSE (which
+    parks it at 1 and mutes `EN_SELCHANGE` permanently, where a bool would self-heal); and
+    `afterEdit` listed "drop" among the mutations it covers, which is a path that **does not
+    exist** — the control registers no drop target and handles no `WM_DROPFILES`.
+    **Known difference, accepted:** dragging TEXT within the editor does nothing (RichEdit
+    supports it). Dropping a FILE is fine — it falls through to the main window's handler, which
+    is guarded by `confirmSaveIfDirty`.
+    **Remaining slices, in order:**
     4 `computeSpans` + painted tints; 5 a full release of opt-in bake; 6 flip the default; 7 delete
-    the RichEdit path.
+    the RichEdit path (the *editor* path only — `msftedit.dll`, `MSFTEDIT_CLASS` for `g.hOut` and
+    the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all survive).
+    **Slice 6's acceptance list, banked now:** dropping a file onto the editor AREA (RichEdit
+    registers its own OLE drop target today; the D2D control registers none, so the drop falls to
+    the main window — verify, do not assume), and the fact that the control paints its own caret
+    rather than using `CreateCaret`, so there is no system caret for Narrator/UIA to track.
+    **`ctest -R d2d_dialect` LANDED (`tests/d2d_dialect_test.cpp`, 97 assertions).** It was going
+    to be slice 4's; it is here now because the dialect shipped with *zero* automated coverage and
+    `editor_model_test` only pins the pure model — the bytes that reach disk go through the
+    HANDLERS' arithmetic, and nothing tested any of it. It builds a real parent window and a real
+    `WS_CHILD` control and drives them with the message shapes `MainWindow` sends. What it pins:
+    the exact `saveFile` sequence (`EM_GETTEXTLENGTHEX{GTL_NUMCHARS}` → `resize(2n+16)` →
+    `EM_GETTEXTEX{cb = bytes, GT_USECRLF}`) round-trips the real `examples/crypto.sentinel`
+    **byte-identically** with its 12 CRs intact; the `GT_DEFAULT` form is self-consistent and has
+    no CR; **`cb` is honoured as BYTES**, proven with a canary past the declared capacity so
+    reading it as characters *or* dropping the `- 1` is a failure rather than silent heap
+    corruption; `EM_GETTEXTLENGTHEX` is never negative and never 0 for a non-empty document under
+    nine flag combinations including all-ones; `EM_LINEINDEX`/`EM_EXLINEFROMCHAR` are inverses at
+    every line *and* every character offset, with -1 past the end; `EM_EXSETSEL` treats
+    `cpMax == -1` as "to end" and clamps `gotoLineCol`'s unbounded column; and **`EN_CHANGE` is
+    SYNCHRONOUS** — the parent's counter has moved before `SendMessageW` returns and nothing is
+    left in the queue, which is the check that catches a regression to `PostMessage`.
+    **Verified by negative control, four ways** (each mutation applied, rebuilt, run, reverted):
+    `cb` read as a character count → 8 failures incl. an explicit overrun report; the `- 1`
+    dropped → 8 failures; `SendMessageW` → `PostMessageW` in the funnel → 9 failures; the
+    `GT_USECRLF` fork ignored (the LF-only save that destroys the `.sig`) → 5 failures including
+    byte-identity. Exit 1 every time. Everything it asserts is a count, a range or an invariant —
+    no pixel, glyph or font metric — so a font, DPI or theme change cannot break it.
     **`ctest -R d2d_render` is the verification spine for slices 4-7.** It renders the control
     offscreen through WIC — the *same* `drawContent` the window uses — decodes the PNG back and
     asserts on real pixels: the background is Theme `windowBg`, and **>=500 pixels differ from it**
@@ -778,8 +900,9 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     inked (2.99%)**. Verified by negative control: suppressing the draw gives `0 of 788316` and the
     test fails, exit 1. It exists because rendering had NO automated coverage: a blank editor
     would compile, run, open a window and pass every other test in the repo. `capture.ps1` can
-    show you the control — it works fine on it — but seeing is not asserting, and slice 4's
-    colouring needs a check that runs headless in CI and fails by itself.
+    show you the control — it works fine on it, *while the window is foreground* — but seeing is
+    not asserting, an automated session cannot foreground anything, and slice 4's colouring needs
+    a check that runs headless in CI and fails by itself.
     One constraint it imposes: the per-line layouts must stay **device-independent** (no
     `SetDrawingEffect`), which is what lets the window target and the WIC target share one cache.
     Slice 4 must colour by drawing ranges, not by attaching effects to layouts, or the offscreen
@@ -793,6 +916,39 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     **and Build auto-saves the open file, so that fires without anyone pressing Ctrl+S, on the file
     that opens by default.** Stopped by the byte-identity golden test and a manual `git status
     examples/` gate on every slice from 3 onward.
+    **Both were exercised live at slice 3, with the switch ON.** Typing raised the dot and the
+    coral Save; `Close Project` and an externally-delivered second file both raised the
+    Save/Don't Save/Cancel prompt on an unsaved buffer; `ID_UNDO`/`ID_REDO` moved the dot off and
+    back on and tracked `Ln/Col`; double-clicking a Problem jumped the caret to `Ln 202, Col 20`
+    and scrolled the line into view. Ctrl+S and the **Build auto-save** each wrote a
+    `crypto.sentinel` through the Direct2D path that came back at **426 bytes, 12 CRLF, 12 CR,
+    12 LF** — every break CRLF, no strays — with `snc verify --sig` reporting **signature OK**.
+    The 1(a) detector (`Dirty flag missed a change`) did not fire once, on either path.
+
+    > **HOW TO RUN THAT CHECK — THE SAFE FORM, AND IT IS THE PROCEDURE FOR SLICES 4-7.**
+    > The slice-3 session ran it by pointing the IDE at `examples/` and saving
+    > **`examples/crypto.sentinel` itself**. The end state was clean and the signature verified,
+    > so nothing was lost — but that was the *outcome*, not the *design*. The whole reason the
+    > test exists is that a slip in the new `EM_GETTEXTEX` handler writes the file short or
+    > LF-only; running it on the committed original means the first symptom of the bug you are
+    > hunting is the destruction of the evidence, plus a committed `.sig` that no longer matches
+    > and a dirty tree to explain. The house rule — *never write to `examples/`* — is not a
+    > formality here, it is the containment.
+    > **Do this instead**, and never the other thing:
+    > 1. `robocopy examples %TEMP%\snt-crlf crypto.sentinel crypto.sentinel.sig sentinel-trust.toml`
+    >    (or a `.sntproject` copy of the whole folder) — a SCRATCH COPY outside the repo.
+    > 2. Open the scratch folder in the IDE (`--d2d-editor`), edit, Ctrl+S, and run a Build so the
+    >    **auto-save** path is exercised too — that is the one that fires with nobody pressing
+    >    Ctrl+S, and it is the one that reaches the signed file in real use.
+    > 3. Compare against the pristine original, which is still untouched in `examples/`:
+    >    `fc /b examples\crypto.sentinel %TEMP%\snt-crlf\crypto.sentinel` for byte identity, and
+    >    `snc verify --sig` in the scratch folder for the signature.
+    > 4. `git status --porcelain examples/` must print **nothing**, before and after. If it ever
+    >    prints a line, `git checkout -- examples/` and find out which write got out.
+    >
+    > `ctest -R d2d_dialect` now covers the same byte-identity property with no file write at
+    > all (it reads `examples/crypto.sentinel` `GENERIC_READ` and compares in memory), so the
+    > live run is confirmation that the *host* wiring is right, not the primary evidence.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.

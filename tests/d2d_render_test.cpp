@@ -11,12 +11,14 @@
 // pixels.
 //
 // scripts\capture.ps1 does capture this control correctly, so it is a fine way to LOOK at
-// it. It is not a way to TEST it: it needs a visible window, a human, and a judgement call.
-// This runs headless, is deterministic, and fails loudly. (An earlier note here claimed
-// PrintWindow could not capture Direct2D at all. That was wrong -- one capture came back
-// blank, most likely taken before the window had presented, and a general law got written
-// from a single observation. Re-measured: a magenta-cleared D2D window captures as magenta,
-// and this demo captures with its real text.)
+// it -- PROVIDED the window is FOREGROUND. It is not a way to TEST it: it needs a visible
+// window someone has brought to the front, and a judgement call. This runs headless, is
+// deterministic, and fails loudly. (An earlier note here claimed PrintWindow could not
+// capture Direct2D at all. That was wrong and is retracted -- re-measured, a magenta-cleared
+// D2D window captures as magenta and the demo captures with its real text. The real
+// condition is compositing: a background or minimised D2D window has nothing to copy and
+// captures blank EVERY time, and a background process cannot foreground it, so an automated
+// run cannot use capture.ps1 on this control at all.)
 //
 // THE ASSERTION THAT IS THE POINT OF THE WHOLE FILE is case 4: a meaningful number of
 // pixels must DIFFER from the background. A control that renders a blank window — the

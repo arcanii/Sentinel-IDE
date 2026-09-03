@@ -6,11 +6,14 @@
 // unit-tested text model) and renders it with ONE IDWriteTextLayout PER LINE, laid out
 // lazily and only for lines that are actually on screen.
 //
-// SCOPE OF THIS SLICE. This is the renderer + input surface only:
-//   - no RichEdit message dialect (EM_*, EN_CHANGE/EN_SELCHANGE) — that is slice 3;
-//   - no syntax colouring — slice 4. Plain single-colour text is correct here.
-// The control is NOT linked into the Sentinel-IDE exe yet; tests/d2d_editor_demo.cpp is a
-// standalone host that proves it works without touching MainWindow.cpp.
+// SCOPE. Slice 2 built the renderer + input surface; SLICE 3 added the RichEdit message
+// dialect (the ~20 EM_* messages MainWindow.cpp actually sends) and the synchronous
+// EN_CHANGE / EN_SELCHANGE / EN_VSCROLL / EN_HSCROLL funnel, and linked the control into
+// the Sentinel-IDE exe behind ONE CreateWindowExW in createControls, DEFAULT OFF
+// ([editor] d2d in settings.ini, or --d2d-editor / --richedit for one run).
+//   - no syntax colouring — slice 4. Plain single-colour text is correct here, and
+//     EM_SETCHARFORMAT with SCF_SELECTION is a deliberate no-op until then.
+// tests/d2d_editor_demo.cpp remains a standalone host for driving it without the IDE.
 //
 // WHY NOT THE REFERENCE'S SHAPE. SQLTerminal's SqlEditorControl builds ONE
 // IDWriteTextLayout over the whole document and word-wraps it. For a query box that is
@@ -66,11 +69,14 @@ void d2dEditorSetFont(HWND edit, const wchar_t* face, float pointSize);
 // real pixels in CI — the regression net for "the editor renders a blank window", and
 // what makes slices 4-7 (syntax colouring) verifiable at all.
 //
-// For simply LOOKING at the control, scripts\capture.ps1 works on the live window.
-// (An earlier version of this comment claimed PrintWindow could not capture Direct2D
-// at all. It was wrong: one blank capture — most likely taken before the window had
-// presented — got generalised into a mechanism. Re-measured, a magenta-cleared D2D
-// window captures as magenta and the demo captures with its real text.)
+// For simply LOOKING at the control, scripts\capture.ps1 works on the live window — but
+// only while that window is FOREGROUND. (An earlier version of this comment claimed
+// PrintWindow could not capture Direct2D at all. It was wrong and is retracted:
+// re-measured, a magenta-cleared D2D window captures as magenta and the demo captures with
+// its real text. The actual condition is compositing — a background or minimised D2D
+// window has nothing for PrintWindow to copy and captures blank every time, and a
+// background process cannot foreground it, so an automated run cannot capture this control
+// at all. Use the test above, which needs no window.)
 //
 // The caller owns COM init (CoInitializeEx) — this creates the WIC factory but will not
 // initialize an apartment behind the caller's back.
