@@ -23,10 +23,12 @@ struct Settings {
     std::wstring vcvarsPath;                      // optional vcvars64.bat override (MSVC linker env; else auto-detected)
     bool         lineNumbers = false;             // show the editor line-number gutter
     // Opt-in: use the Direct2D editor control instead of RichEdit (phase 46 slice 3).
-    // DEFAULT OFF and deliberately NOT exposed in the Settings dialog yet — until slice 4
-    // it has no syntax colouring and no error tints, so a checkbox would advertise a
-    // feature that is visibly worse. `lineNumbers` sets the precedent for an [editor] key
-    // the dialog does not surface. Slice 6 flips this default; slice 7 deletes the branch.
+    // STILL DEFAULT OFF — RichEdit is what every user gets unless they ask otherwise.
+    // Surfaced in the Settings dialog since slice 5 (it was held back until slice 4 gave the
+    // control syntax colouring, because a checkbox that offers a visibly worse editor is
+    // worse than no checkbox). READ EXACTLY ONCE, by wantD2DEditor() at WM_CREATE, so a
+    // change here needs a restart — which is what the dialog's hint line says.
+    // Slice 6 flips this default; slice 7 deletes the branch.
     bool         d2dEditor   = false;
     std::wstring updateSkipVersion;               // appcast version the user chose to skip (never re-offer it)
     std::vector<std::wstring> recents;            // recently-opened project folders (most-recent first)

@@ -817,6 +817,105 @@ int main(int argc, char** argv) {
         check(stormSteps >= 10, "a selection-based highlighter really would shatter the run");
     }
 
+    // ---------------------------------------------------------------------------
+    // The control PAINTS its caret, so there is no GDI caret to see. That is a rendering
+    // choice; having no SYSTEM caret was an accessibility REGRESSION against RichEdit,
+    // because GetGUIThreadInfo/OBJID_CARET is the only thing Narrator, Magnifier's
+    // "follow the text cursor" and IME candidate placement can follow. Slice 5 creates a
+    // real caret (never shown) and keeps it on the painted one; this is what says so.
+    //
+    // Nothing here is a font or pixel metric: every expected position is asked of the
+    // control through EM_POSFROMCHAR, which returns drawContent's own origin. The claim
+    // under test is therefore an invariant — "the system caret is exactly where the control
+    // says that character is" — and it holds at any font, DPI or theme.
+    printf("\n11. a real SYSTEM caret exists, tracks the painted caret, and dies with focus\n");
+    {
+        auto caretOwner = []() -> HWND {
+            GUITHREADINFO gi{};
+            gi.cbSize = sizeof(gi);
+            return GetGUIThreadInfo(GetCurrentThreadId(), &gi) ? gi.hwndCaret : nullptr;
+        };
+        auto caretRect = []() -> RECT {
+            GUITHREADINFO gi{};
+            gi.cbSize = sizeof(gi);
+            if (!GetGUIThreadInfo(GetCurrentThreadId(), &gi)) return RECT{ 0, 0, 0, 0 };
+            return gi.rcCaret;
+        };
+        auto posFromChar = [](HWND e, LONG off) -> POINTL {
+            POINTL p{ -9999, -9999 };
+            SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, static_cast<LPARAM>(off));
+            return p;
+        };
+
+        SendMessageW(edit, WM_KILLFOCUS, 0, 0);
+        check(caretOwner() != edit, "with no focus, the editor owns no caret");
+
+        // A document tall and wide enough that the caret can be moved and scrolled away
+        // from the origin in both axes.
+        std::wstring doc;
+        for (int i = 0; i < 200; ++i) doc += L"let alpha = beta + gamma * delta;  // a line\n";
+        SetWindowTextW(edit, doc.c_str());
+        SetFocus(edit);
+        check(GetFocus() == edit, "the editor took the focus");
+        check(caretOwner() == edit, "...and CREATED a system caret that it owns");
+
+        // At three caret positions: the top of the document, a column well into line 5, and
+        // line 150 — which is far enough down that ensureCaretVisible must scroll to reach
+        // it, so the y below is only right if the caret follows the VIEW as well as the
+        // offset.
+        struct { LONG line, col; } spots[] = { { 0, 0 }, { 5, 20 }, { 150, 12 } };
+        for (auto& s : spots) {
+            const LONG off = lineIndex(edit, s.line) + s.col;
+            setSel(edit, off, off);
+            SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+            SendMessageW(edit, WM_PAINT, 0, 0);
+            const POINTL want = posFromChar(edit, off);
+            POINT got{ -1, -1 };
+            GetCaretPos(&got);
+            printf("     line %3ld col %2ld: EM_POSFROMCHAR (%ld,%ld), GetCaretPos (%ld,%ld)\n",
+                   s.line, s.col, want.x, want.y, got.x, got.y);
+            check(got.x == want.x && got.y == want.y,
+                  "the system caret sits exactly where the control puts that character");
+        }
+
+        // The caret must follow a scroll that does NOT move it in the document — this is
+        // the case a "set it when the selection changes" implementation gets wrong.
+        const LONG off = lineIndex(edit, 150) + 12;
+        SendMessageW(edit, WM_PAINT, 0, 0);
+        POINT before{ 0, 0 };
+        GetCaretPos(&before);
+        for (int i = 0; i < 3; ++i)
+            SendMessageW(edit, WM_VSCROLL, MAKEWPARAM(SB_LINEUP, 0), 0);
+        SendMessageW(edit, WM_PAINT, 0, 0);
+        POINT after{ 0, 0 };
+        GetCaretPos(&after);
+        const POINTL wantAfter = posFromChar(edit, off);
+        printf("     after 3x WM_VSCROLL(SB_LINEUP): y %ld -> %ld, EM_POSFROMCHAR y %ld\n",
+               before.y, after.y, wantAfter.y);
+        check(after.y != before.y, "a pure scroll moved the system caret");
+        check(after.x == wantAfter.x && after.y == wantAfter.y,
+              "...and left it exactly on EM_POSFROMCHAR");
+
+        // Its HEIGHT is the line pitch, taken from the control the same way: two adjacent
+        // lines' y difference. A one-pixel caret would report an insertion point with no
+        // extent for a magnifier to zoom to. Within ONE pixel, not exactly: the pitch is a
+        // float (25.67px here) and both numbers truncate it — the caret once, the two
+        // EM_POSFROMCHAR ys at different fractional offsets — so adjacent lines can measure
+        // 26 apart while the caret is 25 tall. Anything larger than that is a real defect.
+        const POINTL y0 = posFromChar(edit, lineIndex(edit, 150));
+        const POINTL y1 = posFromChar(edit, lineIndex(edit, 151));
+        const RECT rc = caretRect();
+        const LONG pitch = y1.y - y0.y, tall = rc.bottom - rc.top;
+        printf("     line pitch %ld, GUITHREADINFO rcCaret height %ld\n", pitch, tall);
+        check(tall > 1 && (tall - pitch <= 1) && (pitch - tall <= 1),
+              "the caret is one line tall (to the pixel a float pitch rounds to)");
+        check(rc.left == after.x && rc.top == after.y,
+              "GUITHREADINFO reports the same point (this is what an AT actually reads)");
+
+        SendMessageW(edit, WM_KILLFOCUS, 0, 0);
+        check(caretOwner() != edit, "kill-focus destroyed it - a caret is a per-THREAD object");
+    }
+
     DestroyWindow(edit);
     DestroyWindow(host);
 

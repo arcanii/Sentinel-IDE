@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SentinelIDE Settings — a dark-themed modal dialog (mirrors the SQLTerminal
-// themed-dialog pattern): editor font, theme, the log level + location, and the
-// build toolchain (the snc compiler + the MSVC environment that provides link.exe).
+// themed-dialog pattern): editor font, the Direct2D editor opt-in, theme, the log
+// level + location, and the build toolchain (the snc compiler + the MSVC
+// environment that provides link.exe).
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -22,8 +23,8 @@ namespace sentinelide {
 namespace {
 
 enum { IDC_FONT = 101, IDC_THEME, IDC_LEVEL, IDC_LOG, IDC_REVEAL,
-       IDC_SNC, IDC_SNC_BROWSE, IDC_VCVARS, IDC_VCVARS_BROWSE,
-       IDC_HDR_BUILD = 130, IDC_SNC_HINT, IDC_VCVARS_HINT };
+       IDC_SNC, IDC_SNC_BROWSE, IDC_VCVARS, IDC_VCVARS_BROWSE, IDC_D2D,
+       IDC_HDR_BUILD = 130, IDC_SNC_HINT, IDC_VCVARS_HINT, IDC_D2D_HINT };
 
 struct DlgState {
     Settings* s = nullptr;
@@ -53,7 +54,14 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case WM_CTLCOLORSTATIC: {
             const Theme& th = currentTheme(); int id = GetDlgCtrlID((HWND)l); HDC hdc = (HDC)w;
             if (id == IDC_HDR_BUILD) { SetTextColor(hdc, th.accent); SetBkColor(hdc, th.panelBg); return (LRESULT)themeBrush(th.panelBg); }
-            if (id == IDC_SNC_HINT || id == IDC_VCVARS_HINT) { SetTextColor(hdc, th.textMuted); SetBkColor(hdc, th.panelBg); return (LRESULT)themeBrush(th.panelBg); }
+            if (id == IDC_SNC_HINT || id == IDC_VCVARS_HINT || id == IDC_D2D_HINT) { SetTextColor(hdc, th.textMuted); SetBkColor(hdc, th.panelBg); return (LRESULT)themeBrush(th.panelBg); }
+            // The checkbox is a BUTTON but sends WM_CTLCOLORSTATIC, and it falls through to
+            // dialogCtlColor with every other label: panelBg ground, textPrimary text. Its
+            // BOX and its text are drawn by the theme engine, not by this colour — which is
+            // why it needs the DarkMode_Explorer hint applyDialogDarkMode pushes onto every
+            // child (a stock checkbox would draw a white box and near-black text on the dark
+            // panel). Same route as ProjectSettingsDialog's IDC_SIGN, which is the only
+            // other checkbox in the app; the light theme takes no hint and needs none.
             return dialogCtlColor(msg, w);
         }
         case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
@@ -86,6 +94,13 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 GetWindowTextW(st->eLog, buf, 1024); st->s->logFile = buf;
                 GetWindowTextW(st->eSnc, buf, 1024); st->s->sncPath = buf;
                 GetWindowTextW(st->eVcvars, buf, 1024); st->s->vcvarsPath = buf;
+                // Written to [editor] d2d by saveSettings; READ once, at WM_CREATE, by
+                // createControls' wantD2DEditor(). Nothing here tries to swap the live
+                // control — the editor class is chosen at the single CreateWindowExW that
+                // built it, and re-creating it mid-session would mean re-homing the text,
+                // the undo stack, the dirty state and every host handle that points at it.
+                // The hint under the checkbox says "restart" for exactly that reason.
+                st->s->d2dEditor = IsDlgButtonChecked(hwnd, IDC_D2D) == BST_CHECKED;
                 st->result = IDOK; st->done = true; return 0;
             }
             if (id == IDCANCEL && st) { st->done = true; return 0; }
@@ -133,6 +148,25 @@ bool showSettingsDialog(HWND owner, Settings& s, const std::wstring& resolvedSnc
     int yy = M;
     mk(L"STATIC", L"Editor font", SS_LEFT, x0, yy + S(4), lblW, S(20), 0, ui);
     st.eFont = mk(L"EDIT", s.editorFont.c_str(), ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, fx, yy, fldW, S(22), IDC_FONT, ui); yy += rowH;
+
+    // The Direct2D editor (phase 46 slice 5) — the first thing in this dialog the user is
+    // being asked to OPT IN to rather than configure, so the label says "preview" and the
+    // hint says what it costs. In the field column with no label of its own, which is the
+    // shape ProjectSettingsDialog's IDC_SIGN already set for a checkbox in this app.
+    // BS_AUTOCHECKBOX, not owner-draw: the state and the keyboard behaviour come free, and
+    // it reports itself to UIA/Narrator as a real checkbox with a real checked state, which
+    // an owner-drawn BS_OWNERDRAW button does not.
+    mk(L"BUTTON", L"Use the Direct2D editor  (preview)", BS_AUTOCHECKBOX | WS_TABSTOP, fx, yy + S(2), fldW, S(22), IDC_D2D, ui);
+    CheckDlgButton(hwnd, IDC_D2D, s.d2dEditor ? BST_CHECKED : BST_UNCHECKED);
+    yy += rowH - S(8);
+    // A wrapping muted line, the same voice as the snc/vcvars hints below. It has to be
+    // here: the editor class is chosen once, at WM_CREATE, so a toggle cannot take effect
+    // in this session and a checkbox that appears to do nothing is worse than no checkbox.
+    // TWO lines at every DPI this ships at, so it is sized for two. S(34) was one line
+    // plus a sliver, which clipped the second one mid-word into the Theme row below --
+    // caught by screenshotting the dialog, not by anything that compiles.
+    mk(L"STATIC", L"Takes effect after a restart. Dragging text within the editor is not supported yet.",
+       SS_LEFT, fx, yy, fldW, S(46), IDC_D2D_HINT, ui); yy += S(52);
 
     mk(L"STATIC", L"Theme", SS_LEFT, x0, yy + S(4), lblW, S(20), 0, ui);
     st.cTheme = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, fx, yy, S(190), S(200), IDC_THEME, ui); yy += rowH;

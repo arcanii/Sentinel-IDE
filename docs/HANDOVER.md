@@ -963,14 +963,51 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     assertions): 65 characters typed **with a repaint after each** and an error tint set and
     cleared partway = **1 undo step**; the same 60 characters with an `EM_EXSETSEL` between them
     = **60 undo steps**. The second half is what makes the first half mean something.
-    **Remaining slices, in order:**
-    5 a full release of opt-in bake; 6 flip the default; 7 delete
+    **SLICE 5 PREPARED, NOT PUBLISHED** (uncommitted at the time of writing → see the working
+    tree). It makes the D2D editor *discoverable* so it gets real exposure before slice 6 flips
+    the default. Three things:
+    (a) **A Settings checkbox** — "Use the Direct2D editor  (preview)", `BS_AUTOCHECKBOX` (not
+    owner-draw, so UIA/Narrator see a real checkbox with a real checked state), written to
+    `[editor] d2d`. It was held back until slice 4 on purpose: a checkbox offering a *visibly
+    worse* editor is worse than no checkbox. The setting is READ EXACTLY ONCE, by
+    `wantD2DEditor()` at `WM_CREATE`, so it needs a restart — the hint under it says so, because
+    a checkbox that appears to do nothing is the worst of the three options. Nothing tries to
+    swap the live control: the class is chosen at the single `CreateWindowExW` that built it, and
+    re-creating it mid-session would mean re-homing the text, the undo stack, the dirty state and
+    every host handle pointing at it.
+    (b) **A REAL SYSTEM CARET** — this was banked below as slice 6's problem and is bought here
+    instead, because slice 5 is the release that actually offers this to users. The control paints
+    its own caret; `GetGUIThreadInfo` and the `OBJID_CARET` accessible object read the *system*
+    caret, so with none created there was nothing for Narrator, Magnifier's "follow the text
+    cursor", or an IME placing its candidate list to track — a genuine accessibility regression
+    against RichEdit, which creates one. Now created on focus, moved with `SetCaretPos`, destroyed
+    on kill-focus (a caret is a per-THREAD object) — and **deliberately never `ShowCaret`'d**: a
+    shown caret is a SECOND caret, a blinking GDI bar beside the painted one. Created-and-
+    positioned is all the reporting APIs read. `caretClientPos` is the ONE copy of that arithmetic,
+    shared by the painted caret, the system caret and the IME composition window, in
+    `drawContent`'s exact float form — `(LONG)(n + f)` and `n + (LONG)f` disagree by a pixel when
+    `n + f` is negative, which put the IME window off the glyph on a scrolled-away caret.
+    `d2d_dialect` case 11 pins it: the system caret sits exactly on `EM_POSFROMCHAR` at three
+    scattered offsets, follows a pure scroll, is one line tall, and dies with focus.
+    (c) **Version 0.1.7 → 0.1.8** in `scripts/build.bat` (`MKT`/`MKTRC`; CRLF verified intact
+    afterwards — 91 CRLF, 0 bare LF). Nothing else release-related was touched: no tag, no
+    appcast, no signing. Publishing is a separate, deliberate act — see *Releases*.
+    **Found by screenshotting the dialog, not by anything that compiles:** the checkbox's hint
+    static was sized `S(34)`, one line plus a sliver, so its second line was clipped mid-word into
+    the Theme row below. Now `S(46)`. Look at dialogs you change.
+
+    **Remaining slices, in order:** 6 flip the default; 7 delete
     the RichEdit path (the *editor* path only — `msftedit.dll`, `MSFTEDIT_CLASS` for `g.hOut` and
     the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all survive).
     **Slice 6's acceptance list, banked now:** dropping a file onto the editor AREA (RichEdit
     registers its own OLE drop target today; the D2D control registers none, so the drop falls to
-    the main window — verify, do not assume), and the fact that the control paints its own caret
-    rather than using `CreateCaret`, so there is no system caret for Narrator/UIA to track.
+    the main window — verify, do not assume); multi-monitor `WM_DPICHANGED`; and **the physical
+    keystrokes — Ctrl+Z / Ctrl+Y / Ctrl+S with `d2d=1`**, which NOTHING has yet tested with real
+    keys. Every undo/redo/save check in slices 3-5 posted the `WM_COMMAND` that
+    `TranslateAcceleratorW` produces, which is the code those slices changed but is not the
+    keyboard. An automated session cannot inject them (it cannot foreground the window); a human
+    can do it in a minute. Do it before the default flips.
+    *(The system-caret item that used to be banked here is DONE — see slice 5(b) above.)*
     **`ctest -R d2d_dialect` LANDED (`tests/d2d_dialect_test.cpp`, 97 assertions).** It was going
     to be slice 4's; it is here now because the dialect shipped with *zero* automated coverage and
     `editor_model_test` only pins the pure model — the bytes that reach disk go through the
@@ -1073,6 +1110,15 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.5` | 154 | `Sentinel-IDE-0.1.5.154-setup.exe` | Patch. **The first release whose auto-update actually installs** — v0.1.0–v0.1.4 offered, downloaded and verified updates, then silently installed nothing (phase 40). The app now runs the verified payload itself, and the updater logs what it does. **Clients ≤0.1.4 must install this one by hand.** |
 | `v0.1.6` | 160 | `Sentinel-IDE-0.1.6.160-setup.exe` | Patch. Saved-point dirty tracking: undoing back to the loaded or last-saved text now clears the `●` and the unsaved-changes prompt, instead of latching on at the first keystroke. **First release verified by a real released client auto-updating to it** — a shipped 0.1.5 install went to 0.1.6.160 in under 10 s via ≡ ▸ Check for Updates…. |
 | `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
+
+**0.1.8 is PREPARED BUT NOT PUBLISHED.** `scripts/build.bat` carries `MKT=0.1.8`, so any build
+from this tree stamps 0.1.8.<n> — but there is **no tag, no installer, no signature and no appcast
+entry**, and `kAppcastUrl` still serves 0.1.7 to every client. It is not a release until
+`docs/RELEASING.md` has been followed end to end. What it *will* carry: the Direct2D editor as a
+discoverable opt-in (Settings ▸ "Use the Direct2D editor (preview)", restart required), with syntax
+colouring, painted error-line tints and a real system caret for Narrator/Magnifier/IME. RichEdit
+remains the default, so the release is behaviourally a no-op for anyone who does not tick the box —
+which is the entire point of baking it as an opt-in first.
 
 **Every release before 0.1.4 was dead on arrival for anyone without Visual Studio.** `scripts/build.bat`
 is the only build script and it configured `-DCMAKE_BUILD_TYPE=Debug`, so v0.1.0–v0.1.3 shipped a
@@ -1251,8 +1297,9 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Targets follow-ons (remaining):** per-target `lib_paths`; a definable output dir; add/remove
   `[[target]]` blocks from the form (today it edits existing blocks' name/entry/type in place).
 - **Undo/redo follow-up:** track the saved point so undo-to-clean clears `●`; toolbar button hover states.
-- **The Direct2D editor** — **slices 1-4 landed (colouring included), opt-in and DEFAULT OFF; slices 5-7
-  remain, see phase 46**; dark **title-bar menu bar**; a
+- **The Direct2D editor** — **slices 1-5 done (colouring, error tints, system caret, Settings
+  checkbox), opt-in and DEFAULT OFF; 0.1.8 PREPARED not published; slices 6-7 remain, see
+  phase 46**; dark **title-bar menu bar**; a
   project-templates picker (lib/exe/multi-target) for New Project.
 - **Reconcile the spines/PRD** to ADR-0061 signing + the project/tier model (un-park PRD work).
 

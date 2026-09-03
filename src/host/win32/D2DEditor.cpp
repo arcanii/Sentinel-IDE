@@ -231,6 +231,13 @@ struct EditorState {
     UINT_PTR blinkTimer = 0;
     UINT_PTR autoTimer = 0;
 
+    // The SYSTEM caret (slice 5) — created while focused, never shown. See
+    // syncSystemCaret. sysCaretPt/sysCaretH are the values last pushed to USER32, so a
+    // sync that changes nothing costs no call and raises no accessibility event.
+    bool sysCaret = false;
+    POINT sysCaretPt{ -1, -1 };
+    int sysCaretH = 0;
+
     // ---- the RichEdit dialect (slice 3) -------------------------------------
     // EM_SETEVENTMASK's mask. THE DEFAULT IS EVERY BIT SET, NOT ZERO, and that is the
     // whole point of writing it out: a mask that starts empty and then somehow misses
@@ -962,6 +969,63 @@ void drawContent(EditorState* st, ID2D1RenderTarget* rt) {
     }
 }
 
+// ---- the SYSTEM caret (slice 5) ---------------------------------------------
+// This control PAINTS its caret (drawContent, above) so the theme owns that pixel. What
+// that silently dropped is the SYSTEM caret, and the system caret is not decoration: it is
+// what GetGUIThreadInfo / the OBJID_CARET accessible object report, so with none created
+// there is NOTHING for Narrator, Windows Magnifier's "follow the text cursor", or an IME
+// placing its candidate list to track. RichEdit creates one, so the Direct2D editor was
+// shipping a real accessibility regression against the control it replaces — banked for
+// slice 6 in the handover, bought here instead because slice 5 offers this to users.
+//
+// So: a REAL caret, created on focus and destroyed on kill-focus, moved with SetCaretPos —
+// but deliberately NEVER ShowCaret'd. A shown caret is a SECOND caret: a blinking GDI bar
+// beside the painted one, drawn by USER32 into a client area that a Direct2D swap chain
+// re-presents underneath it. Created-and-positioned is all the reporting APIs read;
+// visible is not part of the contract, and this control's visible caret is the one it draws.
+
+// The caret in CLIENT coordinates. Mirrors drawContent's ox/oy exactly — the same
+// inset-minus-scroll origin and the same line * lineH — in the ints SetCaretPos and
+// ImmSetCompositionWindow take. ONE copy of that arithmetic, so the painted caret, the
+// system caret and the IME composition window cannot end up in three different places.
+// The float expressions are drawContent's and EM_POSFROMCHAR's, character for character,
+// and that is deliberate rather than tidy: `(LONG)(n + f)` and `n + (LONG)f` disagree by
+// one pixel whenever n + f is negative (truncation is toward zero, not down), so the
+// integer-first form this used to carry could put the IME window a pixel off the glyph on a
+// scrolled-away caret. Written this way, EM_POSFROMCHAR(caret) IS the caret position, which
+// is also what d2d_dialect case 11 asserts.
+void caretClientPos(EditorState* st, POINT& pt, int& h) {
+    ensureFormat(st);  // lineH, or the caret is one pixel tall at the top of the window
+    ensureLineIndex(st);
+    const size_t line = lineIndexForOffset(st, st->model.caret());
+    const float lh = (std::max)(1.0f, st->lineH);
+    pt.x = static_cast<LONG>(static_cast<float>(dpx(st, kInsetX) - st->scrollX) +
+                             xInLine(st, line, st->model.caret()));
+    pt.y = static_cast<LONG>(static_cast<float>(dpx(st, kInsetY) - st->scrollY) +
+                             static_cast<float>(line) * lh);
+    h = (std::max)(1, static_cast<int>(lh));
+}
+
+// Called from the tail of paint(), which is the one place that cannot drift from where the
+// caret was actually drawn: every path that moves the caret or the view already ends in an
+// InvalidateRect, and a path that does not repaint has not moved the painted caret either.
+void syncSystemCaret(EditorState* st) {
+    if (!st->sysCaret) return;
+    POINT pt{};
+    int h = 0;
+    caretClientPos(st, pt, h);
+    if (h != st->sysCaretH) {
+        // CreateCaret is the only way to change a caret's SIZE, so a font or DPI change has
+        // to rebuild it. It also destroys whatever caret existed, which is exactly right.
+        if (!CreateCaret(st->hwnd, nullptr, (std::max)(1, dpx(st, 1)), h)) return;
+        st->sysCaretH = h;
+        st->sysCaretPt = POINT{ pt.x - 1, pt.y };  // never equal: force the SetCaretPos below
+    }
+    if (pt.x == st->sysCaretPt.x && pt.y == st->sysCaretPt.y) return;
+    st->sysCaretPt = pt;
+    SetCaretPos(pt.x, pt.y);
+}
+
 void paint(EditorState* st) {
     PAINTSTRUCT ps;
     BeginPaint(st->hwnd, &ps);
@@ -1043,6 +1107,12 @@ void paint(EditorState* st) {
         const size_t hi = (std::min)(lineCount(st), cl + 1 + kCacheMargin);
         trimCache(st, lo, hi);
     }
+    // AFTER both branches: the system caret follows the PAINTED caret, including when the
+    // device is lost and nothing was drawn (the insertion point is still where it is, and
+    // an assistive tool asking about it must not be told a stale answer). The one layout
+    // this can build in the lost branch is the caret's own line, which the trim above
+    // keeps anyway.
+    syncSystemCaret(st);
     EndPaint(st->hwnd, &ps);
 }
 
@@ -1235,14 +1305,15 @@ void stopBlink(EditorState* st) {
 void positionImeWindow(EditorState* st) {
     HIMC himc = ImmGetContext(st->hwnd);
     if (!himc) return;
-    ensureLineIndex(st);
-    const size_t line = lineIndexForOffset(st, st->model.caret());
+    // Same arithmetic as the painted caret and the system caret, from the one copy of it.
+    // (It used to be spelled out here and skipped ensureFormat, so it was correct only
+    // because something else had already measured the font — see caretClientPos.)
+    POINT pt{};
+    int h = 0;
+    caretClientPos(st, pt, h);
     COMPOSITIONFORM cf{};
     cf.dwStyle = CFS_POINT;
-    cf.ptCurrentPos.x =
-        dpx(st, kInsetX) + static_cast<LONG>(xInLine(st, line, st->model.caret())) - st->scrollX;
-    cf.ptCurrentPos.y = dpx(st, kInsetY) +
-                        static_cast<LONG>(static_cast<float>(line) * st->lineH) - st->scrollY;
+    cf.ptCurrentPos = pt;
     ImmSetCompositionWindow(himc, &cf);
     ImmReleaseContext(st->hwnd, himc);
 }
@@ -1590,12 +1661,24 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             st->hasFocus = true;
             st->caretOn = true;
             startBlink(st);
+            // The system caret lives exactly as long as focus does — it is a per-THREAD
+            // object, so keeping one while another control owns the focus would report
+            // this control's insertion point for someone else's window.
+            st->sysCaret = true;
+            st->sysCaretH = 0;                  // force the CreateCaret in syncSystemCaret
+            st->sysCaretPt = POINT{ -1, -1 };
+            syncSystemCaret(st);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_KILLFOCUS:
             st->hasFocus = false;
             st->pendingHigh = 0;  // drop a half-typed surrogate rather than cross a focus change
             stopBlink(st);
+            if (st->sysCaret) {
+                st->sysCaret = false;
+                st->sysCaretH = 0;
+                DestroyCaret();  // ours: it only succeeds for the caret this thread owns
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_TIMER:
@@ -1968,6 +2051,10 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
         case WM_NCDESTROY:
             stopBlink(st);
+            // Normally WM_KILLFOCUS has already done this; a window destroyed while it
+            // still holds the focus never gets one, and leaving a caret behind would have
+            // the thread reporting an insertion point in a window that no longer exists.
+            if (st->sysCaret) { st->sysCaret = false; DestroyCaret(); }
             if (st->autoTimer) KillTimer(hwnd, kAutoScrollTimer);
             discardDeviceResources(st);
             dropLayoutCache(st);
