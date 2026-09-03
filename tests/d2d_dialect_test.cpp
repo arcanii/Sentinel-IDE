@@ -78,6 +78,8 @@ constexpr int kEditId = 1000;  // stands in for IDC_EDIT
 
 struct Counts {
     int change = 0, vscroll = 0, hscroll = 0, selchange = 0;
+    UINT menuCmd = 0;   // last WM_COMMAND with lParam == 0 (accelerator / menu)
+    int menuCount = 0;
     LONG selMin = -1, selMax = -1;
     WORD selTyp = 0;
 };
@@ -92,11 +94,19 @@ Counts gC;
 LRESULT CALLBACK HostProc(HWND h, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_COMMAND && lParam != 0 && LOWORD(wParam) == kEditId) {
         switch (HIWORD(wParam)) {
-            case EN_CHANGE: ++gC.change; return 0;
+            case EN_CHANGE: ++gC.change; return 0;  // (menuCmd/menuCount live below)
             case EN_VSCROLL: ++gC.vscroll; return 0;
             case EN_HSCROLL: ++gC.hscroll; return 0;
             default: break;
         }
+    }
+    // An ACCELERATOR or menu command, not a control notification: WM_COMMAND with a NULL
+    // lParam. The arm above deliberately tests lParam != 0, exactly as MainWindow.cpp does,
+    // so accelerator commands fall through to here rather than being miscounted as EN_*.
+    if (msg == WM_COMMAND && lParam == 0) {
+        gC.menuCmd = LOWORD(wParam);
+        ++gC.menuCount;
+        return 0;
     }
     if (msg == WM_NOTIFY) {
         auto* nm = reinterpret_cast<NMHDR*>(lParam);
@@ -916,6 +926,89 @@ int main(int argc, char** argv) {
         check(caretOwner() != edit, "kill-focus destroyed it - a caret is a per-THREAD object");
     }
 
+    // ---- 13 -----------------------------------------------------------------
+    // THE ACCELERATOR TABLE OWNS Ctrl+Z / Ctrl+Y / Ctrl+S, AND THE CONTROL MUST NOT SEE THEM.
+    // runApp installs a window-level accelerator table and calls TranslateAcceleratorW BEFORE
+    // TranslateMessage/DispatchMessage, so those chords become WM_COMMAND ID_UNDO/ID_REDO/
+    // ID_SAVE on the MAIN window and never reach the control's own WM_KEYDOWN arm. That is
+    // load-bearing in both directions: if the routing broke, undo would look dead on the
+    // Direct2D path (its 'Z' arm is unreachable by design); and if the table ever claimed a
+    // chord the EDITOR needs, that key would silently stop working inside the editor.
+    //
+    // This was verified once, by hand, in a scratch harness during slice 3 — the same
+    // measured-once-in-a-transcript pattern the DPI case below exists to end. It is a test now,
+    // and it matters more since slice 6 made this control the default.
+    //
+    // WHAT THIS DOES NOT COVER, said plainly so nobody reads more into a green tick than is
+    // there: runApp's ACCEL array and `enum MenuId` are both locals in MainWindow.cpp, not a
+    // shared header, so this case MIRRORS them. It therefore pins the ROUTING MECHANISM — that
+    // TranslateAcceleratorW gets first refusal and the control never sees a claimed chord —
+    // and NOT the contents of the real table. Delete Ctrl+Z from MainWindow's array and this
+    // still passes. Nor does it press a physical key: it posts the WM_KEYDOWN Windows would
+    // post and fakes the CONTROL key state that TranslateAccelerator actually reads. The one
+    // untested link is hardware -> Windows, which is not ours. If the ACCEL array or the enum
+    // is ever renumbered, this test must move with it.
+    printf("\n13. the accelerator table claims Ctrl+Z/Y/S; the editor keeps its own keys\n");
+    {
+        enum : UINT { kIdSave = 1004, kIdUndo = 1005, kIdRedo = 1006 };
+        ACCEL accels[] = {
+            { FVIRTKEY | FCONTROL, (WORD)'S', (WORD)kIdSave },
+            { FVIRTKEY | FCONTROL, (WORD)'Z', (WORD)kIdUndo },
+            { FVIRTKEY | FCONTROL, (WORD)'Y', (WORD)kIdRedo },
+        };
+        HACCEL hAccel = CreateAcceleratorTableW(accels, 3);
+        check(hAccel != nullptr, "built the same accelerator table runApp installs");
+
+        BYTE saved[256];
+        GetKeyboardState(saved);
+
+        auto pressWithCtrl = [&](WORD vk) -> bool {
+            BYTE ks[256];
+            GetKeyboardState(ks);
+            ks[VK_CONTROL] = 0x80;   // TranslateAccelerator reads the real key STATE, not the
+            ks[VK_LCONTROL] = 0x80;  // message, so the chord has to be genuinely held down
+            SetKeyboardState(ks);
+            drainQueueUndispatched();
+            gC.menuCmd = 0;
+            gC.menuCount = 0;
+            PostMessageW(edit, WM_KEYDOWN, vk, 1);
+            MSG m;
+            if (!PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) return false;
+            // Exactly runApp's loop order: the accelerator gets first refusal.
+            const bool eaten = TranslateAcceleratorW(host, hAccel, &m) != 0;
+            if (!eaten) { TranslateMessage(&m); DispatchMessageW(&m); }
+            return eaten;
+        };
+
+        struct { WORD vk; UINT id; const char* name; } claimed[3] = {
+            { 'Z', kIdUndo, "Ctrl+Z -> ID_UNDO" },
+            { 'Y', kIdRedo, "Ctrl+Y -> ID_REDO" },
+            { 'S', kIdSave, "Ctrl+S -> ID_SAVE" },
+        };
+        for (const auto& c : claimed) {
+            const bool eaten = pressWithCtrl(c.vk);
+            printf("     %s: consumed=%d, host got command %u\n", c.name, (int)eaten, gC.menuCmd);
+            check(eaten, "the accelerator consumed it before the control could see it");
+            check(gC.menuCount == 1 && gC.menuCmd == c.id,
+                  "...and the host received exactly that command, once");
+        }
+
+        // The other direction, and it is the half that would rot silently: a chord the table
+        // does NOT claim must fall through to the editor. Ctrl+A is select-all IN the control.
+        SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)L"alpha beta");
+        SendMessageW(edit, WM_SETFOCUS, 0, 0);
+        const bool eatenA = pressWithCtrl('A');
+        check(!eatenA, "Ctrl+A is NOT claimed by the table - the editor still owns it");
+        CHARRANGE cr{ -1, -1 };
+        SendMessageW(edit, EM_EXGETSEL, 0, (LPARAM)&cr);
+        printf("     Ctrl+A reached the editor: selection %ld..%ld of 10\n", cr.cpMin, cr.cpMax);
+        check(cr.cpMin == 0 && cr.cpMax == 10, "...and it selected all of the buffer");
+
+        SetKeyboardState(saved);
+        DestroyAcceleratorTable(hAccel);
+        drainQueueUndispatched();
+    }
+
     // ---- 12 -----------------------------------------------------------------
     // A MONITOR MOVE RESCALES THE CONTROL. This was on slice 6's acceptance list as
     // "verify, do not assume", and it had been measured exactly once, by hand, in a session
@@ -937,6 +1030,11 @@ int main(int argc, char** argv) {
             SendMessageW(e, EM_POSFROMCHAR, (WPARAM)&p, static_cast<LPARAM>(off));
             return p;
         };
+        // Set our OWN buffer rather than inheriting whatever the previous case left: case 13
+        // ends by select-all-ing a one-line string, and asking a one-line document for the
+        // pitch between lines 2 and 3 yields 0. A case that depends on its predecessor breaks
+        // the moment someone reorders them.
+        SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)L"one\ntwo\nthree\nfour\nfive");
         struct { UINT dpi; LONG pitch; } m[3] = { {96, 0}, {144, 0}, {192, 0} };
         for (auto& e : m) {
             sentinelide::d2dEditorUpdateDpi(edit, e.dpi);
