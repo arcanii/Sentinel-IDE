@@ -996,7 +996,28 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     static was sized `S(34)`, one line plus a sliver, so its second line was clipped mid-word into
     the Theme row below. Now `S(46)`. Look at dialogs you change.
 
-    **Remaining slices, in order:** 6 flip the default; 7 delete
+    **SLICE 6 DONE — the Direct2D control is the DEFAULT.** `Settings::d2dEditor` is now
+    `true`, so a machine with no `[editor] d2d` key gets it. Three escape hatches survive and
+    all three were verified live off the log's `Editor control:` line: no flag and no key →
+    `Direct2D (default)`; `--richedit` → `RichEdit (opted out)`; `--d2d-editor` → Direct2D.
+    Unticking the box writes `d2d=0` and is permanent, and `createControls` still falls back to
+    RichEdit on its own if the window class fails to register. **Anyone who ran 0.1.8 and left
+    the box unticked keeps RichEdit** — `saveSettings` wrote `d2d=0`, and an explicit opt-out
+    must outrank a changed default.
+    The Settings label dropped "(preview)" and the hint flipped with it: a ticked-by-default
+    checkbox must not describe itself as something you opt into, and the useful sentence is no
+    longer what you gain by ticking but **what you lose by unticking** — dragging TEXT within a
+    file, which RichEdit supports and this control does not. (Shortening that hint was not
+    cosmetic: the longer wording ran to three lines in a two-line static and clipped, the same
+    way slice 5's did. Screenshot the dialog after changing its text.)
+    **What slice 6 deliberately does NOT do:** remove the choice. That is slice 7, and it should
+    not run until this default has had real use. The two editors are not feature-identical yet.
+    **Still unverified, and it is the same item slice 5 left open:** the physical keystrokes.
+    Ctrl+Z / Ctrl+Y / Ctrl+S have only ever been exercised as the `WM_COMMAND` that
+    `TranslateAcceleratorW` produces — the code these slices changed, but not the keyboard. An
+    automated session cannot inject them. **This is now the DEFAULT editor, so that check is
+    worth a minute of a human's time before 0.1.9 ships.**
+    **Remaining slices:** 7 delete
     the RichEdit path (the *editor* path only — `msftedit.dll`, `MSFTEDIT_CLASS` for `g.hOut` and
     the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all survive).
     **Slice 6's acceptance list, banked now:** dropping a file onto the editor AREA (RichEdit
@@ -1110,15 +1131,21 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.5` | 154 | `Sentinel-IDE-0.1.5.154-setup.exe` | Patch. **The first release whose auto-update actually installs** — v0.1.0–v0.1.4 offered, downloaded and verified updates, then silently installed nothing (phase 40). The app now runs the verified payload itself, and the updater logs what it does. **Clients ≤0.1.4 must install this one by hand.** |
 | `v0.1.6` | 160 | `Sentinel-IDE-0.1.6.160-setup.exe` | Patch. Saved-point dirty tracking: undoing back to the loaded or last-saved text now clears the `●` and the unsaved-changes prompt, instead of latching on at the first keystroke. **First release verified by a real released client auto-updating to it** — a shipped 0.1.5 install went to 0.1.6.160 in under 10 s via ≡ ▸ Check for Updates…. |
 | `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
+| `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap, stated in the release notes: dragging TEXT within the editor is not supported (dropping a FILE still opens it). |
 
-**0.1.8 is PREPARED BUT NOT PUBLISHED.** `scripts/build.bat` carries `MKT=0.1.8`, so any build
-from this tree stamps 0.1.8.<n> — but there is **no tag, no installer, no signature and no appcast
-entry**, and `kAppcastUrl` still serves 0.1.7 to every client. It is not a release until
-`docs/RELEASING.md` has been followed end to end. What it *will* carry: the Direct2D editor as a
-discoverable opt-in (Settings ▸ "Use the Direct2D editor (preview)", restart required), with syntax
-colouring, painted error-line tints and a real system caret for Narrator/Magnifier/IME. RichEdit
-remains the default, so the release is behaviourally a no-op for anyone who does not tick the box —
-which is the entire point of baking it as an opt-in first.
+**0.1.8 IS PUBLISHED (2026-09-04).** Tag `v0.1.8` points at **55ae4bd**, the clean tree the
+binary was built from (`rev-list --count` 80 + `BUILDBASE` 100 = build **180**), so it rebuilds
+from its tag. Checks that were actually run, in this order, because the order is the point:
+`dumpbin /DEPENDENTS` listed only Windows system DLLs plus `WinSparkle.dll` — no debug CRT, the
+check four early releases failed; `sign-release.ps1` reported *Valid signature* against the key
+compiled into `Updater.cpp`; the **enclosure was confirmed HTTP 200 at 3,614,330 bytes, matching
+the appcast `length` and the local installer byte for byte, BEFORE the feed was pushed** — a 404
+enclosure is the one failure that makes every client see an update it then cannot download; then
+the feed itself, live at `raw.githubusercontent.com`, serving `sparkle:version="0.1.8.180"`.
+**Not verified: that a real client installs it.** Steps like these verify the OFFER path only,
+which is exactly all anyone verified for v0.1.0-v0.1.4 — every one of which offered updates that
+then installed nothing. The install check needs a throwaway client stamped below the feed; see the
+box at the end of `docs/RELEASING.md`.
 
 **Every release before 0.1.4 was dead on arrival for anyone without Visual Studio.** `scripts/build.bat`
 is the only build script and it configured `-DCMAKE_BUILD_TYPE=Debug`, so v0.1.0–v0.1.3 shipped a
@@ -1297,9 +1324,10 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Targets follow-ons (remaining):** per-target `lib_paths`; a definable output dir; add/remove
   `[[target]]` blocks from the form (today it edits existing blocks' name/entry/type in place).
 - **Undo/redo follow-up:** track the saved point so undo-to-clean clears `●`; toolbar button hover states.
-- **The Direct2D editor** — **slices 1-5 done (colouring, error tints, system caret, Settings
-  checkbox), opt-in and DEFAULT OFF; 0.1.8 PREPARED not published; slices 6-7 remain, see
-  phase 46**; dark **title-bar menu bar**; a
+- **The Direct2D editor** — **slices 1-6 done: it is now the DEFAULT** (`--richedit` and the
+  Settings checkbox both still opt out). **0.1.8 published** carrying it as an opt-in; the flip
+  itself is unreleased. **Slice 7 (delete the RichEdit path) remains — do not run it until the
+  new default has had real use**, see phase 46; dark **title-bar menu bar**; a
   project-templates picker (lib/exe/multi-target) for New Project.
 - **Reconcile the spines/PRD** to ADR-0061 signing + the project/tier model (un-park PRD work).
 

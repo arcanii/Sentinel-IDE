@@ -28,8 +28,17 @@ struct Settings {
     // control syntax colouring, because a checkbox that offers a visibly worse editor is
     // worse than no checkbox). READ EXACTLY ONCE, by wantD2DEditor() at WM_CREATE, so a
     // change here needs a restart — which is what the dialog's hint line says.
-    // Slice 6 flips this default; slice 7 deletes the branch.
-    bool         d2dEditor   = false;
+    // SLICE 6: FLIPPED. The Direct2D control is now the default and RichEdit is the
+    // fallback. What makes that defensible is that it is still a DEFAULT, not a removal:
+    // `--richedit` overrides it at any time, unticking the box overrides it permanently, and
+    // createControls falls back on its own if the window class fails to register. Slice 7 is
+    // what removes the choice, and it should not run until this default has had real use.
+    //
+    // The escape hatch matters more than usual here because the two editors are not yet
+    // feature-identical: dragging TEXT within the editor works on RichEdit and not on this
+    // control (dropping a FILE works on both — neither child accepts files, so the drop
+    // reaches MainWindow's guarded handler either way, measured via WS_EX_ACCEPTFILES).
+    bool         d2dEditor   = true;
     std::wstring updateSkipVersion;               // appcast version the user chose to skip (never re-offer it)
     std::vector<std::wstring> recents;            // recently-opened project folders (most-recent first)
 };

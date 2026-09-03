@@ -156,7 +156,11 @@ bool showSettingsDialog(HWND owner, Settings& s, const std::wstring& resolvedSnc
     // BS_AUTOCHECKBOX, not owner-draw: the state and the keyboard behaviour come free, and
     // it reports itself to UIA/Narrator as a real checkbox with a real checked state, which
     // an owner-drawn BS_OWNERDRAW button does not.
-    mk(L"BUTTON", L"Use the Direct2D editor  (preview)", BS_AUTOCHECKBOX | WS_TABSTOP, fx, yy + S(2), fldW, S(22), IDC_D2D, ui);
+    // SLICE 6: this is now the DEFAULT, so the label drops "(preview)" — a checkbox that
+    // is ticked out of the box must not describe itself as something you are opting into.
+    // The hint below flips with it: the useful sentence is no longer "what you get if you
+    // tick this" but "what you lose if you untick it".
+    mk(L"BUTTON", L"Use the Direct2D editor", BS_AUTOCHECKBOX | WS_TABSTOP, fx, yy + S(2), fldW, S(22), IDC_D2D, ui);
     CheckDlgButton(hwnd, IDC_D2D, s.d2dEditor ? BST_CHECKED : BST_UNCHECKED);
     yy += rowH - S(8);
     // A wrapping muted line, the same voice as the snc/vcvars hints below. It has to be
@@ -165,7 +169,7 @@ bool showSettingsDialog(HWND owner, Settings& s, const std::wstring& resolvedSnc
     // TWO lines at every DPI this ships at, so it is sized for two. S(34) was one line
     // plus a sliver, which clipped the second one mid-word into the Theme row below --
     // caught by screenshotting the dialog, not by anything that compiles.
-    mk(L"STATIC", L"Takes effect after a restart. Dragging text within the editor is not supported yet.",
+    mk(L"STATIC", L"Takes effect after a restart. Untick for the older editor, which supports dragging text.",
        SS_LEFT, fx, yy, fldW, S(46), IDC_D2D_HINT, ui); yy += S(52);
 
     mk(L"STATIC", L"Theme", SS_LEFT, x0, yy + S(4), lblW, S(20), 0, ui);

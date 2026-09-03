@@ -248,7 +248,7 @@ void createControls(HWND hwnd) {
     // is unconditional where the RichEdit line is `if (th.dark)`.
     if (g.d2dEditor) d2dEditorApplyTheme(g.hEdit);
     else if (th.dark) SetWindowTheme(g.hEdit, L"DarkMode_Explorer", nullptr);
-    logMsg(LogLevel::Info, std::wstring(L"Editor control: ") + (g.d2dEditor ? L"Direct2D (opt-in)" : L"RichEdit"));
+    logMsg(LogLevel::Info, std::wstring(L"Editor control: ") + (g.d2dEditor ? L"Direct2D (default)" : L"RichEdit (opted out)"));
     SendMessageW(g.hEdit, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE | ENM_SCROLL);
     SendMessageW(g.hEdit, EM_SETTARGETDEVICE, 0, 1);   // no word-wrap → width changes don't reflow (code-editor default; smooth splitter)
     styleEditor(g.hEdit, th.windowBg);
