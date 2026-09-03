@@ -97,6 +97,25 @@ public:
 
     // ---- editing -----------------------------------------------------------
     void insertText(const std::wstring& s);  // replaces the selection if any
+
+    // Drag-and-drop MOVE: lift the current selection out and re-insert it at `dest` (an
+    // offset in the text as it is NOW, before the lift), as ONE undo step.
+    //
+    // WHY IT LIVES HERE and is not two calls in the control. A move spelled
+    // deleteSelection() + insertText() is TWO recordPreEdit(false) calls, i.e. two
+    // snapshots, i.e. Ctrl+Z leaves the text with the selection deleted and nothing
+    // re-inserted — a half-move on screen, which is worse than either end state. Undo
+    // granularity is the undo stack's business, and the undo stack is in here.
+    //
+    // A `dest` INSIDE [min, max] is a no-op, deliberately and not defensively: dropping a
+    // selection onto itself must change nothing and must not even push an undo step.
+    // (The bounds are inclusive at both ends — landing exactly on either edge also puts
+    // the text back where it started.)
+    //
+    // Afterwards the moved run is SELECTED, so it can be dragged straight on again, which
+    // is what every other editor does and what makes a mis-drop cheap to correct.
+    void moveSelectionTo(size_t dest);
+
     void backspace();                        // delete selection, else codepoint left
     void deleteForward();                    // delete selection, else codepoint right
     void deleteSelection();                  // no-op when empty

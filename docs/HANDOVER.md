@@ -724,7 +724,9 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     separately — `snc verify` against a one-byte-flipped `.sig` exits non-zero, which is what makes
     `verifyFile` return `Invalid`.
 
-46. **Direct2D editor — slices 1-4 of ~8-11 sessions landed; it is in the exe, DEFAULT OFF.** The
+46. **Direct2D editor — slices 1-7 landed; it is the DEFAULT, and the two editors are now
+    feature-identical.** (This heading has tracked the work slice by slice; the numbered
+    sub-sections below are in the order they landed, so slice 7 is the last of them.) The
     editor replacement is the largest remaining item and is genuinely multi-session, so it was
     designed before any code moved: three strategies proposed independently (parallel control,
     model-first, render-first), judged on regression risk / effort / how early something ships, then
@@ -860,9 +862,10 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     parks it at 1 and mutes `EN_SELCHANGE` permanently, where a bool would self-heal); and
     `afterEdit` listed "drop" among the mutations it covers, which is a path that **does not
     exist** — the control registers no drop target and handles no `WM_DROPFILES`.
-    **Known difference, accepted:** dragging TEXT within the editor does nothing (RichEdit
-    supports it). Dropping a FILE is fine — it falls through to the main window's handler, which
-    is guarded by `confirmSaveIfDirty`.
+    **Known difference, accepted at the time — CLOSED IN SLICE 7:** dragging TEXT within the
+    editor did nothing (RichEdit supports it). Dropping a FILE fell through to the main window's
+    handler, guarded by `confirmSaveIfDirty` — and keeping that true after the control grew a drop
+    target of its own is the hard half of slice 7. See the slice-7 section below.
     **SLICE 4 LANDED — syntax colouring and the error tints, both PAINTED.** The rules moved out
     of `MainWindow.cpp::highlight()` into **`src/editor/SyntaxLexer.{h,cpp}`** — pure, no Windows,
     no `COLORREF` — exposing `computeSpans(text, len, LexState&, out)` with an explicit
@@ -1006,8 +1009,9 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     must outrank a changed default.
     The Settings label dropped "(preview)" and the hint flipped with it: a ticked-by-default
     checkbox must not describe itself as something you opt into, and the useful sentence is no
-    longer what you gain by ticking but **what you lose by unticking** — dragging TEXT within a
-    file, which RichEdit supports and this control does not. (Shortening that hint was not
+    longer what you gain by ticking but **what you lose by unticking** — at slice 6 that was
+    dragging TEXT within a file. **Slice 7 closed that gap, so the clause is gone**; the hint now
+    says only that the box needs a restart and that unticking returns you to RichEdit. (Shortening that hint was not
     cosmetic: the longer wording ran to three lines in a two-line static and clipped, the same
     way slice 5's did. Screenshot the dialog after changing its text.)
     **What slice 6 deliberately does NOT do:** remove the choice. That is slice 7, and it should
@@ -1017,9 +1021,10 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     `TranslateAcceleratorW` produces — the code these slices changed, but not the keyboard. An
     automated session cannot inject them. **This is now the DEFAULT editor, so that check is
     worth a minute of a human's time before 0.1.9 ships.**
-    **Remaining slices:** 7 delete
-    the RichEdit path (the *editor* path only — `msftedit.dll`, `MSFTEDIT_CLASS` for `g.hOut` and
-    the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all survive).
+    **Remaining slices:** 7 was *text drag-and-drop* (below), which is the stated precondition;
+    what is left is deleting the RichEdit path (the *editor* path only — `msftedit.dll`,
+    `MSFTEDIT_CLASS` for `g.hOut` and the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all
+    survive).
     **Slice 6's acceptance list, banked now:** dropping a file onto the editor AREA (RichEdit
     registers its own OLE drop target today; the D2D control registers none, so the drop falls to
     the main window — verify, do not assume); multi-monitor `WM_DPICHANGED`; and **the physical
@@ -1108,6 +1113,115 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     > all (it reads `examples/crypto.sentinel` `GENERIC_READ` and compares in memory), so the
     > live run is confirmation that the *host* wiring is right, not the primary evidence.
 
+
+    **SLICE 7 LANDED — TEXT DRAG AND DROP, and with it the last behavioural difference against
+    RichEdit.** Drag a selection to move it, Ctrl-drag to copy, accept `CF_UNICODETEXT` dropped
+    from other applications, with the caret tracking the drop point. The two editors are now
+    feature-identical, which was the stated precondition for deleting the RichEdit path.
+
+    **`OleInitialize` replaced `CoInitializeEx` in `runApp` (MainWindow.cpp).** `RegisterDragDrop`
+    fails with `CO_E_NOTINITIALIZED` on a thread that has only a plain COM apartment. It is a
+    strict upgrade — `OleInitialize` calls `CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)`
+    itself — so the shell dialogs, WIC and the shell-item APIs are untouched. **Pairing checked,
+    not assumed:** that call and the `CoUninitialize` (now `OleUninitialize`) after the message
+    loop are the *only* COM init/teardown on the UI thread, and the five `std::thread`s this app
+    starts (signing, build, run, and two in `Updater.cpp`) initialise no apartment and use no COM.
+    One init, one uninit, same thread.
+
+    **THE TRAP, and it is bigger than the feature: REGISTERING A DROP TARGET STEALS FILE DROPS.**
+    An OLE drop target on a CHILD wins outright over the parent's `DragAcceptFiles`, so from the
+    moment `RegisterDragDrop` succeeds the shell stops sending `WM_DROPFILES` to the main window
+    for anything dropped on the editor's rectangle. Left unhandled, dropping a `.sentinel` on the
+    text area does nothing — or, if `CF_HDROP` fell through to the text branch, pastes its PATH.
+    Either is a worse regression than the gap being closed. So `CF_HDROP` is classified FIRST and
+    handed straight back to the host: `EditorDropTarget::forwardFilesToHost` copies the shell's
+    `HGLOBAL` byte-for-byte and `SendMessage`s it to the parent as `WM_DROPFILES`, which lands in
+    MainWindow's existing handler → `requestOpenPath` → the `confirmSaveIfDirty`-guarded
+    `WM_APP_OPEN_PATH`. **No second opening path was written**, deliberately: that guard is the
+    only thing standing between a dropped file and someone's unsaved buffer. The block is COPIED
+    rather than forwarded because the host finishes with `DragFinish` (a `GlobalFree`) while the
+    `STGMEDIUM` belongs to the data object and is returned with `ReleaseStgMedium` — handing one
+    handle to both is a double free.
+
+    **A move is ONE undo step.** `EditorModel::moveSelectionTo(dest)` does the delete and the
+    insert under a single `recordPreEdit(false)`. Spelled as `deleteSelection() + insertText()` it
+    would be two snapshots and the first Ctrl+Z would show the text deleted and not re-inserted —
+    a half-move. A `dest` inside `[min, max]` (inclusive at both ends) is a no-op that pushes no
+    undo step at all, so dropping a selection onto itself changes nothing rather than costing a
+    Ctrl+Z to get past.
+
+    **Every drop ends in `afterEdit`.** `applyDrop` is the only mutating function in the
+    drag-and-drop section and its last statement is the funnel, i.e. a SYNCHRONOUS `EN_CHANGE`. A
+    drop that mutated the buffer and returned to OLE without notifying would leave the buffer
+    discardable with no prompt — this project's defect #1, arriving through a path nobody types
+    into.
+
+    **`DoDragDrop` is a MODAL LOOP inside the window proc**, and every line of `beginTextDrag` is
+    placed for that: the dragged run is COPIED out of the model before the call (a `const wchar_t*`
+    into `model.text()` would dangle across a reallocation); the local move is performed by the
+    DROP against the model's state at that instant, never against offsets captured at drag start;
+    the delete that ends an EXTERNAL move re-checks that the range still holds the exact text that
+    was handed over, and skips it otherwise (leaving a copy is recoverable, deleting the wrong run
+    is not); `state(hwnd) != st` is re-tested after the call in case the window went away with it;
+    the blink timer is stopped for the duration and `st->selecting` is cleared, which is also what
+    makes `onAutoScroll` a no-op if a `WM_TIMER` queued before the drag arrives during it.
+    A drag is recognised as LOCAL by a private clipboard format carrying the source `HWND`
+    (`SentinelD2DEditorDrag`), not by "is `DoDragDrop` on our stack" — the latter cannot be tested
+    without a mouse and would call a second editor's drag local.
+
+    **A press that does not travel is still a plain click.** A left-press inside the selection
+    does NOT move the caret; it arms a drag and waits. `SM_CXDRAG`/`SM_CYDRAG` of travel starts the
+    drag, `WM_LBUTTONUP` without it collapses the selection exactly as a press outside one would.
+    (The capture release in `WM_LBUTTONUP` had to become unconditional: an armed drag holds the
+    capture without setting `selecting`.)
+
+    **`ctest -R d2d_dialect` case 14 (175 assertions in the file now).** It drives the control's
+    REAL `IDropTarget` — fetched through a window property the control publishes for exactly this,
+    because `RegisterDragDrop` has no getter and the alternative was a second, test-only drop path
+    that could pass while the shipping one is broken — with its own `IDataObject`. It pins: an
+    external `CF_UNICODETEXT` drop inserts at the drop point and raises a **synchronous**
+    `EN_CHANGE` (counter moved before `Drop` returned, queue empty); a local MOVE is ONE undo step
+    that restores the text exactly and leaves **nothing behind it**; a drop inside the source
+    selection is refused at BOTH edges for MOVE and for Ctrl-COPY, edits nothing and pushes no undo
+    step; Ctrl maps to COPY; **`CF_HDROP` reaches the parent as `WM_DROPFILES` with a block
+    `DragQueryFileW` still parses**, with the buffer untouched — and `CF_HDROP` beats
+    `CF_UNICODETEXT` when a drag carries both. Every drop point is far left or far right of a line,
+    so not one assertion is a font metric. The test host now calls `OleInitialize`, and its first
+    check — "the control has a live drop target" — is what says out loud that the app needs it.
+
+    **MEASURED LIVE, with the switch ON, by real OLE drops** (`scripts` has nothing for this; a
+    throwaway harness under `%TEMP%` fabricated the data objects and called `DoDragDrop` with an
+    `IDropSource` that drops immediately, and read the live control's text and selection back with
+    `EM_EXGETSEL`/`EM_GETTEXTEX` through `ReadProcessMemory`, since those take pointers):
+    * **A dropped FILE still opens.** `DoDragDrop` returned `DRAGDROP_S_DROP`/`DROPEFFECT_COPY` and
+      the log printed `Opening externally-delivered path:` then `Opened file:` — i.e. it went
+      through `requestOpenPath` and the guard, not through some new path. **Also re-measured on
+      `--richedit`**, where it still falls through to the main window: both editors open a dropped
+      file, which is the property that had to survive.
+    * **A drag-MOVE.** `fn main() {…}` with `n main() {` selected, dropped past the end →
+      `DROPEFFECT_MOVE`, text `f\n    let x = 1\n}\nn main() {`, moved run selected,
+      **`EM_CANUNDO` = 1**. One `ID_UNDO` restored the original text byte-for-byte and left
+      `EM_CANUNDO` = 0 — one step, no half-move behind it.
+    * **The prompt still appears.** After a drag-move, `WM_CLOSE` raised the `SentinelSaveDlg`
+      Save/Don't Save/Cancel dialog — and the log did **not** contain
+      `Dirty flag missed a change…`, which `confirmSaveIfDirty` writes whenever it has to
+      re-derive `g.dirty` itself. Absent = `EN_CHANGE` had already fired and `onEditChanged` had
+      already set it. `ID_SAVE` (gated on `g.dirty`) then wrote the moved text to disk, which is
+      the same fact from the other side.
+    * **Dropping inside the source selection changed nothing**: `DROPEFFECT_NONE`, identical text,
+      identical selection, `EM_CANUNDO` still 0 **and `EM_CANREDO` still 1** — the redo stack was
+      not even cleared, so `recordPreEdit` never ran.
+    * Ctrl-drag reported `DROPEFFECT_COPY` where the same drag without it reported `MOVE`.
+    All of it on a **scratch copy** under `%TEMP%`; `git status --porcelain examples/` empty
+    throughout.
+
+    **NOT covered, said plainly:** the physical mouse. The drag threshold, `DoDragDrop`'s loop as
+    the user drives it, `QueryContinueDrag`/`GiveFeedback`, the external-move delete, the drop
+    caret's PIXELS and the edge autoscroll during a drag all need a real mouse on a foreground
+    window. The harness above exercised the source path end-to-end for a local move, but a human
+    should still drag a selection around once — together with the Ctrl+Z / Ctrl+Y / Ctrl+S
+    KEYSTROKES that slices 5 and 6 also left unpressed.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -1131,7 +1245,7 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.5` | 154 | `Sentinel-IDE-0.1.5.154-setup.exe` | Patch. **The first release whose auto-update actually installs** — v0.1.0–v0.1.4 offered, downloaded and verified updates, then silently installed nothing (phase 40). The app now runs the verified payload itself, and the updater logs what it does. **Clients ≤0.1.4 must install this one by hand.** |
 | `v0.1.6` | 160 | `Sentinel-IDE-0.1.6.160-setup.exe` | Patch. Saved-point dirty tracking: undoing back to the loaded or last-saved text now clears the `●` and the unsaved-changes prompt, instead of latching on at the first keystroke. **First release verified by a real released client auto-updating to it** — a shipped 0.1.5 install went to 0.1.6.160 in under 10 s via ≡ ▸ Check for Updates…. |
 | `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
-| `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap, stated in the release notes: dragging TEXT within the editor is not supported (dropping a FILE still opens it). |
+| `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap at the time of that release, stated in its release notes and **closed since, in slice 7**: dragging TEXT within the editor was not supported (dropping a FILE always opened it, and still does). |
 
 **0.1.8 IS PUBLISHED (2026-09-04).** Tag `v0.1.8` points at **55ae4bd**, the clean tree the
 binary was built from (`rev-list --count` 80 + `BUILDBASE` 100 = build **180**), so it rebuilds

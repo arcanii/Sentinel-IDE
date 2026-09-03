@@ -34,10 +34,13 @@ struct Settings {
     // createControls falls back on its own if the window class fails to register. Slice 7 is
     // what removes the choice, and it should not run until this default has had real use.
     //
-    // The escape hatch matters more than usual here because the two editors are not yet
-    // feature-identical: dragging TEXT within the editor works on RichEdit and not on this
-    // control (dropping a FILE works on both — neither child accepts files, so the drop
-    // reaches MainWindow's guarded handler either way, measured via WS_EX_ACCEPTFILES).
+    // SLICE 7 CLOSED THE LAST GAP: the Direct2D control now supports dragging TEXT within a
+    // file (move, Ctrl-drag to copy, CF_UNICODETEXT from other applications), so the two
+    // editors are feature-identical and the escape hatch is now only about taste and risk.
+    // Dropping a FILE still opens it on BOTH — measured on both paths after the change, not
+    // assumed: on RichEdit the drop falls through to MainWindow's guarded WM_DROPFILES, and
+    // on the Direct2D control the drop target forwards CF_HDROP to that same handler,
+    // because registering a target for text takes file drops away from the parent.
     bool         d2dEditor   = true;
     std::wstring updateSkipVersion;               // appcast version the user chose to skip (never re-offer it)
     std::vector<std::wstring> recents;            // recently-opened project folders (most-recent first)

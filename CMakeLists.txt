@@ -256,7 +256,13 @@ add_test(NAME d2d_render COMMAND d2d_render_test
 # that EN_CHANGE is SYNCHRONOUS — a regression from SendMessageW to PostMessageW is failure
 # mode #1 for this migration and nothing else in the repo can see it. Case 10 (slice 4) adds the
 # third: 65 characters typed WITH A REPAINT AFTER EACH must still be ONE undo step, which is the
-# whole reason the colouring paints instead of moving the selection.
+# whole reason the colouring paints instead of moving the selection. Case 14 (slice 7) adds the
+# fourth and fifth: a drag-MOVE is ONE undo step that restores the text exactly, and A DROPPED
+# FILE STILL REACHES THE HOST — registering an OLE drop target for text takes file drops over the
+# editor away from the main window, and losing them would be a worse regression than the gap the
+# slice closes. It drives the control's REAL IDropTarget (fetched through the window property the
+# control publishes) with its own IDataObject, so there is no test-only drop path to pass while
+# the shipping one is broken.
 # It SKIPS (printing why, exit 0) only when the machine has no Direct2D/DirectWrite.
 # READ-ONLY on examples/: the golden path is opened GENERIC_READ and there is no write path.
 #     cmake --build build --target d2d_dialect_test  &&  build\d2d_dialect_test.exe
@@ -266,8 +272,11 @@ add_executable(d2d_dialect_test
   src/editor/EditorModel.cpp
   src/editor/SyntaxLexer.cpp)
 target_include_directories(d2d_dialect_test PRIVATE src)
+# shell32 is for the TEST, not the control: case 14 builds a CF_HDROP block and reads it
+# back with DragQueryFileW/DragFinish, exactly as MainWindow's WM_DROPFILES handler does.
+# (D2DEditor.cpp forwards that block as opaque bytes and needs nothing from shell32.)
 target_link_libraries(d2d_dialect_test PRIVATE
-  d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 advapi32)
+  d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 shell32 advapi32)
 set_target_properties(d2d_dialect_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME d2d_dialect COMMAND d2d_dialect_test
   "${CMAKE_CURRENT_SOURCE_DIR}/examples/crypto.sentinel")

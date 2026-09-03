@@ -47,6 +47,15 @@
 //
 // The rules themselves are NOT here: they live in src/editor/SyntaxLexer.{h,cpp}, which the
 // RichEdit path calls too, so the two editors cannot disagree about a file.
+//
+// ADDED IN SLICE 7: OLE DRAG AND DROP — the last behavioural difference against RichEdit,
+// and the precondition for deleting the RichEdit path. Drag a selection to move it,
+// Ctrl-drag to copy, accept CF_UNICODETEXT from other applications, and — the part that is
+// a REGRESSION RISK rather than a feature — keep file drops working. Registering a drop
+// target on this child takes file drops away from the main window's WM_DROPFILES, so
+// CF_HDROP is checked first and handed back to the host's own guarded opening path. The
+// whole thing is in one section, "OLE drag and drop", with its four traps written out
+// there.
 #include "host/win32/D2DEditor.h"
 
 #include <windowsx.h>
@@ -63,6 +72,11 @@
 // only exit test (`if (pt.y > edH) break`, MainWindow.cpp:410) never fires, so it walks the
 // whole document on every repaint. Zero warnings, zero errors, one very confused reader.
 #include <richedit.h>
+
+// OLE drag-and-drop (slice 7): IDataObject / IDropSource / IDropTarget, RegisterDragDrop,
+// DoDragDrop, ReleaseStgMedium. Included explicitly rather than leaned on windows.h for —
+// this file's drop path is not optional plumbing and the dependency should be visible.
+#include <ole2.h>
 
 #include <algorithm>
 #include <cmath>
@@ -102,6 +116,34 @@ constexpr float kDefaultPointSize = 11.0f;
 
 // Tab width in columns (monospace, so column == advance of '0').
 constexpr int kTabColumns = 4;
+
+// ---- drag and drop (slice 7) ------------------------------------------------
+//
+// The window property under which the control publishes its IDropTarget. It exists for ONE
+// caller — tests/d2d_dialect_test.cpp — because RegisterDragDrop has no public getter and
+// the alternative was a second, test-only drop path, which is exactly the shape of test
+// that passes while the shipping path is broken. Through this the test drives the REAL
+// DragEnter/DragOver/Drop with its own IDataObject: format negotiation, the
+// inside-the-selection rejection, the key-state-to-effect mapping and the CF_HDROP
+// forwarding are all the code that ships. (ole32 stores its own copy under
+// "OleDropTargetInterface"; that name is an undocumented implementation detail and is NOT
+// what this reads. This property is ours, set and removed by this file.)
+constexpr const wchar_t* kDropTargetProp = L"SentinelD2DDropTarget";
+
+// The private clipboard format that says "this drag came out of a Sentinel Direct2D
+// editor", carrying the source HWND as a UINT64 payload.
+//
+// WHY: a drop has to know whether it is a MOVE WITHIN THIS CONTROL — which deletes the
+// source selection — or an insert from somewhere else, which must never delete anything.
+// Deciding that from "is DoDragDrop on our stack?" would be wrong twice: it cannot be
+// tested without a mouse, and it would call a drag from a SECOND editor in this process
+// local to the first. Identity travels on the data object, where it belongs.
+UINT sentinelDragFormat() {
+    // Function-local static: registered once per process, on first use, and the clipboard
+    // format registry is per-session so the value is stable for every window here.
+    static const UINT cf = RegisterClipboardFormatW(L"SentinelD2DEditorDrag");
+    return cf;
+}
 
 // How many lines either side of the visible window keep their layout after a paint.
 // This is the whole memory bound: live IDWriteTextLayouts <= visible + 2*kCacheMargin,
@@ -230,6 +272,35 @@ struct EditorState {
     wchar_t pendingHigh = 0;  // buffered high surrogate from WM_CHAR
     UINT_PTR blinkTimer = 0;
     UINT_PTR autoTimer = 0;
+
+    // ---- drag and drop (slice 7) -------------------------------------------
+    // The registered drop target. Null when RegisterDragDrop failed — which is not an
+    // error worth failing creation over: the thread may have no OLE apartment (the
+    // standalone demo and the render test both CoInitializeEx rather than OleInitialize),
+    // and an editor without drag-and-drop is exactly the editor slices 2-6 shipped. Every
+    // drag path below is gated on this being non-null, so "no OLE" degrades to the old
+    // behaviour rather than to a half-registered control.
+    IDropTarget* dropTarget = nullptr;
+
+    // A left-press landed INSIDE the selection, so it might be the start of a drag. The
+    // caret is deliberately NOT moved yet — that is decided at the threshold (drag) or at
+    // the button-up (an ordinary click). dragArmPt is the press point, in client pixels.
+    bool dragArmed = false;
+    POINT dragArmPt{ 0, 0 };
+
+    // DoDragDrop is on the stack for THIS control. A MODAL LOOP: it pumps messages, so
+    // paints, timers and host-posted work can all run while it is set.
+    bool dragActive = false;
+    // ...and our own drop target already performed the move, so the source half must NOT
+    // delete the selection a second time when DoDragDrop returns DROPEFFECT_MOVE.
+    bool dragLocalDrop = false;
+
+    // The drop caret: where the payload would land, tracked during a drag. It is NOT the
+    // model caret — a local drag must keep its source selection on screen, and moving the
+    // real caret would collapse it. Painted unblinking and even without focus (a drag from
+    // another application does not give us the focus until the drop).
+    bool dropCaret = false;
+    size_t dropOffset = 0;
 
     // The SYSTEM caret (slice 5) — created while focused, never shown. See
     // syncSystemCaret. sysCaretPt/sysCaretH are the values last pushed to USER32, so a
@@ -960,7 +1031,26 @@ void drawContent(EditorState* st, ID2D1RenderTarget* rt) {
                                                      // there were no spans at all)
     }
 
-    if (st->hasFocus && st->caretOn && st->br.caret) {
+    // THE DROP CARET (slice 7) takes the ordinary caret's place while a drag hovers, and
+    // the `else` is the point: a local drag would otherwise show TWO carets, the blinking
+    // insertion point at the end of the source selection and the drop position, with no
+    // way to tell which one the text is about to land at.
+    //
+    // Three differences from the caret below, all deliberate: it ignores hasFocus (a drag
+    // from another application has not given us the focus and will not until the drop), it
+    // ignores caretOn (a position readout that blinks is a position readout you have to
+    // wait for), and it is twice as wide so it reads as a target rather than as the caret
+    // having jumped. The offset is re-clamped here rather than trusted: it was computed
+    // when the mouse last moved, and the host can edit the buffer from under a drag —
+    // DoDragDrop pumps messages.
+    if (st->dropCaret && st->br.caret) {
+        const size_t off = (std::min)(st->dropOffset, st->model.length());
+        const size_t dl = lineIndexForOffset(st, off);
+        const float dx = ox + xInLine(st, dl, off);
+        const float dy = oy + static_cast<float>(dl) * lh;
+        const float w = static_cast<float>((std::max)(2, dpx(st, 2)));
+        rt->FillRectangle(D2D1::RectF(dx, dy, dx + w, dy + lh), st->br.caret);
+    } else if (st->hasFocus && st->caretOn && st->br.caret) {
         const size_t cl = lineIndexForOffset(st, st->model.caret());
         const float cx = ox + xInLine(st, cl, st->model.caret());
         const float cy = oy + static_cast<float>(cl) * lh;
@@ -1119,16 +1209,18 @@ void paint(EditorState* st) {
 // ---- post-edit / caret-move bookkeeping -------------------------------------
 
 // EVERY model mutation ends here — typing, Enter, Tab, Backspace/Delete (plain and by
-// word), cut, paste, IME commit, EM_UNDO/EM_REDO, WM_SETTEXT. That is by construction, not
-// by inspection: nothing else in this file touches st->model's text, so the notification
-// below cannot be forgotten by slices 4-7 either.
+// word), cut, paste, IME commit, EM_UNDO/EM_REDO, WM_SETTEXT, and since slice 7 DROP (both
+// halves: the text a drop inserts, and the delete at the end of a drag-move out to another
+// application). That is by construction, not by inspection: nothing else in this file
+// touches st->model's text, so the notification below cannot be forgotten by slice 7's
+// successors either.
 //
-// NOT in that list, because the path does not exist: DROP. This control registers no OLE
-// drop target and handles no WM_DROPFILES, so dragging a FILE onto the editor falls
-// through to the main window's handler (which is guarded by confirmSaveIfDirty, so the
-// open buffer is safe) and dragging TEXT within the editor does nothing at all. RichEdit
-// supports the latter; this is a KNOWN DIFFERENCE to accept or close deliberately at slice
-// 6, not something afterEdit silently covers.
+// The drop path is the one that had to be threaded in deliberately rather than inherited.
+// g.dirty is a pure function of (editorText(), g.savedText) and EN_CHANGE is only the
+// trigger to recompute it, so a drop that mutated the buffer and returned to OLE without
+// coming through here would leave the buffer DISCARDABLE WITH NO PROMPT — this project's
+// defect #1, arriving through a code path nobody types into. applyDrop therefore ends in
+// this function and nowhere else.
 void afterEdit(EditorState* st) {
     st->linesDirty = true;
     st->desiredX = -1;
@@ -1466,6 +1558,667 @@ bool onKeyDown(EditorState* st, WPARAM vk) {
     }
 }
 
+// ---- OLE drag and drop (slice 7) --------------------------------------------
+//
+// THE LAST DIFFERENCE between this control and the RichEdit one it replaces: dragging TEXT
+// within a file. Closing it is what makes the two feature-identical, which is the stated
+// precondition for deleting the RichEdit path.
+//
+// FOUR THINGS HERE ARE LOAD-BEARING, and each of them is a real defect if it is got wrong.
+//
+// 1. REGISTERING A DROP TARGET INTERCEPTS FILE DROPS, and that would be a WORSE regression
+//    than the one being fixed. Before this, the editor had no drop target, so a .sentinel
+//    dropped on the text area fell through to the main window's WM_DROPFILES -> requestOpenPath,
+//    which posts and lands behind confirmSaveIfDirty. An OLE drop target on the child wins
+//    outright over the parent's DragAcceptFiles, so from the moment RegisterDragDrop
+//    succeeds the shell stops delivering that message for the editor's rectangle. Handled
+//    explicitly: CF_HDROP is checked FIRST, never treated as text, and forwarded to the
+//    host's own handler so the guarded path stays the only opening path. See
+//    forwardFilesToHost.
+//
+// 2. A MOVE IS ONE UNDO STEP. Delete-then-insert spelled as two model calls is two
+//    snapshots, and the intermediate one is a half-move: Ctrl+Z would leave the text
+//    deleted and not re-inserted. EditorModel::moveSelectionTo does both under one
+//    recordPreEdit.
+//
+// 3. EVERY MUTATION GOES THROUGH afterEdit. A drop is a buffer edit that no keystroke
+//    caused, which makes it exactly the kind of edit a notification funnel gets forgotten
+//    for. applyDrop is the single mutating function here and it ends in afterEdit, i.e. in
+//    a SYNCHRONOUS EN_CHANGE. Never PostMessage.
+//
+// 4. DoDragDrop IS A MODAL LOOP INSIDE OUR WINDOW PROC. It pumps messages, so while it is
+//    on the stack this control can paint, tick its timers and — because the host posts work
+//    to itself — even have its buffer replaced under it. So: the dragged text is COPIED out
+//    of the model before the call (a const wchar_t* into model.text() would dangle across a
+//    reallocation), the local move is performed by the DROP against the model's state at
+//    that instant rather than against offsets captured at drag start, the delete at the end
+//    of an external move re-checks that the range it is about to remove still holds the
+//    text that was handed over, and the state pointer is re-validated after the call in
+//    case the window went away with it. The blink timer is stopped for the duration and the
+//    autoscroll timer is killed (st->selecting is cleared, which is also what makes
+//    onAutoScroll a no-op if a WM_TIMER queued before the drag arrives during it).
+
+// Where a drop would land, and whether it is even allowed. Split out so DragOver's preview
+// and Drop's commit cannot disagree about the answer — a target that highlights a position
+// it then refuses is a target the user cannot predict.
+DWORD dropEffectFor(DWORD keyState, DWORD allowed, bool rejected) {
+    // Dropping a selection ONTO ITSELF: refused outright, for a move AND for a Ctrl-copy.
+    // A move there is a no-op that would still burn an undo step; a copy there would
+    // silently duplicate text inside the run the user was pointing at. RichEdit refuses
+    // both, and "no drop" cursor is the honest answer for a gesture that changes nothing.
+    if (rejected) return DROPEFFECT_NONE;
+    // Ctrl copies, everything else moves — the Windows text convention, and the one the
+    // Settings hint has been promising. Fall back the other way when the source will not
+    // allow what was asked for (a read-only source offers COPY only).
+    DWORD want = (keyState & MK_CONTROL) ? DROPEFFECT_COPY : DROPEFFECT_MOVE;
+    if (!(allowed & want)) want = (want == DROPEFFECT_MOVE) ? DROPEFFECT_COPY : DROPEFFECT_MOVE;
+    return (allowed & want) ? want : DROPEFFECT_NONE;
+}
+
+// THE ONE PLACE A DROP MUTATES THE BUFFER. Returns false when nothing changed, so the
+// caller reports DROPEFFECT_NONE and no source deletes anything on the strength of it.
+//
+// `localSource` means the payload came out of THIS control (see sentinelDragFormat), which
+// is what separates "move my own selection" from "insert someone else's text".
+bool applyDrop(EditorState* st, const std::wstring& text, size_t at, bool localSource, bool move) {
+    const editor::Selection sel = st->model.selection();
+    const bool inside = localSource && !sel.empty() && at >= sel.min() && at <= sel.max();
+    if (inside) return false;  // belt and braces: DragOver already refused this
+    if (localSource && move) {
+        if (sel.empty()) return false;
+        // Against the selection as it is NOW, not against offsets remembered at drag start.
+        // The drag's modal loop could have moved them; this cannot be stale by construction.
+        st->model.moveSelectionTo(at);
+    } else {
+        if (text.empty()) return false;
+        // setCaret collapses the selection first, so an existing selection is left alone
+        // rather than replaced — dropping text is an INSERT at a point, not a paste over.
+        st->model.setCaret(at, false);
+        const std::wstring ins = editor::normalizeNewlines(text);
+        st->model.insertText(ins);
+        // SELECT WHAT WAS JUST DROPPED, exactly as the move path does. Two reasons, and the
+        // first is a real behavioural difference from the editor this one replaces:
+        //
+        //   1. RichEdit selects the inserted run, so the next keystroke REPLACES it. Leaving
+        //      the caret after it instead means that keystroke APPENDS — measured on the same
+        //      gesture in both editors: Ctrl-copy-drop "a" onto "abcdef" then type Z gives
+        //      "abcdefZ" on RichEdit and "abcdefaZ" here. Slice 7 deletes the RichEdit path
+        //      on the grounds that the two are feature-identical, so divergences like this
+        //      have to be closed, not inherited.
+        //   2. It also makes the drop cheap to correct — the run can be dragged straight on
+        //      again — which is the reason EditorModel::moveSelectionTo already does it. The
+        //      copy path simply did not, which was an inconsistency rather than a decision.
+        //
+        // This ALSO closes the undo-granularity hole: insertText opens a coalescing typing
+        // run for a single character inserted into an empty selection, so a ONE-CHARACTER
+        // copy-drop left that run open and the next typed character folded into the drop's
+        // undo step — one Ctrl+Z would then undo both. Leaving a non-empty selection behind
+        // ends the run, so the next keystroke starts its own step.
+        const size_t at2 = st->model.caret();
+        if (!ins.empty() && at2 >= ins.size()) st->model.setSelection(at2 - ins.size(), at2);
+    }
+    afterEdit(st);  // the funnel. Synchronous EN_CHANGE, or the buffer is discardable.
+    return true;
+}
+
+// ---- the data object the drag hands out -------------------------------------
+// A minimal IDataObject over one immutable string. TWO formats, and both are needed:
+// CF_UNICODETEXT is what every other application reads, and the private
+// sentinelDragFormat() carries the source HWND so our own drop target can recognise its
+// own text. CF_TEXT is deliberately NOT offered — an ANSI down-conversion would mangle
+// exactly the non-ASCII identifiers this editor's word predicate exists to handle, and
+// every drop target this century reads CF_UNICODETEXT.
+struct FormatEnum final : public IEnumFORMATETC {
+    FormatEnum(std::vector<FORMATETC> f, ULONG at) : fmts_(std::move(f)), at_(at) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IEnumFORMATETC) {
+            *ppv = static_cast<IEnumFORMATETC*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+
+    HRESULT STDMETHODCALLTYPE Next(ULONG count, FORMATETC* out, ULONG* fetched) override {
+        if (!out && count) return E_POINTER;
+        ULONG n = 0;
+        while (n < count && at_ < fmts_.size()) out[n++] = fmts_[at_++];
+        if (fetched) *fetched = n;
+        return (n == count) ? S_OK : S_FALSE;
+    }
+    HRESULT STDMETHODCALLTYPE Skip(ULONG count) override {
+        const ULONG left = static_cast<ULONG>(fmts_.size()) - at_;
+        at_ += (std::min)(count, left);
+        return (count <= left) ? S_OK : S_FALSE;
+    }
+    HRESULT STDMETHODCALLTYPE Reset() override {
+        at_ = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IEnumFORMATETC** out) override {
+        if (!out) return E_POINTER;
+        *out = new (std::nothrow) FormatEnum(fmts_, at_);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+
+    // PUBLIC destructor, not the usual COM-private one: `new (std::nothrow) FormatEnum`
+    // outside the class potentially invokes it, so a private one does not compile.
+    ~FormatEnum() = default;
+
+private:
+    LONG ref_ = 1;
+    std::vector<FORMATETC> fmts_;
+    ULONG at_ = 0;
+};
+
+struct EditorDataObject final : public IDataObject {
+    EditorDataObject(std::wstring text, HWND owner) : text_(std::move(text)), owner_(owner) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *ppv = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* fe, STGMEDIUM* med) override {
+        if (!fe || !med) return E_INVALIDARG;
+        *med = STGMEDIUM{};
+        if (!(fe->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
+        const void* bytes = nullptr;
+        size_t n = 0;
+        UINT64 hwndValue = 0;
+        if (fe->cfFormat == CF_UNICODETEXT) {
+            bytes = text_.c_str();
+            n = (text_.size() + 1) * sizeof(wchar_t);  // the NUL travels with it
+        } else if (sentinelDragFormat() && fe->cfFormat == sentinelDragFormat()) {
+            hwndValue = static_cast<UINT64>(reinterpret_cast<UINT_PTR>(owner_));
+            bytes = &hwndValue;
+            n = sizeof(hwndValue);
+        } else {
+            return DV_E_FORMATETC;
+        }
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
+        if (!h) return E_OUTOFMEMORY;
+        void* p = GlobalLock(h);
+        if (!p) {
+            GlobalFree(h);
+            return E_OUTOFMEMORY;
+        }
+        std::memcpy(p, bytes, n);
+        GlobalUnlock(h);
+        med->tymed = TYMED_HGLOBAL;
+        med->hGlobal = h;
+        med->pUnkForRelease = nullptr;  // the RECEIVER frees it, via ReleaseStgMedium
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return DATA_E_FORMATETC; }
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* fe) override {
+        if (!fe) return E_INVALIDARG;
+        if (!(fe->tymed & TYMED_HGLOBAL)) return DV_E_TYMED;
+        if (fe->cfFormat == CF_UNICODETEXT) return S_OK;
+        if (sentinelDragFormat() && fe->cfFormat == sentinelDragFormat()) return S_OK;
+        return DV_E_FORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+        if (out) out->ptd = nullptr;  // required even on the E_NOTIMPL path
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD dir, IEnumFORMATETC** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (dir != DATADIR_GET) return E_NOTIMPL;  // nothing can be set on this object
+        std::vector<FORMATETC> f;
+        f.push_back(FORMATETC{ CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL });
+        if (sentinelDragFormat())
+            f.push_back(FORMATETC{ static_cast<CLIPFORMAT>(sentinelDragFormat()), nullptr,
+                                   DVASPECT_CONTENT, -1, TYMED_HGLOBAL });
+        *out = new (std::nothrow) FormatEnum(std::move(f), 0);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
+
+    ~EditorDataObject() = default;  // public for the same reason as FormatEnum's
+
+private:
+    LONG ref_ = 1;
+    std::wstring text_;  // a COPY, taken before DoDragDrop — never a view into the model
+    HWND owner_ = nullptr;
+};
+
+// ---- the drop source --------------------------------------------------------
+// Escape cancels, releasing the button drops, everything else keeps going. The default
+// cursors are correct for a text drag and drawing our own would only lose the shell's
+// copy/move/no-drop glyphs.
+struct EditorDropSource final : public IDropSource {
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropSource) {
+            *ppv = static_cast<IDropSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape, DWORD keyState) override {
+        if (escape) return DRAGDROP_S_CANCEL;
+        if (!(keyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
+
+    ~EditorDropSource() = default;  // public for the same reason as FormatEnum's
+
+private:
+    LONG ref_ = 1;
+};
+
+// ---- the drop target --------------------------------------------------------
+struct EditorDropTarget final : public IDropTarget {
+    explicit EditorDropTarget(EditorState* s) : st_(s) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *ppv = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* obj, DWORD keyState, POINTL pt,
+                                        DWORD* effect) override {
+        if (!effect) return E_INVALIDARG;
+        kind_ = classify(obj);
+        local_ = (kind_ == Kind::Text) && namesThisControl(obj);
+        return DragOver(keyState, pt, effect);
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD keyState, POINTL pt, DWORD* effect) override {
+        if (!effect) return E_INVALIDARG;
+        const DWORD allowed = *effect;
+        if (kind_ == Kind::None) {
+            hideDropCaret();
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        if (kind_ == Kind::Files) {
+            // A FILE is not inserted anywhere, so there is no insertion point to point at —
+            // showing one would promise a paste that is not going to happen. COPY (never
+            // MOVE) so the shell never deletes the file it just handed us.
+            hideDropCaret();
+            *effect = (allowed & DROPEFFECT_COPY) ? DROPEFFECT_COPY
+                      : (allowed & DROPEFFECT_LINK) ? DROPEFFECT_LINK
+                                                    : DROPEFFECT_NONE;
+            return S_OK;
+        }
+        POINT p = toClient(pt);
+        edgeScroll(p);  // BEFORE the hit-test: a scroll moves what is under the cursor
+        const size_t off = offsetFromPoint(st_, p.x, p.y);
+        *effect = dropEffectFor(keyState, allowed, insideSourceSelection(off));
+        if (*effect == DROPEFFECT_NONE)
+            hideDropCaret();
+        else
+            showDropCaret(off);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        hideDropCaret();
+        kind_ = Kind::None;
+        local_ = false;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* obj, DWORD keyState, POINTL pt,
+                                   DWORD* effect) override {
+        if (!effect) return E_INVALIDARG;
+        const DWORD allowed = *effect;
+        *effect = DROPEFFECT_NONE;
+        hideDropCaret();
+
+        // CF_HDROP FIRST, and it is not a preference. A file drag from Explorer that fell
+        // through to the text branch would either do nothing or paste the file's PATH into
+        // the buffer, and both are worse than the gap this whole section closes.
+        const Kind k = classify(obj);
+        if (k == Kind::Files) {
+            if (forwardFilesToHost(obj))
+                *effect = (allowed & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            return S_OK;
+        }
+        if (k != Kind::Text) return S_OK;
+
+        const bool local = namesThisControl(obj);
+        local_ = local;  // Drop can arrive without a DragEnter having set it (a re-entered target)
+        const POINT p = toClient(pt);
+        const size_t off = offsetFromPoint(st_, p.x, p.y);
+        const DWORD e = dropEffectFor(keyState, allowed, insideSourceSelection(off));
+        if (e == DROPEFFECT_NONE) return S_OK;
+
+        const bool move = (e == DROPEFFECT_MOVE);
+        // A local move needs no payload at all — it moves the model's own selection, so
+        // going back to the data object for a copy of text we already have would only add a
+        // way to fail. Every other case does need it.
+        std::wstring text;
+        if (!(local && move) && !fetchText(obj, text)) return S_OK;
+
+        SetFocus(st_->hwnd);  // dropped-in text you cannot immediately type after is half a feature
+        if (!applyDrop(st_, text, off, local, move)) return S_OK;
+        // Tell the SOURCE half not to delete: we already did the delete, as part of the one
+        // undo step. Without this, beginTextDrag would see DROPEFFECT_MOVE come back from
+        // DoDragDrop and remove the text a second time.
+        if (local && move) st_->dragLocalDrop = true;
+        *effect = e;
+        return S_OK;
+    }
+
+    ~EditorDropTarget() = default;  // public for the same reason as FormatEnum's
+
+private:
+    enum class Kind { None, Text, Files };
+
+    static Kind classify(IDataObject* obj) {
+        if (!obj) return Kind::None;
+        FORMATETC files{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        if (obj->QueryGetData(&files) == S_OK) return Kind::Files;
+        FORMATETC text{ CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        if (obj->QueryGetData(&text) == S_OK) return Kind::Text;
+        return Kind::None;
+    }
+
+    // Did this payload come out of THIS control? See sentinelDragFormat.
+    bool namesThisControl(IDataObject* obj) const {
+        const UINT cf = sentinelDragFormat();
+        if (!obj || !cf) return false;
+        FORMATETC fe{ static_cast<CLIPFORMAT>(cf), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM med{};
+        if (FAILED(obj->GetData(&fe, &med))) return false;
+        bool same = false;
+        if (med.tymed == TYMED_HGLOBAL && med.hGlobal && GlobalSize(med.hGlobal) >= sizeof(UINT64)) {
+            if (const void* p = GlobalLock(med.hGlobal)) {
+                UINT64 v = 0;
+                std::memcpy(&v, p, sizeof(v));  // the block is not guaranteed to be aligned
+                same = (reinterpret_cast<HWND>(static_cast<UINT_PTR>(v)) == st_->hwnd);
+                GlobalUnlock(med.hGlobal);
+            }
+        }
+        ReleaseStgMedium(&med);
+        return same;
+    }
+
+    static bool fetchText(IDataObject* obj, std::wstring& out) {
+        FORMATETC fe{ CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM med{};
+        if (FAILED(obj->GetData(&fe, &med))) return false;
+        bool ok = false;
+        if (med.tymed == TYMED_HGLOBAL && med.hGlobal) {
+            if (const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(med.hGlobal))) {
+                // NUL-terminated by convention, but the scan is bounded by the block anyway:
+                // a source that forgets the terminator must not walk this off the heap.
+                const size_t cap = GlobalSize(med.hGlobal) / sizeof(wchar_t);
+                size_t n = 0;
+                while (n < cap && p[n] != L'\0') ++n;
+                out.assign(p, n);
+                GlobalUnlock(med.hGlobal);
+                ok = true;
+            }
+        }
+        ReleaseStgMedium(&med);
+        return ok;
+    }
+
+    // TRAP 2, and the reason this function exists rather than an openFile() call.
+    // Registering the drop target above stopped the shell delivering WM_DROPFILES to the
+    // MAIN WINDOW for anything dropped on the editor's rectangle, so this control now owns
+    // file drops whether it wants them or not. It hands them straight back: MainWindow's
+    // WM_DROPFILES calls requestOpenPath, which POSTS, which lands in the
+    // confirmSaveIfDirty-guarded WM_APP_OPEN_PATH. That is the only route in the app that
+    // cannot silently discard an unsaved buffer, and adding a second one here — however
+    // carefully — would be adding a second chance to get that wrong.
+    //
+    // The block is COPIED byte-for-byte instead of forwarded, because ownership has to be
+    // unambiguous. The host finishes with DragFinish(), which GlobalFrees what it was given,
+    // while the STGMEDIUM we were handed belongs to the data object and is returned with
+    // ReleaseStgMedium; passing one handle to both is a double free. Copying also means this
+    // code needs to know NOTHING about the DROPFILES layout — it is the shell's own block, so
+    // DragQueryFileW parses the copy exactly as it would have parsed the original.
+    bool forwardFilesToHost(IDataObject* obj) const {
+        HWND parent = GetParent(st_->hwnd);
+        if (!parent) return false;  // standalone host (the demo, the tests): nothing to open with
+        FORMATETC fe{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM med{};
+        if (FAILED(obj->GetData(&fe, &med))) return false;
+        bool ok = false;
+        if (med.tymed == TYMED_HGLOBAL && med.hGlobal) {
+            const SIZE_T bytes = GlobalSize(med.hGlobal);
+            HGLOBAL copy = bytes ? GlobalAlloc(GMEM_MOVEABLE, bytes) : nullptr;
+            if (copy) {
+                const void* src = GlobalLock(med.hGlobal);
+                void* dst = GlobalLock(copy);
+                if (src && dst) {
+                    std::memcpy(dst, src, bytes);
+                    GlobalUnlock(copy);
+                    GlobalUnlock(med.hGlobal);
+                    // SENT, not posted: the host copies the paths out and DragFinish()es the
+                    // block before it returns, so the copy's whole lifetime is inside this
+                    // call and cannot leak if the message is never dispatched. The OPEN is
+                    // still deferred — requestOpenPath posts — so nothing runs on this stack.
+                    SendMessageW(parent, WM_DROPFILES, reinterpret_cast<WPARAM>(copy), 0);
+                    ok = true;
+                } else {
+                    if (dst) GlobalUnlock(copy);
+                    if (src) GlobalUnlock(med.hGlobal);
+                    GlobalFree(copy);
+                }
+            }
+        }
+        ReleaseStgMedium(&med);
+        return ok;
+    }
+
+    POINT toClient(POINTL pt) const {
+        POINT p{ pt.x, pt.y };  // DragEnter/DragOver/Drop are given SCREEN coordinates
+        ScreenToClient(st_->hwnd, &p);
+        return p;
+    }
+
+    bool insideSourceSelection(size_t off) const {
+        if (!local_) return false;  // someone else's text can land anywhere
+        const editor::Selection sel = st_->model.selection();
+        // Inclusive at BOTH ends: landing exactly on either edge of the run also puts the
+        // text back where it already is.
+        return !sel.empty() && off >= sel.min() && off <= sel.max();
+    }
+
+    void showDropCaret(size_t off) const {
+        if (st_->dropCaret && st_->dropOffset == off) return;  // nothing moved, nothing to repaint
+        st_->dropCaret = true;
+        st_->dropOffset = off;
+        InvalidateRect(st_->hwnd, nullptr, FALSE);
+    }
+
+    void hideDropCaret() const {
+        if (!st_->dropCaret) return;
+        st_->dropCaret = false;
+        InvalidateRect(st_->hwnd, nullptr, FALSE);
+    }
+
+    // Scroll when the cursor is within a line of an edge, so a drag can reach text that is
+    // off screen. Driven by DragOver rather than by the kAutoScrollTimer: that timer's
+    // handler extends the SELECTION, which is the one thing a drag must not touch, and it
+    // is gated on st->selecting, which beginTextDrag clears precisely so a WM_TIMER left
+    // over from the press cannot fire into a drag.
+    void edgeScroll(const POINT& p) const {
+        ensureFormat(st_);  // lineH / spaceW are the step sizes below
+        RECT rc;
+        GetClientRect(st_->hwnd, &rc);
+        const int lh = (std::max)(1, static_cast<int>(st_->lineH));
+        const int cw = (std::max)(1, static_cast<int>(st_->spaceW));
+        const int beforeY = st_->scrollY, beforeX = st_->scrollX;
+        if (p.y < lh)
+            st_->scrollY -= lh;
+        else if (p.y > rc.bottom - lh)
+            st_->scrollY += lh;
+        if (p.x < 2 * cw)
+            st_->scrollX -= 4 * cw;
+        else if (p.x > rc.right - 2 * cw)
+            st_->scrollX += 4 * cw;
+        clampScroll(st_);
+        if (st_->scrollY == beforeY && st_->scrollX == beforeX) return;
+        InvalidateRect(st_->hwnd, nullptr, FALSE);
+        // The funnel's contract is "ANY change of scrollY/scrollX reports here, whatever
+        // caused it" — including one that happened inside an OLE callback. The host's
+        // consumer is one InvalidateRect of the line-number gutter, which is safe to run
+        // from here; skipping it would leave the gutter reading the pre-drag line numbers.
+        flushViewNotifications(st_);
+    }
+
+    LONG ref_ = 1;
+    EditorState* st_ = nullptr;
+    Kind kind_ = Kind::None;
+    bool local_ = false;  // the payload came out of this very control
+};
+
+// Registered at WM_CREATE. Failure is NOT fatal: without an OLE apartment on the thread
+// (CoInitializeEx alone is not enough — see MainWindow's OleInitialize) RegisterDragDrop
+// returns CO_E_NOTINITIALIZED, and the right answer is the editor slices 2-6 shipped, not a
+// half-registered control. st->dropTarget stays null and every drag path is gated on it.
+void registerDropTarget(EditorState* st) {
+    if (st->dropTarget) return;
+    auto* target = new (std::nothrow) EditorDropTarget(st);
+    if (!target) return;
+    if (FAILED(RegisterDragDrop(st->hwnd, target))) {
+        target->Release();  // ...and the control simply has no drag-and-drop
+        return;
+    }
+    // Two references now: RegisterDragDrop took its own, and this one keeps the pointer
+    // valid for the property below and for the Release at WM_NCDESTROY.
+    st->dropTarget = target;
+    SetPropW(st->hwnd, kDropTargetProp, reinterpret_cast<HANDLE>(target));
+}
+
+void revokeDropTarget(EditorState* st) {
+    if (!st->dropTarget) return;
+    RemovePropW(st->hwnd, kDropTargetProp);
+    RevokeDragDrop(st->hwnd);  // drops OLE's reference; the target can no longer be called
+    st->dropTarget->Release();
+    st->dropTarget = nullptr;
+}
+
+// The SOURCE half. Called from WM_MOUSEMOVE once a press that landed inside the selection
+// has travelled past the system drag threshold.
+//
+// Read trap 4 at the top of this section before touching anything here: DoDragDrop is a
+// MODAL LOOP that pumps messages, and every line below is placed with that in mind.
+void beginTextDrag(EditorState* st) {
+    const editor::Selection sel = st->model.selection();
+    if (sel.empty()) return;
+    // COPIED OUT FIRST. model.text() is a std::wstring the model reallocates on every edit,
+    // and the loop below can deliver an edit (the host posts work to itself, and a posted
+    // WM_APP_OPEN_PATH replaces the whole buffer). A pointer into it would dangle; this
+    // string is ours.
+    const std::wstring dragged = st->model.text().substr(sel.min(), sel.max() - sel.min());
+
+    st->dragArmed = false;
+    // Selection-extension and its autoscroll are over: OLE owns the mouse from here, and a
+    // WM_TIMER queued before the drag can still be delivered INSIDE it (KillTimer does not
+    // purge what is already posted). onAutoScroll returns immediately while this is false.
+    st->selecting = false;
+    if (st->autoTimer) {
+        KillTimer(st->hwnd, kAutoScrollTimer);
+        st->autoTimer = 0;
+    }
+    if (GetCapture() == st->hwnd) ReleaseCapture();  // DoDragDrop takes its own capture
+    // Stop the blink for the duration. The drop caret does not blink, and leaving the timer
+    // running would repaint the window twice a second through a modal loop for nothing.
+    stopBlink(st);
+    st->caretOn = true;
+
+    auto* data = new (std::nothrow) EditorDataObject(dragged, st->hwnd);
+    auto* source = new (std::nothrow) EditorDropSource();
+    if (!data || !source) {
+        if (data) data->Release();
+        if (source) source->Release();
+        if (st->hasFocus) startBlink(st);
+        return;
+    }
+
+    HWND hwnd = st->hwnd;  // survives st; used to re-validate below
+    st->dragActive = true;
+    st->dragLocalDrop = false;
+    DWORD effect = DROPEFFECT_NONE;
+    const HRESULT hr = DoDragDrop(data, source, DROPEFFECT_COPY | DROPEFFECT_MOVE, &effect);
+    data->Release();
+    source->Release();
+
+    // RE-ENTRANCY, the honest version: the loop that just returned dispatched messages, and
+    // one of them could in principle have destroyed this window (a posted WM_CLOSE from the
+    // updater's shutdown request is the realistic route) — which would have run WM_NCDESTROY
+    // and deleted `st` while this frame still held it. GWLP_USERDATA on a dead HWND reads 0,
+    // so this comparison is safe on a pointer that is no longer safe to dereference.
+    if (state(hwnd) != st) return;
+
+    st->dragActive = false;
+    st->dropCaret = false;
+    if (st->hasFocus) startBlink(st);
+
+    // An EXTERNAL move: the text is now in another application and this side owes the
+    // delete. (A move within this control was already done by our own drop target as ONE
+    // undo step, which is what dragLocalDrop records.)
+    if (SUCCEEDED(hr) && effect == DROPEFFECT_MOVE && !st->dragLocalDrop) {
+        const editor::Selection now = st->model.selection();
+        // Delete only if the range still holds exactly the text that was handed over. If
+        // the modal loop let something edit the buffer, the offsets captured before it mean
+        // nothing, and deleting on their say-so would destroy unrelated text. Leaving a copy
+        // behind is the recoverable failure; deleting the wrong run is not.
+        if (now.min() == sel.min() && now.max() == sel.max() && now.max() <= st->model.length() &&
+            st->model.text().compare(now.min(), now.max() - now.min(), dragged) == 0) {
+            st->model.deleteSelection();
+            afterEdit(st);  // the funnel — an unreported delete is a discardable buffer
+        }
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 // ---- mouse selection + autoscroll (carried over, plus the X axis) -----------
 
 void onMouseMove(EditorState* st, int mx, int my, WPARAM keys) {
@@ -1564,6 +2317,12 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     if (!st) return DefWindowProcW(hwnd, msg, wParam, lParam);
 
     switch (msg) {
+        case WM_CREATE:
+            // The OLE drop target (slice 7). Deliberately not fatal if it fails — see
+            // registerDropTarget — so returning 0 (== "creation succeeded", which is also
+            // what DefWindowProcW returned for this message before) is right either way.
+            registerDropTarget(st);
+            return 0;
         case WM_PAINT: paint(st); return 0;
         case WM_ERASEBKGND: return 1;  // D2D clears the whole client
         case WM_SIZE: {
@@ -1600,11 +2359,27 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case WM_GETDLGCODE: return DLGC_WANTALLKEYS | DLGC_WANTCHARS | DLGC_WANTARROWS;
         case WM_LBUTTONDOWN: {
             SetFocus(hwnd);
+            const int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            const size_t off = offsetFromPoint(st, mx, my);
+            const editor::Selection sel = st->model.selection();
+            // A press INSIDE an existing selection is ambiguous: it starts either a drag of
+            // that selection or an ordinary click that replaces it. THE CARET IS NOT MOVED
+            // HERE — moving it would collapse the selection before the drag could pick it
+            // up, which is the bug that makes drag-to-move impossible to add later. The
+            // ambiguity is resolved by which message arrives next: WM_MOUSEMOVE past the
+            // system drag threshold starts the drag, WM_LBUTTONUP without one is the click.
+            // Gated on dropTarget so a control with no OLE apartment behaves exactly as it
+            // did before this existed. Shift-click always extends, never drags.
+            if (!shift && st->dropTarget && !sel.empty() && off >= sel.min() && off < sel.max()) {
+                SetCapture(hwnd);
+                st->dragArmed = true;
+                st->dragArmPt = POINT{ mx, my };
+                return 0;
+            }
             SetCapture(hwnd);
             st->selecting = true;
-            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            st->model.setCaret(offsetFromPoint(st, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)),
-                               shift);
+            st->model.setCaret(off, shift);
             caretMoved(st, true);
             return 0;
         }
@@ -1613,13 +2388,39 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             caretMoved(st, true);
             return 0;
         case WM_MOUSEMOVE:
+            if (st->dragArmed) {
+                // SM_CXDRAG/SM_CYDRAG is the system's own definition of "the user meant to
+                // drag, not to click" — a few pixels, and honouring it is what keeps a
+                // slightly shaky click on a selection from flinging the text somewhere.
+                if (!(wParam & MK_LBUTTON)) {
+                    st->dragArmed = false;  // button gone without a WM_LBUTTONUP for us
+                    return 0;
+                }
+                const int dx = GET_X_LPARAM(lParam) - st->dragArmPt.x;
+                const int dy = GET_Y_LPARAM(lParam) - st->dragArmPt.y;
+                if ((dx < 0 ? -dx : dx) >= GetSystemMetrics(SM_CXDRAG) ||
+                    (dy < 0 ? -dy : dy) >= GetSystemMetrics(SM_CYDRAG))
+                    beginTextDrag(st);  // MODAL: does not return until the drag ends
+                return 0;
+            }
             onMouseMove(st, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), wParam);
             return 0;
         case WM_LBUTTONUP:
-            if (st->selecting) {
-                st->selecting = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
+            if (st->dragArmed) {
+                // Pressed inside the selection and never travelled: an ordinary click, and
+                // it must behave as one — collapse the selection and put the caret where
+                // the press was. This is the half of the drag gesture that is exercised on
+                // every stray click, so it is the half that must not misbehave.
+                st->dragArmed = false;
+                st->model.setCaret(offsetFromPoint(st, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)),
+                                   false);
+                caretMoved(st, true);
             }
+            st->selecting = false;
+            // Unconditional, and it has to be: an ARMED drag also holds the capture (taken
+            // in WM_LBUTTONDOWN without setting `selecting`), so releasing only on the
+            // selecting path would strand the mouse captured after a click on a selection.
+            if (GetCapture() == hwnd) ReleaseCapture();
             if (st->autoTimer) {
                 KillTimer(hwnd, kAutoScrollTimer);
                 st->autoTimer = 0;
@@ -1627,6 +2428,10 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         case WM_CAPTURECHANGED:  // capture stolen mid-drag (no WM_LBUTTONUP arrives)
             st->selecting = false;
+            // DoDragDrop takes the capture itself, so this arrives at the start of every
+            // text drag as well: disarming here is what stops the WM_LBUTTONUP that ends
+            // the drag from also being read as a click.
+            st->dragArmed = false;
             if (st->autoTimer) {
                 KillTimer(hwnd, kAutoScrollTimer);
                 st->autoTimer = 0;
@@ -1699,6 +2504,11 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             }
             return 0;
         case WM_SETCURSOR:
+            // While a drag is in flight OLE owns the cursor: GiveFeedback returns
+            // DRAGDROP_S_USEDEFAULTCURSORS, and the shell sets the copy / move / no-drop
+            // glyph on every DragOver. Forcing an I-beam back over the top of it would hide
+            // the one piece of feedback that tells the user what the drop is going to do.
+            if (st->dragActive || st->dropCaret) return TRUE;
             if (LOWORD(lParam) == HTCLIENT) {
                 SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
                 return TRUE;
@@ -2050,6 +2860,13 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
 
         case WM_NCDESTROY:
+            // FIRST, before anything else is torn down: while the target is registered OLE
+            // holds a reference to an object that dereferences `st` on every DragOver, and
+            // `st` is deleted at the bottom of this case. Revoking here rather than at
+            // WM_DESTROY is deliberate — the HWND is still valid for RevokeDragDrop, and
+            // WM_NCDESTROY is where the rest of this control's teardown already lives, so
+            // there is one place to read rather than two.
+            revokeDropTarget(st);
             stopBlink(st);
             // Normally WM_KILLFOCUS has already done this; a window destroyed while it
             // still holds the focus never gets one, and leaving a caret behind would have

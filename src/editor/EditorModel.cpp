@@ -184,6 +184,32 @@ void EditorModel::insertText(const std::wstring& s) {
     typingRun_ = run;
 }
 
+void EditorModel::moveSelectionTo(size_t dest) {
+    if (sel_.empty()) return;
+    const size_t a = sel_.min(), b = sel_.max();
+    dest = snap(clamp(dest));
+    // Dropping onto the selection itself, including exactly on either edge: nothing to do,
+    // and no undo step to push. This is checked BEFORE recordPreEdit on purpose — an
+    // "undo" that restored an identical buffer would be an invisible no-op the user has to
+    // press Ctrl+Z twice to get past.
+    if (dest >= a && dest <= b) return;
+    // ONE snapshot for the whole move. extendRun is false: a move is never part of a
+    // typing run, and letting it coalesce into one would fold an unrelated keystroke into
+    // the same undo step.
+    recordPreEdit(false);
+    const std::wstring moved = text_.substr(a, b - a);
+    text_.erase(a, b - a);
+    // The erase shifted everything after `b` down by the length of the run, so a
+    // destination beyond it has to come down with it. (Destinations before `a` are
+    // untouched by the erase; there is no third case, since dest inside [a, b] returned
+    // above.)
+    const size_t at = (dest > b) ? dest - (b - a) : dest;
+    text_.insert(at, moved);
+    sel_.anchor = at;
+    sel_.caret = at + moved.size();
+    typingRun_ = false;
+}
+
 void EditorModel::deleteSelection() {
     if (sel_.empty()) return;
     recordPreEdit(false);

@@ -169,7 +169,11 @@ bool showSettingsDialog(HWND owner, Settings& s, const std::wstring& resolvedSnc
     // TWO lines at every DPI this ships at, so it is sized for two. S(34) was one line
     // plus a sliver, which clipped the second one mid-word into the Theme row below --
     // caught by screenshotting the dialog, not by anything that compiles.
-    mk(L"STATIC", L"Takes effect after a restart. Untick for the older editor, which supports dragging text.",
+    // SLICE 7: the "which supports dragging text" clause is GONE, because that gap is
+    // closed and a hint that still named it would be telling users to untick for a feature
+    // they already have. What is left is the only true thing about the box now: it needs a
+    // restart, and unticking gets the older control. Still sized S(46) for two lines.
+    mk(L"STATIC", L"Takes effect after a restart. Untick to go back to the older RichEdit control.",
        SS_LEFT, fx, yy, fldW, S(46), IDC_D2D_HINT, ui); yy += S(52);
 
     mk(L"STATIC", L"Theme", SS_LEFT, x0, yy + S(4), lblW, S(20), 0, ui);

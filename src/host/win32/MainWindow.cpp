@@ -1694,6 +1694,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_LBUTTONUP: if (g.dragV) { g.dragV = false; ReleaseCapture(); } return 0;
     case WM_DROPFILES: {
+        // TWO senders since phase 46 slice 7, and that is the point. The shell sends this
+        // for a file dropped anywhere the main window itself accepts (DragAcceptFiles), and
+        // the Direct2D editor SENDS it for a file dropped on the TEXT AREA — because the
+        // moment that control registered an OLE drop target for dragging text, the shell
+        // stopped delivering WM_DROPFILES for the editor's rectangle at all. Forwarding
+        // here rather than opening the file over there is deliberate: this is the only
+        // route to requestOpenPath, i.e. to the confirmSaveIfDirty guard, and a second
+        // opening path is a second chance to discard someone's buffer.
+        // The editor hands over its OWN copy of the block, so the DragFinish below frees
+        // memory nobody else owns. See D2DEditor.cpp::forwardFilesToHost.
         HDROP drop = reinterpret_cast<HDROP>(wParam);
         const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
         // Only the first path: each open replaces the single editor buffer, so opening five
@@ -2042,7 +2052,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
     g.hInst = hInstance;
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // OleInitialize, NOT CoInitializeEx, and the difference is load-bearing since phase 46
+    // slice 7: RegisterDragDrop (D2DEditor.cpp, the editor's text drop target) fails with
+    // CO_E_NOTINITIALIZED unless the thread was initialised through OLE — the plain COM
+    // apartment CoInitializeEx creates is not enough, because the drag-drop, clipboard and
+    // in-place-activation services live in the OLE layer above it.
+    //
+    // It is a strict UPGRADE, not a swap: OleInitialize itself calls
+    // CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED) and fails if the thread is already
+    // in a multi-threaded apartment, so everything the old call bought (the shell dialogs
+    // in shobjidl, WIC in d2dEditorRenderToPng, the shell item APIs) is still there on the
+    // same single-threaded apartment.
+    //
+    // PAIRING, checked rather than assumed: this is the only COM/OLE initialisation on the
+    // UI thread and CoUninitialize below (now OleUninitialize) is the only teardown. The
+    // three std::threads this file starts (:729 signing, :1275 / :1288 the build and run
+    // workers) and the two in Updater.cpp initialise no apartment of their own and use no
+    // COM, so none of them needs one. One init, one uninit, same thread.
+    OleInitialize(nullptr);
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES };
     InitCommonControlsEx(&icc);
 
@@ -2118,7 +2145,7 @@ int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
     // ON one of them. Tearing down from inside WM_DESTROY races that callback; by here the
     // window is gone and the callback has long returned. (Same placement RabbitEars uses.)
     shutdownUpdater();
-    CoUninitialize();
+    OleUninitialize();   // pairs with the OleInitialize above; see the note there
     return (int)msg.wParam;
 }
 
