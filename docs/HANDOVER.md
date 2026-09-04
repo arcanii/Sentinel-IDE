@@ -97,7 +97,7 @@ exist so far:
 | `tools/loc.sentinel` | **The first part of Sentinel-IDE written *in* Sentinel** — a whole-file line counter (read_file/write_file). Counts toward the "Sentinel" LOC badge. |
 | `examples/` | Sample project: `sentinel.toml` (+ `[[target]]`s), `sentinel-trust.toml`, `crypto.sentinel`(+`.sig`), `hello.sentinel` |
 | `art/` | `S2_icon.png` (app icon — metallic shield), `A_simple_clean…827808.png` (the `.sentinel` file icon — page + blue S + padlock), plus earlier iteration drafts (`…721412/818278.png`, `Remove_the_drop_shadow…726263.png`) |
-| `docs/` | `prototype.md`, `sentinel-project.md`, this file, `screenshots/phase1..15*.png` |
+| `docs/` | `prototype.md`, `sentinel-project.md`, this file, `release-notes-*.md`, `screenshots/phase1..15*.png` + `phase46-editor.png` (the README hero, 0.1.12) |
 | `LICENSE` | GPL-3.0-or-later (verbatim; the Win32 shell derives from GPL-3.0 SQLTerminal-Win32) |
 | `README.md` | Public-facing readme (status, features, build, installer, license) |
 | `.gitignore` / `.gitattributes` | Ignores `build/`, `target/`, artifacts, `*.sealed`/`*.key`, `.claude/`, `_bmad/`. Attributes force `eol=crlf` on text and mark `*.sig`/`*.ico`/`*.png` **binary** so the signed demo stays byte-exact. |

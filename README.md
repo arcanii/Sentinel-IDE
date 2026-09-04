@@ -4,7 +4,9 @@ A native, **Windows-first IDE for the Sentinel language** — built, increasingl
 
 > **Status: released and self-updating, still early.** Twelve public releases (`v0.1.0` … `v0.1.12`), each an Ed25519-signed installer that existing installs auto-update to. It is genuinely used to edit Sentinel code — but it is Windows-only, needs a local `snc` (the Sentinel compiler) to build Sentinel code, and the build script has machine-specific paths. Early, not a toy.
 
-![Sentinel-IDE](docs/screenshots/phase15-about.png)
+![Sentinel-IDE](docs/screenshots/phase46-editor.png)
+
+*The Direct2D editor with Sentinel syntax colouring, the project tree over a multi-target manifest, the target/tier scheme selector, and the trust chip reporting a verified signature.*
 
 ## What it does today
 
