@@ -92,4 +92,10 @@ constexpr WPARAM kUpdateCheckFailed   = 1;
 // read on the UI thread.
 bool updaterShutdownPending();
 
+// True between the moment ≡ ▸ Check for Updates… starts a fetch and the moment the UI has
+// acted on its outcome. The host uses it to hold a BACKGROUND find back rather than racing
+// the user's own request to the screen — see the WM_APP_UPDATE_AVAILABLE handler. Set and
+// cleared on the UI thread's behalf but written from a worker, so it is an atomic.
+bool updaterManualCheckInFlight();
+
 }  // namespace sentinelide

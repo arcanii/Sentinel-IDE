@@ -1678,12 +1678,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // checkForUpdates(), which is the entry point that actually installs.
         //
         // wParam 1 = the user asked, via ≡ ▸ Check for Updates…; 0 = the background poll.
-        // Sticky, not assignable: if a manual offer is parked here and the background poll
-        // then posts, the offer must stay manual or the guard released below never is, and
-        // the menu item would be dead for the rest of the run.
-        if (wParam) g.pendingUpdateManual = true;
+        //
+        // HOLD A BACKGROUND FIND WHILE THE USER'S OWN CHECK IS IN FLIGHT. Both paths read the
+        // same feed seconds apart, so they routinely find the same version — and if the poll
+        // gets to the screen first, the user answers it, and then their OWN request arrives
+        // and asks the identical question again. Measured before this guard. Deferring here
+        // rather than de-duplicating afterwards is what makes it one dialog instead of two
+        // suppressed halves: the manual result then arrives, offers, and sets offeredThisRun,
+        // which is what this deferred post will trip over when the timer brings it back.
+        if (!wParam && updaterManualCheckInFlight()) {
+            SetTimer(hwnd, kUpdateOfferTimer, 4000, nullptr);
+            return 0;
+        }
         wchar_t* ver = reinterpret_cast<wchar_t*>(lParam);
-        if (ver) { g.pendingUpdate = ver; free(ver); }
+        const std::wstring incoming = ver ? std::wstring(ver) : std::wstring();
+        if (ver) free(ver);
+        // FINDING 3: manual-ness belongs to a VERSION, not to the window. It used to be a
+        // sticky bool, so while a manual offer for X was parked, a background post of a
+        // DIFFERENT version Y inherited it and sailed past both the skip check and
+        // offeredThisRun — the one route by which a version the user had explicitly skipped
+        // could still be offered. Same version: keep it manual (a parked manual offer must
+        // stay manual, or the guard below is never released and the menu item is dead for the
+        // rest of the run). Different version: the new post's own wParam decides.
+        if (!incoming.empty() && _wcsicmp(incoming.c_str(), g.pendingUpdate.c_str()) != 0) {
+            g.pendingUpdateManual = (wParam != 0);
+            g.pendingUpdate = incoming;
+        } else {
+            if (wParam) g.pendingUpdateManual = true;
+            if (!incoming.empty()) g.pendingUpdate = incoming;
+        }
         if (g.pendingUpdate.empty()) {
             if (g.pendingUpdateManual) { g.pendingUpdateManual = false; endInteractiveUpdateCheck(); }
             return 0;

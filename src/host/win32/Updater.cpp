@@ -340,6 +340,7 @@ void checkForUpdates(HWND owner) {
 }
 
 void endInteractiveUpdateCheck() { g_manualCheckInFlight = false; }
+bool updaterManualCheckInFlight() { return g_manualCheckInFlight.load(); }
 
 bool checkForUpdatesInteractive(HWND owner) {
     if (!g_started) {
