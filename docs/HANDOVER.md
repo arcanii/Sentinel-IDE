@@ -1246,22 +1246,27 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.6` | 160 | `Sentinel-IDE-0.1.6.160-setup.exe` | Patch. Saved-point dirty tracking: undoing back to the loaded or last-saved text now clears the `●` and the unsaved-changes prompt, instead of latching on at the first keystroke. **First release verified by a real released client auto-updating to it** — a shipped 0.1.5 install went to 0.1.6.160 in under 10 s via ≡ ▸ Check for Updates…. |
 | `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
 | `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap at the time of that release, stated in its release notes and **closed since, in slice 7**: dragging TEXT within the editor was not supported (dropping a FILE always opened it, and still does). |
+| `v0.1.9` | 185 | `Sentinel-IDE-0.1.9.185-setup.exe` | Minor. **The Direct2D editor becomes the DEFAULT** (phase 46 slice 6), and **text drag-and-drop** closes the last regression against RichEdit — the two editors are feature-equivalent for the first time, which is the stated precondition for slice 7. Escape hatches intact: `--richedit`, the Settings checkbox, and a `d2d=0` written by 0.1.8 all outrank the new default. Dropping a FILE on the editor still opens it guarded — the new `IDropTarget` classifies `CF_HDROP` first and forwards it to the host's existing `WM_DROPFILES` handler, because registering a text drop target would otherwise have swallowed file drops silently. |
 
-**0.1.9 IS PREPARED, NOT PUBLISHED.** `scripts/build.bat` carries `MKT=0.1.9`, so any build
-from this tree stamps 0.1.9.<n> — but there is **no tag, no installer, no signature and no appcast
-entry**, and the live feed still serves 0.1.8.180 to every client. It is not a release until
-`docs/RELEASING.md` has been followed end to end. Notes are drafted at
-`docs/release-notes-0.1.9.md`. What it will carry: **the Direct2D editor as the DEFAULT** (slice 6)
-plus **text drag-and-drop** (the last regression against RichEdit), so the two editors are finally
-feature-equivalent. `--richedit` and the Settings checkbox still opt out, and an explicit opt-out
-written by 0.1.8 outranks the new default.
+**0.1.9 IS PUBLISHED (2026-09-04).** Tag `v0.1.9` points at **7f88a27**, the clean tree the binary
+was built from (`rev-list --count` 85 + `BUILDBASE` 100 = build **185**). Checks run, in the order
+that matters: `dumpbin /DEPENDENTS` showed no debug CRT; `sign-release.ps1` reported *Valid
+signature* against the key compiled into `Updater.cpp`; the **enclosure was confirmed HTTP 200 at
+3,618,031 bytes — matching the appcast `length` AND the local installer — BEFORE the feed was
+pushed**; then the live feed itself, serving `sparkle:version="0.1.9.185"`. ctest 11/11.
+Notes at `docs/release-notes-0.1.9.md`.
+**Not verified, as with every release so far: that a real client installs it.** The steps above
+verify the OFFER path only, which is exactly all anyone verified for v0.1.0-v0.1.4 — every one of
+which offered updates that then installed nothing. The install check needs a throwaway client
+stamped below the feed; see the box at the end of `docs/RELEASING.md`.
 
-**BLOCKED ON A STUCK FILE, NOT ON CODE.** `build\Sentinel-IDE.exe` is a **0-byte stub** left by a
-failed link on the `G:` share and it cannot be relinked, deleted, renamed or moved — `LNK1104`,
-with **no process holding it** (checked by walking every process's MainModule). It is an
-environment fault: the same objects link fine to local disk (910,336 bytes, FileVersion
-0.1.8.183), and `ctest` is 11/11 because the test targets link `D2DEditor.cpp` themselves. Clear
-that file (a reboot, or dropping the share's handle) before step 2 of RELEASING.md.
+**A note on the environment, because it cost an hour and will recur.** The v0.1.9 build was blocked
+by `build\Sentinel-IDE.exe` becoming a **0-byte stub** on the `G:` share after a failed link: it
+could not be relinked, deleted, renamed or moved (`LNK1104`), with **no process holding it** —
+verified by walking every process's `MainModule` against that path, not assumed. The code was never
+at fault: the same objects linked fine to local disk, and `ctest` stayed 11/11 because the test
+targets link `D2DEditor.cpp` themselves rather than the app exe. If `LNK1104` appears with no
+obvious holder, suspect the share, not the build.
 
 **Still owed before cutting it, and no harness here can do them:** drag text once with a real
 mouse, and press **Ctrl+Z / Ctrl+Y / Ctrl+S** — every check across slices 3-6 posted the
