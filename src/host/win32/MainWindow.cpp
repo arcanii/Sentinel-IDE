@@ -1668,6 +1668,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_APP_UPDATE_AVAILABLE: {
+        // Mid-install the process is seconds from ExitProcess (WinSparkle's watchdog
+        // force-exits after 3s), so a modal here is a flash on a dying window. Same
+        // reasoning and same one-liner as WM_APP_OPEN_PATH above. Unsaved work is
+        // unaffected either way — WM_CLOSE's auto-save runs regardless.
+        if (updaterShutdownPending()) return 0;
         // An appcast check found something newer (WinSparkle's periodic check is off — its
         // prompt leads to the install path that does nothing). Offer it; accepting runs
         // checkForUpdates(), which is the entry point that actually installs.
@@ -1738,6 +1743,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_APP_UPDATE_CHECK_RESULT: {
+        // Mid-install the process is seconds from ExitProcess (WinSparkle's watchdog
+        // force-exits after 3s), so a modal here is a flash on a dying window. Same
+        // reasoning and same one-liner as WM_APP_OPEN_PATH above. Unsaved work is
+        // unaffected either way — WM_CLOSE's auto-save runs regardless.
+        if (updaterShutdownPending()) return 0;
         // A manual check with nothing to offer. The background poll is allowed to stay quiet
         // in both these cases; a menu item the user clicked is not.
         if (wParam == kUpdateCheckUpToDate || wParam == kUpdateCheckFailed)

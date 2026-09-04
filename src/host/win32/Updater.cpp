@@ -112,6 +112,14 @@ bool versionIsNewer(const char* candidate, const char* mine) {
 bool fetchAppcast(std::string& body) {
     HINTERNET net = InternetOpenW(L"Sentinel-IDE", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     if (!net) return false;
+    // Bound the wait. An unroutable feed took 21.7s to report failure on the default stack
+    // timeouts (measured against 10.255.255.1) — the UI stays live and the status bar says
+    // "Checking for updates…", so it is not a hang, but nothing in the code bounded it. A
+    // manual check is someone standing there waiting; 8s to a verdict beats 22s.
+    DWORD toMs = 8000;
+    InternetSetOptionW(net, INTERNET_OPTION_CONNECT_TIMEOUT, &toMs, sizeof(toMs));
+    InternetSetOptionW(net, INTERNET_OPTION_RECEIVE_TIMEOUT, &toMs, sizeof(toMs));
+    InternetSetOptionW(net, INTERNET_OPTION_SEND_TIMEOUT, &toMs, sizeof(toMs));
     // RELOAD/NO_CACHE_WRITE or WinINet will happily serve us a cached feed forever.
     const DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
                         INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_UI;
@@ -412,7 +420,12 @@ bool updaterAvailable() { return false; }
 bool updaterShutdownPending() { return false; }
 void initUpdater(HWND) {}
 void checkForUpdates(HWND) {}
-bool checkForUpdatesInteractive(HWND) { return true; }
+// false, NOT true: the caller sets "Checking for updates…" on a true return and then
+// waits for a result that a stubbed-out updater will never post — a latent instance of the
+// exact do-nothing bug this whole change exists to kill. Unreachable today (both entry
+// points are gated on updaterAvailable(), false in this build), which is precisely why it
+// would rot unnoticed.
+bool checkForUpdatesInteractive(HWND) { return false; }
 void endInteractiveUpdateCheck() {}
 void shutdownUpdater() {}
 }  // namespace sentinelide

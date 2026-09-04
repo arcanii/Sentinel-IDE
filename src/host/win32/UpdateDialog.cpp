@@ -146,6 +146,24 @@ UpdateChoice showUpdateAvailableDialog(HWND owner, const std::wstring& newVersio
     while (!st.done) {
         const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
         if (r <= 0) { if (r == 0) PostQuitMessage((int)msg.wParam); break; }
+        // ENTER MUST OBEY FOCUS. Answering DM_GETDEFID with IDCANCEL (above) stops a stray
+        // Enter from accepting an offer nobody was looking at — which really happened, and
+        // ran an installer. But IsDialogMessageW only routes Enter to the FOCUSED control
+        // when that control reports DLGC_DEFPUSHBUTTON, and with the default forced to
+        // IDCANCEL none of them do. So a keyboard user who Tabbed to "Install now" and
+        // pressed Enter got LATER: an affirmative keystroke silently performing the negative
+        // action, which is worse than the stray-Enter problem it was protecting against.
+        // Measured both ways on 2026-09-04 (Enter -> "user deferred", Space -> "user
+        // accepted"). Click the focused button ourselves and keep the safe default for
+        // everything else: focus is explicit intent, an unfocused dialog is not.
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+            HWND f = GetFocus();
+            if (f && IsChild(hwnd, f) &&
+                (SendMessageW(f, WM_GETDLGCODE, 0, 0) & DLGC_BUTTON)) {
+                SendMessageW(f, BM_CLICK, 0, 0);
+                continue;
+            }
+        }
         if (!IsDialogMessageW(hwnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
 
