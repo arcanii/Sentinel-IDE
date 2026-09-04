@@ -1247,6 +1247,28 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
 | `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap at the time of that release, stated in its release notes and **closed since, in slice 7**: dragging TEXT within the editor was not supported (dropping a FILE always opened it, and still does). |
 
+**0.1.9 IS PREPARED, NOT PUBLISHED.** `scripts/build.bat` carries `MKT=0.1.9`, so any build
+from this tree stamps 0.1.9.<n> — but there is **no tag, no installer, no signature and no appcast
+entry**, and the live feed still serves 0.1.8.180 to every client. It is not a release until
+`docs/RELEASING.md` has been followed end to end. Notes are drafted at
+`docs/release-notes-0.1.9.md`. What it will carry: **the Direct2D editor as the DEFAULT** (slice 6)
+plus **text drag-and-drop** (the last regression against RichEdit), so the two editors are finally
+feature-equivalent. `--richedit` and the Settings checkbox still opt out, and an explicit opt-out
+written by 0.1.8 outranks the new default.
+
+**BLOCKED ON A STUCK FILE, NOT ON CODE.** `build\Sentinel-IDE.exe` is a **0-byte stub** left by a
+failed link on the `G:` share and it cannot be relinked, deleted, renamed or moved — `LNK1104`,
+with **no process holding it** (checked by walking every process's MainModule). It is an
+environment fault: the same objects link fine to local disk (910,336 bytes, FileVersion
+0.1.8.183), and `ctest` is 11/11 because the test targets link `D2DEditor.cpp` themselves. Clear
+that file (a reboot, or dropping the share's handle) before step 2 of RELEASING.md.
+
+**Still owed before cutting it, and no harness here can do them:** drag text once with a real
+mouse, and press **Ctrl+Z / Ctrl+Y / Ctrl+S** — every check across slices 3-6 posted the
+`WM_COMMAND` that `TranslateAcceleratorW` produces, which is the code those slices changed but is
+not the keyboard. Also uncovered: the drag threshold, `QueryContinueDrag`/`GiveFeedback`, and edge
+autoscroll during a drag.
+
 **0.1.8 IS PUBLISHED (2026-09-04).** Tag `v0.1.8` points at **55ae4bd**, the clean tree the
 binary was built from (`rev-list --count` 80 + `BUILDBASE` 100 = build **180**), so it rebuilds
 from its tag. Checks that were actually run, in this order, because the order is the point:
