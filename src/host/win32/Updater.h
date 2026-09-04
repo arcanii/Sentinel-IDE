@@ -19,8 +19,39 @@ namespace sentinelide {
 // when WinSparkle needs the app to quit so it can install an update.
 void initUpdater(HWND mainWnd);
 
-// User-triggered "Check for Updates…" (≡ menu). Shows WinSparkle's own UI.
+// Download and install an update NOW, with no further questions —
+// win_sparkle_check_update_with_ui_and_install(). This is what runs once the user has
+// answered "Install now"; it is NOT the menu item. See the comment on its definition for
+// why the prompt-then-install variant cannot be used instead.
 void checkForUpdates(HWND owner);
+
+// User-triggered "Check for Updates…" (≡ menu, About box) — asks BEFORE installing.
+//
+// Fetches the appcast on a detached thread (a blocking network GET on the UI thread would
+// freeze the message loop for as long as the server takes) and reports the outcome by
+// POSTING to the main window:
+//   * a newer version   -> WM_APP_UPDATE_AVAILABLE with wParam 1, i.e. the same themed
+//                          Install now / Later / Skip offer the background poll raises;
+//   * already current   -> WM_APP_UPDATE_CHECK_RESULT, wParam kUpdateCheckUpToDate;
+//   * fetch/parse fails -> WM_APP_UPDATE_CHECK_RESULT, wParam kUpdateCheckFailed.
+//
+// ALL THREE are reported, and that is the difference from the background poll: a background
+// check may fail silently and try again next tick, but a menu item the user just clicked
+// must never appear to do nothing. Nothing is swallowed here.
+//
+// Returns false when a manual check is ALREADY IN FLIGHT, in which case nothing at all is
+// started: no second thread, and — because the guard is not released until the UI has acted
+// on the first outcome — no second dialog either. The caller may say so in the status bar.
+//
+// `owner` is used only for the synchronous "not configured" message box. Every asynchronous
+// outcome is posted to the main window instead, so it goes through that window's busy
+// deferral and can never stack a second modal on top of an open one.
+bool checkForUpdatesInteractive(HWND owner);
+
+// Release the in-flight guard taken by checkForUpdatesInteractive. The UI calls this when it
+// has finished ACTING on an outcome, not when the message arrives — otherwise a click landing
+// while the offer is still parked behind a modal would queue a second, identical offer.
+void endInteractiveUpdateCheck();
 
 // On app exit.
 void shutdownUpdater();
@@ -29,8 +60,14 @@ void shutdownUpdater();
 // is hidden when false, so we never present a check that cannot verify anything.
 bool updaterAvailable();
 
-// Posted to the main window when OUR OWN periodic check finds a newer version in the
-// appcast. lParam is a heap wchar_t* with the new version string; the UI must free it.
+// Posted to the main window when one of OUR OWN appcast checks finds a newer version.
+// lParam is a heap wchar_t* with the new version string; the UI must free it.
+//
+// wParam says WHICH check found it, and it changes one thing only:
+//   0 = the background poll   — honours [update] skip_version, so a skipped release stays quiet;
+//   1 = a manual menu check   — IGNORES skip_version, because an explicit request outranks a
+//       standing preference. Someone who skipped 0.1.11 and then asks "any updates?" is owed
+//       an answer, not silence.
 //
 // We run that periodic check ourselves because WinSparkle's built-in one is unusable here:
 // it raises WinSparkle's own update prompt, which is the flow that hands us an empty payload
@@ -39,6 +76,14 @@ bool updaterAvailable();
 // we only decide whether to OFFER, and the download, Ed25519 verification and install still
 // go through WinSparkle via checkForUpdates().
 constexpr UINT WM_APP_UPDATE_AVAILABLE = WM_APP + 9;
+
+// Outcome of a MANUAL check that produced no offer. wParam is one of the two constants
+// below; lParam is unused. The "there IS an update" outcome deliberately goes to
+// WM_APP_UPDATE_AVAILABLE above instead of here, so the manual path reuses the proven
+// offer-and-defer handler rather than growing a second copy of it.
+constexpr UINT WM_APP_UPDATE_CHECK_RESULT = WM_APP + 10;
+constexpr WPARAM kUpdateCheckUpToDate = 0;
+constexpr WPARAM kUpdateCheckFailed   = 1;
 
 // True once WinSparkle has asked us to quit so it can install an update. The WM_CLOSE
 // that arrives then is NOT a user closing the window: WinSparkle is waiting on our

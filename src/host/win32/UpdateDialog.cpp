@@ -43,6 +43,20 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             SetBkColor(hdc, th.panelBg); return (LRESULT)themeBrush(th.panelBg);
         }
         case WM_CTLCOLOREDIT: case WM_CTLCOLORBTN: return dialogCtlColor(msg, w);
+        // ENTER MUST MEAN "Later", AND WITHOUT THIS IT MEANS "Install now".
+        //
+        // BS_DEFPUSHBUTTON on the Later button below only draws the heavy border; the key
+        // handling lives in IsDialogMessageW, which asks the WINDOW for its default id via
+        // DM_GETDEFID. This is a plain registered class, not a real dialog resource, so
+        // DefWindowProc answers 0 — "no default" — and IsDialogMessageW's documented
+        // fallback for VK_RETURN is to send IDOK. IDOK here is Install now. Focus does not
+        // enter into it: the dialog manager never consults it for Enter.
+        //
+        // Measured on 2026-09-04, and it is not theoretical: an offer left on screen was
+        // accepted by a stray Enter, downloaded the payload and ran the installer. The
+        // 700 ms accept guard below had long expired — it only covers the first moment.
+        // Answering with IDCANCEL makes the dialog manager agree with what is drawn.
+        case DM_GETDEFID: return MAKELRESULT(IDCANCEL, DC_HASDEFID);
         case WM_COMMAND:
             if (!st) return 0;
             if (LOWORD(w) == IDOK) {

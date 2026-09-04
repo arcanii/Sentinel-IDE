@@ -60,8 +60,9 @@ constexpr wchar_t kAppName[]   = L"Sentinel-IDE";
 constexpr wchar_t kVersion[]   = SENTINEL_VERSION_DISPLAY_W;
 constexpr UINT WM_APP_LINE = WM_APP + 1;   // lParam = heap wchar_t* (UI frees)
 constexpr UINT WM_APP_DONE = WM_APP + 2;   // wParam = exit code
-constexpr UINT_PTR kUpdateOfferTimer = 1;   // retry the background update offer once no modal is up
-constexpr UINT_PTR kOpenPathTimer    = 2;   // retry an externally-delivered open once no modal is up
+constexpr UINT_PTR kUpdateOfferTimer  = 1;   // retry the update offer once no modal is up
+constexpr UINT_PTR kOpenPathTimer     = 2;   // retry an externally-delivered open once no modal is up
+constexpr UINT_PTR kUpdateResultTimer = 3;   // retry a manual check's "up to date" / "failed" report
 constexpr UINT WM_APP_OPEN_PATH = WM_APP + 4;   // lParam = heap wchar_t* (UI frees): open this path
 constexpr UINT WM_APP_SIGN = WM_APP + 3;   // wParam = SignState, lParam = heap "file\tkey\tgrants" (UI frees)
 
@@ -99,7 +100,12 @@ struct AppState {
     int   tier = 1;  // 0=dev 1=experimental 2=stable 3=hardened (TIERED_RELEASES.md)
     int   target = 0;  // active build target (index into project.targets)
     std::wstring rootPath, curFilePath, curFileName, sncPath;
-    std::wstring pendingUpdate;   // version offered by the background poll, held until no modal is up
+    std::wstring pendingUpdate;   // version an appcast check found, held until no modal is up
+    bool pendingUpdateManual = false;  // that check was the MANUAL one → ignore skip_version, and
+                                       // release the updater's in-flight guard once it is answered
+    int  pendingCheckResult = -1; // manual check outcome with nothing to offer (kUpdateCheck*), -1 = none
+    std::wstring offeredThisRun;  // version already offered AND answered this run — the background
+                                  // poll must not raise it a second time (a manual check still may)
     std::wstring pendingOpenPath; // path handed in from outside (IPC / drag-drop), held until the UI is free
     std::wstring savedText;   // editor text as of the last load/save — the saved point undo can return to
     std::wstring statusLeft = L"Ln 1, Col 1", statusMsg = L"Open a folder to start", pendingMsg;
@@ -1662,28 +1668,60 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_APP_UPDATE_AVAILABLE: {
-        // Our own appcast poll found something newer (WinSparkle's periodic check is off —
-        // its prompt leads to the install path that does nothing). Offer it; accepting runs
+        // An appcast check found something newer (WinSparkle's periodic check is off — its
+        // prompt leads to the install path that does nothing). Offer it; accepting runs
         // checkForUpdates(), which is the entry point that actually installs.
+        //
+        // wParam 1 = the user asked, via ≡ ▸ Check for Updates…; 0 = the background poll.
+        // Sticky, not assignable: if a manual offer is parked here and the background poll
+        // then posts, the offer must stay manual or the guard released below never is, and
+        // the menu item would be dead for the rest of the run.
+        if (wParam) g.pendingUpdateManual = true;
         wchar_t* ver = reinterpret_cast<wchar_t*>(lParam);
         if (ver) { g.pendingUpdate = ver; free(ver); }
-        if (g.pendingUpdate.empty()) return 0;
-        // The user asked never to see this one again.
-        if (_wcsicmp(g.pendingUpdate.c_str(), g.settings.updateSkipVersion.c_str()) == 0) {
-            logMsg(LogLevel::Info, L"Updater: skipping offer of " + g.pendingUpdate + L" (user skipped this version)");
-            g.pendingUpdate.clear(); return 0;
+        if (g.pendingUpdate.empty()) {
+            if (g.pendingUpdateManual) { g.pendingUpdateManual = false; endInteractiveUpdateCheck(); }
+            return 0;
+        }
+        // Two reasons the BACKGROUND poll must stay quiet. Neither constrains a manual check:
+        // an explicit request outranks a standing preference and outranks "I already asked".
+        if (!g.pendingUpdateManual) {
+            // (a) "Skip this version" — the durable no.
+            if (_wcsicmp(g.pendingUpdate.c_str(), g.settings.updateSkipVersion.c_str()) == 0) {
+                logMsg(LogLevel::Info, L"Updater: skipping offer of " + g.pendingUpdate + L" (user skipped this version)");
+                g.pendingUpdate.clear(); return 0;
+            }
+            // (b) Already asked about this version in this run. The poll stops after one offer,
+            // but it can find the same version a MANUAL check has just offered — and then park
+            // behind that very dialog and re-ask the moment it closes. Measured: manual offer,
+            // Later, and the identical offer again 30 s later. "Never nag twice" is phase 41's
+            // promise and it has to survive the two paths meeting.
+            if (_wcsicmp(g.pendingUpdate.c_str(), g.offeredThisRun.c_str()) == 0) {
+                logMsg(LogLevel::Info, L"Updater: not re-offering " + g.pendingUpdate + L" — already answered this run");
+                g.pendingUpdate.clear(); return 0;
+            }
         }
         // NEVER open on top of another modal. This message is posted asynchronously, and every
         // modal here pumps with a null-filter GetMessageW, so it would be dispatched straight
         // into their nested loop — and this dialog would then re-enable the main window with
         // that prompt still pending. Wait until the main window is interactive again.
-        if (!IsWindowEnabled(hwnd)) { SetTimer(hwnd, kUpdateOfferTimer, 4000, nullptr); return 0; }
+        // uiIsBusy, not just IsWindowEnabled: TrackPopupMenu leaves its owner ENABLED, and the
+        // manual check is started from the ≡ menu, so the ≡ menu is exactly what this can land in.
+        if (uiIsBusy(hwnd)) { SetTimer(hwnd, kUpdateOfferTimer, 4000, nullptr); return 0; }
         KillTimer(hwnd, kUpdateOfferTimer);
         const std::wstring newVer = g.pendingUpdate;
+        const bool manual = g.pendingUpdateManual;
+        // Clear BOTH before the dialog: it runs a nested modal loop that dispatches the retry
+        // timer, which would otherwise see a pending version and raise a second offer.
         g.pendingUpdate.clear();
+        g.pendingUpdateManual = false;
+        // Whatever they answer, the background poll has now had its one bite at this version.
+        g.offeredThisRun = newVer;
+        const wchar_t* how = manual ? L"requested" : L"background";
         switch (showUpdateAvailableDialog(hwnd, newVer, SENTINEL_FILEVERSION_STR_W)) {
             case UpdateChoice::InstallNow:
-                logMsg(LogLevel::Info, L"Updater: user accepted the background offer of " + newVer);
+                logMsg(LogLevel::Info, std::wstring(L"Updater: user accepted the ") + how + L" offer of " + newVer);
+                // Only here does anything get downloaded or installed.
                 checkForUpdates(hwnd);
                 break;
             case UpdateChoice::SkipVersion:
@@ -1691,9 +1729,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 logMsg(LogLevel::Info, L"Updater: user chose to skip version " + newVer);
                 break;
             default:
-                logMsg(LogLevel::Info, L"Updater: user deferred the background offer of " + newVer);
+                logMsg(LogLevel::Info, std::wstring(L"Updater: user deferred the ") + how + L" offer of " + newVer);
                 break;
         }
+        // Answered — a further manual check may start. Released AFTER the dialog, so a click
+        // landing while it was open (or parked) could not have produced a second one.
+        if (manual) endInteractiveUpdateCheck();
+        return 0;
+    }
+    case WM_APP_UPDATE_CHECK_RESULT: {
+        // A manual check with nothing to offer. The background poll is allowed to stay quiet
+        // in both these cases; a menu item the user clicked is not.
+        if (wParam == kUpdateCheckUpToDate || wParam == kUpdateCheckFailed)
+            g.pendingCheckResult = (int)wParam;
+        if (g.pendingCheckResult < 0) return 0;
+        // Same rule as the offer: a message box disables its owner, so raising one over an
+        // open modal is the same two-modals defect. Wait, then say it.
+        if (uiIsBusy(hwnd)) { SetTimer(hwnd, kUpdateResultTimer, 4000, nullptr); return 0; }
+        KillTimer(hwnd, kUpdateResultTimer);
+        const int outcome = g.pendingCheckResult;
+        g.pendingCheckResult = -1;   // before the box: it pumps, and the retry timer would repeat it
+        if (outcome == (int)kUpdateCheckUpToDate) {
+            g.statusMsg = std::wstring(L"Sentinel-IDE ") + SENTINEL_FILEVERSION_STR_W + L" is up to date";
+            InvalidateRect(hwnd, &g.rStatus, FALSE);
+            MessageBoxW(hwnd,
+                        (std::wstring(L"Sentinel-IDE ") + SENTINEL_FILEVERSION_STR_W +
+                         L" is up to date.\n\nThis is the latest published version.").c_str(),
+                        L"Check for Updates", MB_OK | MB_ICONINFORMATION);
+        } else {
+            g.statusMsg = L"Could not check for updates";
+            InvalidateRect(hwnd, &g.rStatus, FALSE);
+            std::wstring m = L"Couldn't check for updates.\n\n"
+                             L"The update feed could not be reached, or what came back wasn't an "
+                             L"update feed. Check your network connection and try again.";
+            if (!g.settings.logFile.empty()) m += L"\n\nDetails were written to the log:\n" + g.settings.logFile;
+            MessageBoxW(hwnd, m.c_str(), L"Check for Updates", MB_OK | MB_ICONWARNING);
+        }
+        endInteractiveUpdateCheck();
         return 0;
     }
     case WM_TIMER:
@@ -1705,8 +1777,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == kUpdateOfferTimer) {
             KillTimer(hwnd, kUpdateOfferTimer);
+            // Carry the manual flag back through, or a deferred manual offer would come back
+            // as a background one — and a skipped version would then be silently dropped.
             if (!g.pendingUpdate.empty())
-                PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, 0, (LPARAM)_wcsdup(g.pendingUpdate.c_str()));
+                PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, g.pendingUpdateManual ? 1 : 0,
+                             (LPARAM)_wcsdup(g.pendingUpdate.c_str()));
+            return 0;
+        }
+        if (wParam == kUpdateResultTimer) {
+            KillTimer(hwnd, kUpdateResultTimer);
+            if (g.pendingCheckResult >= 0)
+                PostMessageW(hwnd, WM_APP_UPDATE_CHECK_RESULT, (WPARAM)g.pendingCheckResult, 0);
             return 0;
         }
         break;
@@ -1907,7 +1988,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case ID_ABOUT: showAboutDialog(hwnd); break;
-        case ID_CHECK_UPDATES: checkForUpdates(hwnd); break;
+        case ID_CHECK_UPDATES:
+            // A question, so it asks. NOT checkForUpdates() — that one downloads, installs and
+            // closes the app with no "do you want this?" step, which is not what a menu item
+            // reading "Check for Updates…" should do. It is still what runs if the user then
+            // answers Install now. The fetch is asynchronous, so all this does is start it.
+            if (checkForUpdatesInteractive(hwnd)) g.statusMsg = L"Checking for updates…";
+            else                                  g.statusMsg = L"Already checking for updates…";
+            InvalidateRect(hwnd, &g.rStatus, FALSE);
+            break;
         case ID_TIER_DEV: case ID_TIER_EXP: case ID_TIER_STABLE: case ID_TIER_HARD:
             g.tier = LOWORD(wParam) - ID_TIER_DEV; setProjectTitle(hwnd);
             logMsg(LogLevel::Info, std::wstring(L"Tier → ") + tierName(g.tier));

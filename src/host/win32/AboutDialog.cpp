@@ -124,9 +124,19 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_CTLCOLORBTN: return dialogCtlColor(msg, w);
         case WM_COMMAND:
-            // Deliberately does NOT close the About box: WinSparkle's UI appears in front
-            // of it, and if the user cancels the check they are back where they started.
-            if (LOWORD(w) == IDC_UPDATE) { checkForUpdates(hwnd); return 0; }
+            // The SAME interactive path as the ≡ menu item — this button asks the identical
+            // question and must not mean "replace the application".
+            //
+            // It DOES now close the About box, where the old install-immediately call did not.
+            // The outcome is posted to the MAIN window and that window defers anything modal
+            // while this dialog is up (About disables its owner, so uiIsBusy is true) — so
+            // staying open would mean clicking the button and seeing nothing until you closed
+            // it anyway, only later. Closing puts the answer in front of the user at once.
+            if (LOWORD(w) == IDC_UPDATE) {
+                checkForUpdatesInteractive(hwnd);
+                if (st) st->done = true;
+                return 0;
+            }
             if (st && (LOWORD(w) == IDC_CLOSE || LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL)) st->done = true;
             return 0;
         case WM_CLOSE: if (st) st->done = true; return 0;
@@ -192,9 +202,10 @@ void showAboutDialog(HWND owner) {
     //
     // Created only when the updater is compiled in AND has a real signing key, matching
     // the ≡ menu: a check that cannot verify a signature must not be offered at all.
-    // WinSparkle's UI is its own top-level window and this dialog stays open behind it;
-    // that is fine, and the nested-loop WM_QUIT fix below is what makes it safe when the
-    // check ends in "quit so I can install".
+    // The button starts an ASYNCHRONOUS check and closes this dialog (see WM_COMMAND); any
+    // offer or answer is raised by the MAIN window afterwards. The nested-loop WM_QUIT fix
+    // below still matters — WinSparkle's own progress UI is a top-level window that can
+    // appear over this one, and a check can still end in "quit so I can install".
     if (updaterAvailable()) {
         const int uw = S(150);
         HWND up = CreateWindowExW(0, L"BUTTON", L"Check for Updates…", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,

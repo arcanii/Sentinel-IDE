@@ -168,6 +168,16 @@ void startOwnUpdateTimer(HWND mainWnd) {
     }).detach();
 }
 
+// ---- the manual check -----------------------------------------------------
+// Same fetch as the background poll, three differences, all of them the point:
+//   1. it always reports — up to date and "could not reach the feed" are outcomes the user
+//      must see, where the background poll is allowed to shrug and retry in an hour;
+//   2. it posts wParam 1, which tells the host to ignore [update] skip_version;
+//   3. it is guarded, so a double-click cannot start two threads or raise two dialogs.
+// It does NOT install anything by itself: that is checkForUpdates(), reached only if the
+// user picks Install now in the offer this raises.
+std::atomic<bool> g_manualCheckInFlight{false};
+
 // ---- diagnostics ----------------------------------------------------------
 // WinSparkle reports failures ONLY through these callbacks. Without them a failed
 // update is completely silent: the app cannot know, and the log shows nothing between
@@ -314,10 +324,79 @@ void checkForUpdates(HWND owner) {
     // nothing and reports no error. Measured repeatedly on 2026-08-30; it is why every
     // release v0.1.0..v0.1.4 offered updates that could never install.
     //
-    // This variant downloads first and hands the callback a real, verified payload,
-    // which we then run ourselves. It skips the "do you want to update?" prompt, which
-    // is acceptable here because the user reached this by explicitly asking to check.
+    // This variant downloads first and hands the callback a real, verified payload, which we
+    // then run ourselves. It skips the "do you want to update?" prompt and then REPLACES THE
+    // RUNNING APP, which is why it is no longer wired to the menu item: ≡ ▸ Check for Updates…
+    // goes to checkForUpdatesInteractive(), and only an explicit "Install now" lands here.
     win_sparkle_check_update_with_ui_and_install();
+}
+
+void endInteractiveUpdateCheck() { g_manualCheckInFlight = false; }
+
+bool checkForUpdatesInteractive(HWND owner) {
+    if (!g_started) {
+        // Synchronous on purpose: nothing was started, so there is no outcome to wait for,
+        // and the caller is already on the UI thread inside its own WM_COMMAND.
+        MessageBoxW(owner,
+                    L"Auto-update isn't configured in this build.\n\n"
+                    L"No update-signing key was compiled in, so an update could not be "
+                    L"verified even if one were found. See docs/RELEASING.md.",
+                    L"Sentinel-IDE", MB_OK | MB_ICONINFORMATION);
+        return true;   // handled, and visibly so — nothing is in flight to collide with
+    }
+    // Second click while one is running: do nothing at all. Not a queued check, not a second
+    // thread — the first one's answer is already on its way and will be shown. The guard is
+    // released by endInteractiveUpdateCheck() once the UI has ACTED on that answer, so this
+    // also covers the window in which the offer is parked behind a modal.
+    if (g_manualCheckInFlight.exchange(true)) {
+        logMsg(LogLevel::Info, L"Updater: a manual check is already running — ignoring the second request");
+        return false;
+    }
+    // Post to the MAIN window, not to `owner`. Owner may be the About box, which is modal;
+    // routing through the main window means the outcome goes through its uiIsBusy deferral
+    // instead of stacking a message box on top of a dialog (the phase-41 defect).
+    HWND target = g_mainWnd ? g_mainWnd : owner;
+    if (!target) { g_manualCheckInFlight = false; return true; }
+
+    // OFF THE UI THREAD. The GET is small but the network is not ours to promise anything
+    // about; blocking the message loop on it would freeze the window, and a DNS black hole
+    // would freeze it for the resolver's timeout, not ours.
+    std::thread([target] {
+        std::string body;
+        std::string ver;
+        bool ok = fetchAppcast(body);
+        if (ok) {
+            ver = appcastVersion(body);
+            // A 200 carrying something that is not our appcast (a GitHub 404 page, a captive
+            // portal's login form) is a FAILURE, not "no update" — reporting it as up to date
+            // is exactly the silence that hid a broken updater for four releases.
+            if (ver.empty()) ok = false;
+        }
+        UINT msg = WM_APP_UPDATE_CHECK_RESULT;
+        WPARAM wp = kUpdateCheckFailed;
+        LPARAM lp = 0;
+        if (!ok) {
+            logMsg(LogLevel::Error, L"Updater: manual check could not read the appcast "
+                                    L"(feed unreachable, or the response was not an appcast)");
+        } else if (versionIsNewer(ver.c_str(), SENTINEL_FILEVERSION_STR)) {
+            const std::wstring w(ver.begin(), ver.end());   // ASCII version string
+            logMsg(LogLevel::Info, L"Updater: manual check found a newer version — " + w);
+            msg = WM_APP_UPDATE_AVAILABLE;
+            wp  = 1;                                        // manual: ignore skip_version
+            lp  = (LPARAM)_wcsdup(w.c_str());
+        } else {
+            logMsg(LogLevel::Info, std::wstring(L"Updater: manual check — already current at ")
+                                   + SENTINEL_FILEVERSION_STR_W);
+            wp = kUpdateCheckUpToDate;
+        }
+        if (!PostMessageW(target, msg, wp, lp)) {
+            // The window went away (shutting down). Free the payload and drop the guard here,
+            // because the UI will never reach endInteractiveUpdateCheck() for this one.
+            if (lp) free(reinterpret_cast<void*>(lp));
+            g_manualCheckInFlight = false;
+        }
+    }).detach();
+    return true;
 }
 
 void shutdownUpdater() {
@@ -333,6 +412,8 @@ bool updaterAvailable() { return false; }
 bool updaterShutdownPending() { return false; }
 void initUpdater(HWND) {}
 void checkForUpdates(HWND) {}
+bool checkForUpdatesInteractive(HWND) { return true; }
+void endInteractiveUpdateCheck() {}
 void shutdownUpdater() {}
 }  // namespace sentinelide
 
