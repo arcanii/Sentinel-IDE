@@ -1,5 +1,11 @@
 # Sentinel-IDE
 
+[![Latest release](https://img.shields.io/github/v/release/arcanii/Sentinel-IDE?label=release&color=E86A4B)](https://github.com/arcanii/Sentinel-IDE/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/arcanii/Sentinel-IDE/total?color=E86A4B)](https://github.com/arcanii/Sentinel-IDE/releases)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4)
+![Language](https://img.shields.io/badge/C%2B%2B17%20%2B%20Sentinel-informational)
+
 A native, **Windows-first IDE for the Sentinel language** — built, increasingly, *in* Sentinel. The long-term thesis: a thin native host that shrinks over time as more of the IDE is rewritten in Sentinel itself.
 
 > **Status: released and self-updating, still early.** Twelve public releases (`v0.1.0` … `v0.1.12`), each an Ed25519-signed installer that existing installs auto-update to. It is genuinely used to edit Sentinel code — but it is Windows-only, needs a local `snc` (the Sentinel compiler) to build Sentinel code, and the build script has machine-specific paths. Early, not a toy.
@@ -7,6 +13,12 @@ A native, **Windows-first IDE for the Sentinel language** — built, increasingl
 ![Sentinel-IDE](docs/screenshots/phase46-editor.png)
 
 *The Direct2D editor with Sentinel syntax colouring, the project tree over a multi-target manifest, the target/tier scheme selector, and the trust chip reporting a verified signature.*
+
+<p align="center">
+  <img src="docs/screenshots/phase46-about.png" width="620" alt="About box showing lines-of-code badges and the share written in Sentinel">
+</p>
+
+*The About box counts itself. The **Total** badge is produced by [`tools/loc.sentinel`](tools/loc.sentinel) — a Sentinel program in the build pipeline — and the bar under it is the share of this IDE written in Sentinel. It went **down** this release: the Direct2D editor added several thousand lines of C++, which is what "a shrinking debt" looks like when the host grows first.*
 
 ## What it does today
 
