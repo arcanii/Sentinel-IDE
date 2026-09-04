@@ -42,7 +42,9 @@ Win32 + Common Controls v6, MSVC/Ninja, C++17.
 ## Status — phases 1–39 complete (1–17 detailed below; 18–39 in [HANDOVER.md](HANDOVER.md))
 A real, native Win32 IDE built from the UX spines + `Theme.h`:
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar (signing chip).
-2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project.
+2. **Real controls** — dark `WC_TREEVIEW` + editor, draggable splitter, Open Project. (The editor
+   was RichEdit through phase 45; phase 46 replaced it with a Direct2D control and then deleted the
+   RichEdit editor path. RichEdit remains the Output pane.)
 3. **Syntax highlighting** — Sentinel keywords (incl. `secret`/`declassify`), strings, numbers, comments per `Theme.h`.
 4. **Build/Run loop** — `snc.exe` on a worker thread; live-streamed Output (ANSI-stripped) with the exact command + exit code; miette diagnostics (`file:line:col`) parsed into a clickable Problems list. Building `examples\crypto.sentinel` originally reproduced the real Windows link gap (PRD §14 / gap #1 / UJ-3) — **resolved in phase 13** by injecting the auto-detected MSVC env.
 5. **Logging + Settings** — a configurable logfile (level + location) under `%LOCALAPPDATA%\SentinelIDE\logs\`; a themed Settings dialog (editor font, theme follow/light/dark, log level + location + Reveal) persisted to `settings.ini` and applied live.
@@ -83,5 +85,5 @@ CLI: `Sentinel-IDE.exe <file|folder> [--build] [--settings] [--project-settings]
 - **Signing** — editable trust grants beyond add+import; a default-key setting; surface capability-bound verify failures as Problems. (Build gating on `require` and post-build artifact signing shipped — phases 13 + 23; the trust manifest was wired to the real `[[keys]]` schema in phase 29.)
 - **Targets** — per-target `lib_paths`; a definable output dir; add/remove `[[target]]` blocks from the form. (Per-target editing shipped — phase 22.)
 - **Project Settings polish** — `entry`-exists validation; surface `icon`/`authors` in the form.
-- **Direct2D editor** — swap RichEdit for a GPU text editor (the native-perf target, as in the SQLTerminal reference).
+- ~~**Direct2D editor** — swap RichEdit for a GPU text editor (the native-perf target, as in the SQLTerminal reference).~~ **DONE, phase 46** — shipped as the default in v0.1.9 and the RichEdit editor is now deleted.
 - **Accessibility** — backlogged per the UX decision; add the Settings build-command field.

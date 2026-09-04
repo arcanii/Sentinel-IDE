@@ -8,8 +8,8 @@ A native, **Windows-first IDE for the Sentinel language** — built, increasingl
 
 ## What it does today
 
-- **Themed dark/coral shell** (DWM dark titlebar, dark popup/context menus) with a dark TreeView + RichEdit editor and **Sentinel syntax highlighting**.
-- **Editor**: line-number gutter, dirty `●`/Save, error-line tints, **undo/redo** (the highlighter no longer pollutes the undo stack), clickable `file:line:col` links in build output.
+- **Themed dark/coral shell** (DWM dark titlebar, dark popup/context menus) with a dark TreeView + a **Direct2D/DirectWrite code editor** and **Sentinel syntax highlighting** (RichEdit is now only the Output pane).
+- **Editor**: a Direct2D/DirectWrite control — no word wrap, real horizontal scrolling, syntax colouring painted rather than stored (so it cannot reach the undo stack at all), line-number gutter, dirty `●`/Save, error-line tints, **undo/redo**, drag-and-drop of text, and clickable `file:line:col` links in build output.
 - **Build / Run** via `snc` on a worker thread — streamed Output + a clickable Problems list. Builds link and run (the IDE injects the auto-detected MSVC environment so `link.exe` works).
 - **Project model**: a `*.sntproject` (or legacy `sentinel.toml`) manifest with **multiple `[[target]]`s**, an Xcode-style **target ▾ · tier ▾** scheme selector, a structured **Project Settings** form with per-target editing, **New / Open / Close Project**, **Recent Projects**, and **New File**.
 - **Signing & Trust (ADR-0061)**: real `snc keygen`/`sign`/`verify` with a live status-bar trust chip; a successful build can sign the produced artifact.

@@ -87,6 +87,7 @@
 #include <string>
 #include <vector>
 
+#include "core/Logger.h"
 #include "editor/EditorModel.h"
 #include "editor/SyntaxLexer.h"
 #include "host/win32/D2DSupport.h"
@@ -107,6 +108,13 @@ constexpr UINT_PTR kAutoScrollTimer = 2;
 // theorised. A one-shot timer gives the retry a floor instead.
 constexpr UINT_PTR kDeviceRetryTimer = 3;
 constexpr UINT kDeviceRetryMs = 250;
+// How long a device failure has to persist before paint() stops retrying in silence and
+// says so on the client area. Long enough that a GPU reset or an RDP session change (which
+// recover within a frame or two) never flashes a notice at the user; short enough that a
+// real one is explained before anybody starts typing into it. See paint's else branch —
+// since phase 46 slice 8 removed the RichEdit editor there is no fallback control, so a
+// blank pane with no explanation is the outcome that has to be impossible.
+constexpr ULONGLONG kDeviceFailQuietMs = 1000;
 
 // The editor font. Matches Settings::editorFont's default and the 11pt the RichEdit
 // control is formatted with, so the swap in slice 6 is not also a font change.
@@ -318,16 +326,19 @@ struct EditorState {
     DWORD eventMask = ENM_CHANGE | ENM_SELCHANGE | ENM_SCROLL;
 
     // WM_SETREDRAW(FALSE) nesting depth. What the COUNTER buys over a bool is correct
-    // NESTING (clearErrorMarks/markErrorLines run inside highlight()'s window in the
-    // RichEdit path, so the inner TRUE must not un-mute the outer window) and immunity to
-    // a stray extra TRUE (it floors at 0 instead of going negative). It buys NOTHING
+    // NESTING (on the RichEdit path clearErrorMarks/markErrorLines ran inside highlight()'s
+    // window, so the inner TRUE must not un-mute the outer one) and immunity to a stray
+    // extra TRUE (it floors at 0 instead of going negative). It buys NOTHING
     // against an unbalanced FALSE — quite the reverse: an unbalanced FALSE parks this at 1
     // forever and EN_SELCHANGE is muted for the life of the window, where a bool would be
     // cleared by the very next TRUE. The host's four windows are all straight-line
     // FALSE…TRUE pairs with no early return between them, which is why that is acceptable;
     // it is a precondition on the caller, not a property of the counter. See the
     // WM_SETREDRAW case for what the flag is actually used for (it is not redraw
-    // suppression).
+    // suppression). SINCE SLICE 8 THE HOST SENDS NO WM_SETREDRAW AT ALL — every sender was
+    // in the deleted RichEdit colouring path — so this sits at 0 for the life of the window.
+    // Kept because it is part of the dialect this class answers (and d2d_dialect pins it),
+    // not because anything in the IDE still exercises it.
     int redrawOff = 0;
 
     // >0 while the host is re-entering this control from inside one of our own
@@ -344,6 +355,12 @@ struct EditorState {
     // drift apart; unset means "whatever the current Theme says".
     COLORREF bkColor = 0;
     bool haveBkColor = false;
+
+    // Device-failure reporting (slice 8). deviceFailSince is the tick of the FIRST paint in
+    // the current run of failures (0 = the device is fine); deviceFailReported stops the log
+    // line repeating four times a second. Both reset the moment a paint succeeds.
+    ULONGLONG deviceFailSince = 0;
+    bool deviceFailReported = false;
 };
 
 EditorState* state(HWND h) {
@@ -835,18 +852,18 @@ void setFontInternal(EditorState* st, const std::wstring& face, float pointSize)
 // EN_SELCHANGE (0x0702) is a richedit code carrying a SELCHANGE payload and has no
 // WM_COMMAND form (sent that way it falls out of MainWindow's WM_COMMAND handler
 // unmatched, silently, and the Ln/Col readout freezes forever). Matching the split exactly
-// means the host runs the SAME branch for both editors (:1931 and :1921), so any
-// behavioural difference between them is attributable to the control, never to the
-// dialect. Sending BOTH forms is wrong for a different reason: MainWindow handles each
-// (:1919 and :1931), so onEditChanged — and highlight() inside it — would run twice per
-// keystroke.
+// meant the host ran the SAME branch for both editors while there were two, so any
+// behavioural difference between them was attributable to the control and never to the
+// dialect. Sending BOTH forms is wrong for a different reason: MainWindow handles each of
+// them, so onEditChanged would run twice per keystroke.
 //
 // TRAP: MainWindow.cpp:1931 begins `if (lParam != 0 && ...)` to tell a control notification
 // from a menu command, so lParam MUST be the control's HWND. A WM_COMMAND with lParam == 0
 // is skipped in full, and that failure is indistinguishable from having no funnel at all.
 
 // Raised while a notification is in flight, released by scope so an early return in the
-// host cannot strand it (exactly the trap MainWindow's plain-bool g.highlighting has).
+// host cannot strand it — exactly the trap MainWindow's plain-bool g.highlighting had, and
+// one reason slice 8 was able to delete that flag outright rather than port it.
 struct NotifyScope {
     EditorState* st;
     explicit NotifyScope(EditorState* s) : st(s) { ++st->notifyDepth; }
@@ -869,8 +886,9 @@ void notifyParentCommand(EditorState* st, UINT code) {
 void notifyChanged(EditorState* st) {
     if (!(st->eventMask & ENM_CHANGE)) return;
     // Deliberately NOT gated on notifyDepth. The host does not edit the buffer from inside
-    // onEditChanged (highlight() only formats), so this cannot recurse — and an EN_CHANGE
-    // that can be suppressed by anything is an EN_CHANGE that can be lost.
+    // onEditChanged — it reads the text, the undo flags and the line geometry and nothing
+    // else — so this cannot recurse, and an EN_CHANGE that can be suppressed by anything is
+    // an EN_CHANGE that can be lost.
     notifyParentCommand(st, EN_CHANGE);
 }
 
@@ -901,7 +919,7 @@ void flushViewNotifications(EditorState* st) {
     if (sel == st->notifiedSel) return;
     // Gated on redraw, which is EXACT rather than heuristic: every programmatic selection
     // storm in the host sits inside a WM_SETREDRAW(FALSE) window (highlight
-    // MainWindow.cpp:569-579 — one EM_EXSETSEL per token, hundreds per keystroke;
+    // MainWindow's deleted highlight() — one EM_EXSETSEL per token, hundreds per keystroke;
     // clearErrorMarks :605-607; markErrorLines :633-646), and gotoLineCol (:1287), which
     // DOES want the status bar to move, is not. Not recording the value either is the
     // other half: the storm's net effect is a restore to the selection it started from, so
@@ -1116,6 +1134,37 @@ void syncSystemCaret(EditorState* st) {
     SetCaretPos(pt.x, pt.y);
 }
 
+// The editor with no Direct2D device has nothing to draw with, so this draws with GDI,
+// which needs none. Shown only after the failure has outlived kDeviceFailQuietMs — see the
+// call site. The wording's job is to say the text is not lost, because the visible evidence
+// says the opposite.
+void drawDeviceFailureNotice(EditorState* st, HDC hdc) {
+    RECT rc;
+    GetClientRect(st->hwnd, &rc);
+    const Theme& th = currentTheme();
+    if (HBRUSH bg = CreateSolidBrush(st->haveBkColor ? st->bkColor : th.windowBg)) {
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+    }
+    HFONT f = CreateFontW(-dpx(st, 14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+    HGDIOBJ oldFont = f ? SelectObject(hdc, f) : nullptr;
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, th.textPrimary);
+    RECT tr = rc;
+    InflateRect(&tr, -dpx(st, 24), -dpx(st, 24));
+    DrawTextW(hdc,
+              L"The editor could not start Direct2D, so it has nothing to draw with.\n\n"
+              L"It is retrying four times a second. Your text is still here and unchanged — "
+              L"this is a drawing failure, not a lost buffer — and the file on disk is "
+              L"exactly as you last saved it.\n\n"
+              L"If this does not clear, update the graphics driver or restart Sentinel-IDE.",
+              -1, &tr, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+    if (oldFont) SelectObject(hdc, oldFont);
+    if (f) DeleteObject(f);
+}
+
 void paint(EditorState* st) {
     PAINTSTRUCT ps;
     BeginPaint(st->hwnd, &ps);
@@ -1126,6 +1175,11 @@ void paint(EditorState* st) {
     // testing. (The reference has the same omission; a code editor lives far longer than a
     // query box.) Re-entering is safe -- ensureDeviceResources is idempotent.
     if (ensureDeviceResources(st)) {
+        if (st->deviceFailSince) {
+            if (st->deviceFailReported) logMsg(LogLevel::Info, L"Editor: the Direct2D device came back");
+            st->deviceFailSince = 0;
+            st->deviceFailReported = false;
+        }
         ensureLineIndex(st);
         clampScroll(st);
         updateScrollbars(st);
@@ -1186,6 +1240,24 @@ void paint(EditorState* st) {
     } else {
         // Retry on a timer, NOT with a bare InvalidateRect -- see kDeviceRetryTimer.
         SetTimer(st->hwnd, kDeviceRetryTimer, kDeviceRetryMs, nullptr);
+        // NOTHING WAS DRAWN, and Direct2D is the only thing that ever draws this control, so
+        // the client area keeps whatever was last on it -- at cold start, nothing. A brief
+        // loss recovers on the timer above and must not flash an error; one that outlives
+        // kDeviceFailQuietMs is not brief, and since slice 8 there is no RichEdit editor to
+        // fall back to, so an unexplained blank pane is the one outcome to refuse. Say so in
+        // GDI (which needs no device) and log it once per episode.
+        const ULONGLONG now = GetTickCount64();
+        if (!st->deviceFailSince) st->deviceFailSince = now;
+        if (now - st->deviceFailSince >= kDeviceFailQuietMs) {
+            if (!st->deviceFailReported) {
+                st->deviceFailReported = true;
+                logMsg(LogLevel::Error,
+                       L"Editor: no Direct2D device after " + std::to_wstring(kDeviceFailQuietMs) +
+                       L"ms - showing the fallback notice and retrying every " +
+                       std::to_wstring(kDeviceRetryMs) + L"ms");
+            }
+            drawDeviceFailureNotice(st, ps.hdc);
+        }
         // Trimming must NOT be conditional on having painted. While the device is
         // unobtainable every WM_PAINT bails out above, but caret movement and hit-testing
         // keep laying single lines out through layoutForLine -- so holding Down through a
@@ -1642,7 +1714,7 @@ bool applyDrop(EditorState* st, const std::wstring& text, size_t at, bool localS
         //   1. RichEdit selects the inserted run, so the next keystroke REPLACES it. Leaving
         //      the caret after it instead means that keystroke APPENDS — measured on the same
         //      gesture in both editors: Ctrl-copy-drop "a" onto "abcdef" then type Z gives
-        //      "abcdefZ" on RichEdit and "abcdefaZ" here. Slice 7 deletes the RichEdit path
+        //      "abcdefZ" on RichEdit and "abcdefaZ" here. Slice 8 deleted the RichEdit path
         //      on the grounds that the two are feature-identical, so divergences like this
         //      have to be closed, not inherited.
         //   2. It also makes the drop cheap to correct — the run can be dragged straight on
@@ -2550,7 +2622,7 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         // EM_CHARFROMPOS, EM_GETSEL/EM_SETSEL and EM_LINEFROMCHAR are deliberately absent —
         // implementing messages nobody sends is untested code pretending to be a contract.
         // EM_SETREADONLY / EM_REPLACESEL / EM_GETTEXTRANGE / ENM_LINK belong to g.hOut, the
-        // Output pane, which stays RichEdit through slice 7.
+        // Output pane, which stays RichEdit permanently.
 
         // ---- text retrieval: the two messages examples/crypto.sentinel's signature
         //      ultimately rides on ---------------------------------------------------
@@ -2585,7 +2657,7 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // each other (MainWindow.cpp:536-539), which is what lets this control's
             // internal line break be '\n' where RichEdit's is a lone '\r': each
             // representation only has to be self-consistent, and in both a break is ONE
-            // character, which is what keeps highlight()'s offsets aligned with the
+            // character, which is what keeps every host offset aligned with the
             // EM_EXSETSEL index space. GT_SELECTION/GT_RAWTEXT/GT_NOHIDDENTEXT are never
             // sent; ignore rather than fail (see the empty-file hazard above).
             const bool crlf = (gt->flags & GT_USECRLF) != 0;
@@ -2616,13 +2688,13 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             if (!cr) return 0;
             const LONG len = static_cast<LONG>(st->model.length());
             LONG a = cr->cpMin, b = cr->cpMax;
-            if (b < 0) b = len;  // cpMax == -1 means "to the end of the text" — that is how
-            if (a < 0) a = 0;    // applyColor(0,-1,..) (:569) and applyBackColor(0,-1,..)
-            if (a > len) a = len;  // (:606, :634) say "select all".
-            if (b > len) b = len;  // gotoLineCol (:1285-1286) computes lineStart + col - 1
-            if (a > b) {           // with NO upper bound, so a diagnostic whose column runs
-                const LONG t = a;  // past the line end lands here — clamp, never index out
-                a = b;             // of range, never assert.
+            if (b < 0) b = len;    // cpMax == -1 means "to the end of the text" — how the
+            if (a < 0) a = 0;      // deleted applyColor/applyBackColor said "select all";
+            if (a > len) a = len;  // no host caller says it any more, but the dialect does.
+            if (b > len) b = len;  // gotoLineCol computes lineStart + col - 1 with NO upper
+            if (a > b) {           // bound, so a diagnostic whose column runs past the line
+                const LONG t = a;  // end lands here — clamp, never index out of range,
+                a = b;             // never assert.
                 b = t;
             }
             st->model.setSelection(static_cast<size_t>(a), static_cast<size_t>(b));
@@ -2637,10 +2709,11 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             st->desiredX = -1;
             // Deliberately does NOT scroll: that is EM_SCROLLCARET's job, which is exactly
             // why gotoLineCol sends it immediately afterwards (MainWindow.cpp:1287-1288).
-            // Route this through ensureCaretVisible and highlight()'s per-token storm would
-            // drag the viewport across the whole document on every character typed. It also
-            // must not set linesDirty or drop the layout cache — selection is not text, and
-            // the host sends this back at us from inside our own notification.
+            // Routing it through ensureCaretVisible would have dragged the viewport across
+            // the whole document on every character typed back when highlight() moved the
+            // selection once per token; that storm is gone, the separation is still right.
+            // It also must not set linesDirty or drop the layout cache — selection is not
+            // text, and the host sends this back at us from inside our own notification.
             st->caretOn = true;
             InvalidateRect(hwnd, nullptr, FALSE);
             flushViewNotifications(st);
@@ -2770,24 +2843,23 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         case EM_SETCHARFORMAT: {
             if (wParam != SCF_ALL) {
-                // SCF_SELECTION is the ~500-calls-per-keystroke colouring path (applyColor
-                // :516) and the error tints (applyBackColor :529). SLICE 4 REPLACED BOTH —
-                // colouring is computeSpans() in drawContent and the tints are
-                // d2dEditorSetErrorLines — so this stays a no-op that reports success, and
-                // permanently: the host gates both of those paths off this control rather
-                // than sending them, because the storm's real cost is undo granularity, not
-                // pixels. Nobody checks the return.
+                // SCF_SELECTION was the ~500-calls-per-keystroke colouring path
+                // (MainWindow's applyColor) and the error tints (applyBackColor). Slice 4
+                // replaced both — colouring is computeSpans() in drawContent, the tints are
+                // d2dEditorSetErrorLines — and SLICE 8 DELETED THE CALLERS THEMSELVES. So
+                // this is a no-op that reports success, and permanently: the storm's real
+                // cost was undo granularity rather than pixels, and there is nothing left in
+                // the IDE to send it. Nobody checks the return.
                 //
                 // It must NOT raise EN_CHANGE, unlike RichEdit — a deliberate divergence.
                 // Formatting changes no text and g.dirty is a pure comparison over text, so
-                // nothing depends on those spurious notifications; whereas the host's
-                // g.highlighting guard is a plain bool that clearErrorMarks (:610) and
-                // markErrorLines (:650) clear UNCONDITIONALLY, so a notification raised from
-                // here could drop an outer guard mid-highlight.
+                // nothing can depend on those spurious notifications. (They also used to be
+                // able to drop the host's plain-bool g.highlighting guard mid-highlight;
+                // that flag went with slice 8, along with everything that set it.)
                 return TRUE;
             }
-            // SCF_ALL is NOT a no-op: styleEditor (MainWindow.cpp:160-171) is the ONLY
-            // channel by which the host tells the editor its typeface and size — g.hEdit
+            // SCF_ALL is NOT a no-op: styleEditor is the ONLY channel by which the host
+            // tells the editor its typeface and size — g.hEdit
             // never receives a WM_SETFONT anywhere in the program. Ignore it and
             // Settings -> editor font silently stops working. CHARFORMAT2W is a strict
             // superset of CHARFORMATW with the identical leading layout, so reading the
@@ -2820,15 +2892,15 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // would be better still, but the host never sends it.
             return TRUE;
         case EM_GETOLEINTERFACE:
-            // No OLE interface, deliberately: editorDoc() (MainWindow.cpp:150-156) then
-            // returns nullptr and phase 18's suspendUndo/resumeUndo become no-ops at all
-            // eight of their call sites with NO host edit, and WM_DESTROY's Release is
-            // skipped because g.textDoc was never set. That is CORRECT here, not merely
-            // tolerated: they exist only to keep programmatic EM_SETCHARFORMAT off
-            // RichEdit's undo stack, and EditorModel's stack snapshots text + selection
-            // only, so a format is structurally incapable of entering it. Written out (and
-            // the out-param nulled) rather than left to DefWindowProcW, so the contract does
-            // not rest on the caller having initialised its pointer.
+            // No OLE interface, deliberately. This is how the migration crossed phase 18's
+            // suspendUndo/resumeUndo with no host edit at all: editorDoc() got nullptr back
+            // and all eight call sites became no-ops. SLICE 8 then deleted those functions —
+            // they existed only to keep programmatic EM_SETCHARFORMAT off RichEdit's undo
+            // stack, and EditorModel's stack holds text + selection, so a format is
+            // structurally incapable of entering it — which leaves nothing in the IDE that
+            // sends this. Kept as part of the dialect, and written out (with the out-param
+            // nulled) rather than left to DefWindowProcW, so the contract does not rest on a
+            // future caller having initialised its pointer.
             if (lParam) *reinterpret_cast<void**>(lParam) = nullptr;
             return 0;
         case WM_SETREDRAW:
@@ -2839,10 +2911,10 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             // ever InvalidateRects, and no WM_PAINT can be dispatched inside the host's
             // straight-line redraw-off windows because nothing pumps in them.
             //
-            // So the flag earns its keep as something else entirely — it is the host's own
+            // So the flag earns its keep as something else entirely — it is the caller's
             // EXACT (not heuristic) marker for "programmatic bookkeeping, stay quiet", used
             // by flushViewNotifications to suppress EN_SELCHANGE. A depth COUNTER because
-            // the host's windows NEST (clearErrorMarks and markErrorLines run inside
+            // the host's windows NESTED (clearErrorMarks and markErrorLines ran inside
             // highlight()'s on the RichEdit path) and because an extra TRUE must not go
             // negative — NOT because it is safer against an unbalanced FALSE. It is
             // strictly worse there: an unbalanced FALSE leaves this at 1 forever and mutes

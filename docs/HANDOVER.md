@@ -21,7 +21,8 @@ exist so far:
 
 - The prototype **builds and runs**: `scripts\build.bat` → `build\Sentinel-IDE.exe`.
 - It's a real dark/coral Win32 IDE: themed shell with **dark popup/context menus**, dark
-  TreeView + RichEdit editor (syntax highlighting, line gutter, dirty `●`/Save, undo/redo),
+  TreeView + a **Direct2D code editor** (syntax highlighting, line gutter, dirty `●`/Save,
+  undo/redo) — RichEdit is still the **Output pane**, and only that, since phase 46's last slice,
   `snc` build/run with live streamed Output (**clickable `file:line:col`**) + a Problems
   triad, a configurable logfile + Settings dialog, a **Sentinel project model**
   (a `*.sntproject` file, or legacy `sentinel.toml`) with **multiple build targets**, an
@@ -724,9 +725,15 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     separately — `snc verify` against a one-byte-flipped `.sig` exits non-zero, which is what makes
     `verifyFile` return `Invalid`.
 
-46. **Direct2D editor — slices 1-7 landed; it is the DEFAULT, and the two editors are now
-    feature-identical.** (This heading has tracked the work slice by slice; the numbered
-    sub-sections below are in the order they landed, so slice 7 is the last of them.) The
+46. **Direct2D editor — COMPLETE. Slices 1-8 landed; there is now only one editor.** (This
+    heading has tracked the work slice by slice; the numbered sub-sections below are in the order
+    they landed, so the deletion is the last of them. **Read the slice NUMBERS below with care:
+    they collide.** The plan called the deletion "slice 7"; the session that shipped *text
+    drag-and-drop* got there first and stamped **7** on that instead — in the code
+    (`D2DEditor.cpp`'s drop target, `CMakeLists.txt`'s `d2d_dialect` note, `d2d_dialect_test`) and
+    in the sub-section headed "SLICE 7 LANDED — TEXT DRAG AND DROP" below. The repo's own numbering
+    wins, so **the deletion is slice 8** and the code says so; a few older paragraphs above still
+    say "slice 7 deletes…", written before that collision existed, and they mean slice 8.) The
     editor replacement is the largest remaining item and is genuinely multi-session, so it was
     designed before any code moved: three strategies proposed independently (parallel control,
     model-first, render-first), judged on regression risk / effort / how early something ships, then
@@ -1016,11 +1023,11 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     way slice 5's did. Screenshot the dialog after changing its text.)
     **What slice 6 deliberately does NOT do:** remove the choice. That is slice 7, and it should
     not run until this default has had real use. The two editors are not feature-identical yet.
-    **Still unverified, and it is the same item slice 5 left open:** the physical keystrokes.
-    Ctrl+Z / Ctrl+Y / Ctrl+S have only ever been exercised as the `WM_COMMAND` that
-    `TranslateAcceleratorW` produces — the code these slices changed, but not the keyboard. An
-    automated session cannot inject them. **This is now the DEFAULT editor, so that check is
-    worth a minute of a human's time before 0.1.9 ships.**
+    **VERIFIED BY HAND on 2026-09-04, on the released 0.1.9.185 build** (the per-machine install at `C:\Program Files\Sentinel-IDE`, reached by a real in-app update from 0.1.4.151 — five releases in 22 seconds, which also closed the "nobody has ever confirmed a client INSTALLS this" gap that had stood since v0.1.0). A human pressed the keys and moved the mouse:
+    - **Ctrl+Z**, **Ctrl+Y**, **Ctrl+S** — real keypresses, the hardware -> Windows -> `TranslateAcceleratorW` link that `d2d_dialect` case 13 explicitly cannot reach.
+    - **Dragging a text selection** — the drag threshold, `DoDragDrop`'s modal loop, `QueryContinueDrag`/`GiveFeedback` and the drop caret, none of which a harness can drive.
+    - **Dropping a FILE on the editor with a dirty buffer** — it opened AND raised the Save prompt, which is the regression the text drop target could most easily have caused.
+    - Ctrl+S on the signed `examples/crypto.sentinel` left it byte-identical at 426 bytes (`git status examples/` clean), independently re-checked.
     **Remaining slices:** 7 was *text drag-and-drop* (below), which is the stated precondition;
     what is left is deleting the RichEdit path (the *editor* path only — `msftedit.dll`,
     `MSFTEDIT_CLASS` for `g.hOut` and the `EN_LINK` → `parseDiag` → `gotoLineCol` chain all
@@ -1215,12 +1222,116 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     All of it on a **scratch copy** under `%TEMP%`; `git status --porcelain examples/` empty
     throughout.
 
-    **NOT covered, said plainly:** the physical mouse. The drag threshold, `DoDragDrop`'s loop as
-    the user drives it, `QueryContinueDrag`/`GiveFeedback`, the external-move delete, the drop
-    caret's PIXELS and the edge autoscroll during a drag all need a real mouse on a foreground
-    window. The harness above exercised the source path end-to-end for a local move, but a human
-    should still drag a selection around once — together with the Ctrl+Z / Ctrl+Y / Ctrl+S
-    KEYSTROKES that slices 5 and 6 also left unpressed.
+    **Was not covered by any harness; NOW COVERED BY HAND.** The drag threshold,
+    `DoDragDrop`'s loop as a user drives it, `QueryContinueDrag`/`GiveFeedback` and the drop
+    caret all need a real mouse on a foreground window, which an automated session cannot
+    arrange. A human dragged a selection on the released 0.1.9.185 build on 2026-09-04 and it
+    behaved. Still genuinely untested: the EDGE AUTOSCROLL during a drag (dragging past the
+    window edge), which nobody has exercised either way.
+
+    **THE RICHEDIT EDITOR IS DELETED — the last slice, and phase 46 is now closed.** What went:
+    `highlight()` and the three functions that existed only to feed it (`colorForSpan`,
+    `applyColor`, `applyBackColor`); the RichEdit halves of `clearErrorMarks` and
+    `markErrorLines`; `editorDoc()` / `suspendUndo()` / `resumeUndo()` and the `ITextDocument`
+    they cached, with `<richole.h>` and `<tom.h>`; `g.d2dEditor`, `g.highlighting` and
+    `g.textDoc`; `Settings::d2dEditor` and the `[editor] d2d` read; `wantD2DEditor()` and the
+    `--richedit` / `--d2d-editor` flags; and the Settings checkbox with its hint.
+    **Net −154 lines across `MainWindow.cpp`, `SettingsDialog.cpp` and `Settings.h`**
+    (−101 / −37 / −16, i.e. 2152→2051, 240→203, 110→94); −81 across all five source files, once
+    the D2D addition below is counted. `src/editor/SyntaxLexer.{h,cpp}` did not change by a
+    character — slice 4's whole point — and is now consumed only by the control's `drawContent`;
+    `MainWindow.cpp` no longer includes it.
+
+    **WHAT DID NOT GO, and misreading this breaks the app: `msftedit.dll`, `MSFTEDIT_CLASS` and
+    `styleEditor`.** RichEdit was doing two jobs and only one of them was the editor. The
+    **Output pane (`g.hOut`) is still a real `RICHEDIT50W`**, still needs the unconditional
+    `LoadLibraryW(L"Msftedit.dll")` at the top of `createControls`, and still carries the
+    `EN_LINK` → `parseDiag` → `gotoLineCol` chain that makes `file:line:col` in build output
+    clickable. `styleEditor` now serves both panes with no undo guard — on the Output pane it is
+    the dark theme, on the editor its `SCF_ALL` arm is the ONLY channel by which Settings ▸ editor
+    font reaches the control (`g.hEdit` is sent no `WM_SETFONT` anywhere in the program).
+
+    **THE DECISION THE SLICE FORCED: what happens when the editor cannot be built.** Until now
+    `createControls` fell back to RichEdit when `registerD2DEditorClass` failed. With the fallback
+    deleted the only alternative to failing is a window that opens with a dead editor, so the
+    answer is split by *which* failure, because the two have opposite characters:
+    * **Class or window creation fails → FATAL, loudly.** `createControls` returns `false`,
+      `WM_CREATE` returns `-1`, `CreateWindowExW` fails and `runApp` exits non-zero — after an
+      Error log line carrying `GetLastError` and a `MB_ICONERROR` box naming the failure. Nothing
+      is ever shown. An IDE whose editor does not exist has no degraded mode worth offering, and
+      the failure would otherwise be discovered by typing into a void. The box takes **no owner**
+      and `MB_TASKMODAL`: it runs inside the main window's `WM_CREATE`, so owning it to that
+      half-built, about-to-be-destroyed window would pump messages into a `WndProc` whose controls
+      do not all exist yet.
+      **MEASURED, by negative control** — `if (true || !registerD2DEditorClass(...))` forced into
+      `createControls`, rebuilt, launched detached: the log carried
+      `FATAL: the editor window class could not be registered (GetLastError=0)`, the message box
+      came up with exactly the intended text, `IsWindowVisible` on the main window was **False**
+      (it never appeared), and after clicking OK `GetExitCodeProcess` returned **1**. Reverted;
+      `grep` for the control is clean and the tree rebuilt `BUILD_OK`.
+    * **The D2D *device* fails → explain in place, keep retrying.** This one is lazy (first paint),
+      routinely transient (GPU reset, an RDP session change) and already self-heals on the
+      control's 250 ms retry timer, so killing the process would be wrong. But nothing else paints
+      this control, so a *persistent* failure was exactly the silent blank pane the brief forbids.
+      `D2DEditor.cpp::paint` now tracks how long the failure has run and, past
+      `kDeviceFailQuietMs` (1 s — long enough that a blink never flashes a notice), draws a **GDI**
+      explanation over the client area saying the text is not lost and the file on disk is intact,
+      and logs once per episode at Error. That, plus repairing the comments in that file which
+      named functions this slice deleted, is the **+72** net in `D2DEditor.cpp`.
+
+    **A stale `[editor] d2d=0` cannot strand anyone**, which is the migration hazard here: 0.1.8
+    and 0.1.9 both wrote that key, and this machine had one. Nothing reads it any more — that
+    alone is what makes it inert — and `saveSettings` additionally **deletes** it
+    (`WritePrivateProfileStringW(..., nullptr, ...)`) so the file stops carrying a setting the
+    program no longer has. Verified by planting `d2d=0` by hand and launching: the log said
+    `Editor: Direct2D control created`, `GetDlgItem(IDC_EDIT)` reported class `SentinelD2DEditor`,
+    it held 9 lines of the opened file, and typing armed `EM_CANUNDO`. The key was gone from
+    `settings.ini` afterwards.
+
+    **WHAT WAS KEPT ON PURPOSE, so the next session does not "finish the job" wrongly.** The
+    control still answers `WM_SETREDRAW`, `EM_EXGETSEL` and `EM_GETOLEINTERFACE` even though the
+    host now sends none of them (every sender was in the deleted colouring path). They are part of
+    the RichEdit dialect this window class advertises and `d2d_dialect` pins them; dropping
+    `EM_GETOLEINTERFACE` in particular would leave a future caller's out-param uninitialised.
+    `st->redrawOff` therefore sits at 0 for the life of the window — that is expected, not dead
+    code left by accident.
+
+    **Verified.** `BUILD_OK`, zero warnings, `ctest` **11/11** with the `EXCLUDE_FROM_ALL` targets
+    rebuilt first (they are not in `all`; run them stale and you test the old binary). Then, live,
+    driven through Win32 messages from a background session:
+    * **The Output pane still works, EN_LINK included.** A scratch project under `%TEMP%` whose
+      entry fails to compile; `notes.sentinel` open in the editor so the diagnostic named a
+      *different* file. Build → `broken.sentinel:4:18` in the Output pane. Then the pane was
+      **actually clicked** — `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` on a grid, so RichEdit
+      itself did the `CFE_LINK` hit-test — and on the click at client (52,98) focus moved from the
+      Output pane to the editor and the log printed
+      `Opened file: …\broken.sentinel`. That is the whole chain, end to end, not a simulated
+      notification. **The diagnostic line is scrolled out of view by default** (`outAppend` ends
+      with `WM_VSCROLL SB_BOTTOM`), so a naive click sweep finds nothing — scroll the pane up
+      first if you repeat this.
+    * **The unsaved-changes prompt still appears.** One `WM_CHAR` into the editor, then `WM_CLOSE`
+      → `SentinelSaveDlg` with "Save changes to “crypto.sentinel”?" and Save / Don't Save / Cancel.
+    * **`saveFile` still writes CRLF and round-trips byte-identically.** On a **scratch copy** of
+      `examples/crypto.sentinel` under `%TEMP%` (426 bytes, 12 CRLF, 0 bare LF): Ctrl+S with
+      nothing changed wrote nothing at all (`ID_SAVE` is gated on `g.dirty`, and no `Saved:` line
+      appeared); typing `X` and saving gave 427 bytes, **still 12 CRLF and 0 bare LF**; one
+      Backspace and a second save returned the file to the original **SHA-256**.
+      `git status --porcelain examples/` empty throughout.
+    * **The Settings dialog was screenshotted and read**, not just rebuilt — this exact defect
+      (a clipped or gapped row) shipped twice, in slices 5 and 6. Editor font → Theme → Log level
+      → Log file → BUILD TOOLCHAIN → snc → MSVC env → Cancel/OK, evenly spaced at 48 px, nothing
+      clipped, no gap where the checkbox was, and the dialog is correspondingly shorter (client
+      456×332). It closes on its own because every row is placed from a running `yy` and the
+      window is sized from it — `powershell -File scripts\capture.ps1 -Class SentinelSettingsDlg`
+      works from a background session, unlike a capture of the D2D editor.
+
+    **VERIFIED BY HAND on 2026-09-04, on the released 0.1.9.185 build** (the per-machine install at `C:\Program Files\Sentinel-IDE`, reached by a real in-app update from 0.1.4.151 — five releases in 22 seconds, which also closed the "nobody has ever confirmed a client INSTALLS this" gap that had stood since v0.1.0). A human pressed the keys and moved the mouse:
+    - **Ctrl+Z**, **Ctrl+Y**, **Ctrl+S** — real keypresses, the hardware -> Windows -> `TranslateAcceleratorW` link that `d2d_dialect` case 13 explicitly cannot reach.
+    - **Dragging a text selection** — the drag threshold, `DoDragDrop`'s modal loop, `QueryContinueDrag`/`GiveFeedback` and the drop caret, none of which a harness can drive.
+    - **Dropping a FILE on the editor with a dirty buffer** — it opened AND raised the Save prompt, which is the regression the text drop target could most easily have caused.
+    - Ctrl+S on the signed `examples/crypto.sentinel` left it byte-identical at 426 bytes (`git status examples/` clean), independently re-checked.
+
+    Phase 46 therefore has **no untested edges left**.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
@@ -1246,7 +1357,7 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.6` | 160 | `Sentinel-IDE-0.1.6.160-setup.exe` | Patch. Saved-point dirty tracking: undoing back to the loaded or last-saved text now clears the `●` and the unsaved-changes prompt, instead of latching on at the first keystroke. **First release verified by a real released client auto-updating to it** — a shipped 0.1.5 install went to 0.1.6.160 in under 10 s via ≡ ▸ Check for Updates…. |
 | `v0.1.7` | 164 | `Sentinel-IDE-0.1.7.164-setup.exe` | Patch. **Automatic update checking works** (phase 41) — WinSparkle's periodic check is disabled and our own timer polls the appcast and offers via a themed Skip/Install/Later dialog. Verified against the live feed both ways: a published 0.1.6 upgraded via the manual check, and a probe carrying this code raised the background offer unattended at 92 s and installed. **0.1.6 and earlier need one manual check to reach it.** |
 | `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap at the time of that release, stated in its release notes and **closed since, in slice 7**: dragging TEXT within the editor was not supported (dropping a FILE always opened it, and still does). |
-| `v0.1.9` | 185 | `Sentinel-IDE-0.1.9.185-setup.exe` | Minor. **The Direct2D editor becomes the DEFAULT** (phase 46 slice 6), and **text drag-and-drop** closes the last regression against RichEdit — the two editors are feature-equivalent for the first time, which is the stated precondition for slice 7. Escape hatches intact: `--richedit`, the Settings checkbox, and a `d2d=0` written by 0.1.8 all outrank the new default. Dropping a FILE on the editor still opens it guarded — the new `IDropTarget` classifies `CF_HDROP` first and forwards it to the host's existing `WM_DROPFILES` handler, because registering a text drop target would otherwise have swallowed file drops silently. |
+| `v0.1.9` | 185 | `Sentinel-IDE-0.1.9.185-setup.exe` | Minor. **The Direct2D editor becomes the DEFAULT** (phase 46 slice 6), and **text drag-and-drop** closes the last regression against RichEdit — the two editors are feature-equivalent for the first time, which is the stated precondition for slice 7. Escape hatches intact: `--richedit`, the Settings checkbox, and a `d2d=0` written by 0.1.8 all outrank the new default. **All three are gone at HEAD** — phase 46's last slice deleted the RichEdit editor — so this row is the last release in which unticking was possible. Dropping a FILE on the editor still opens it guarded — the new `IDropTarget` classifies `CF_HDROP` first and forwards it to the host's existing `WM_DROPFILES` handler, because registering a text drop target would otherwise have swallowed file drops silently. |
 
 **0.1.9 IS PUBLISHED (2026-09-04).** Tag `v0.1.9` points at **7f88a27**, the clean tree the binary
 was built from (`rev-list --count` 85 + `BUILDBASE` 100 = build **185**). Checks run, in the order
@@ -1465,11 +1576,13 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Targets follow-ons (remaining):** per-target `lib_paths`; a definable output dir; add/remove
   `[[target]]` blocks from the form (today it edits existing blocks' name/entry/type in place).
 - **Undo/redo follow-up:** track the saved point so undo-to-clean clears `●`; toolbar button hover states.
-- **The Direct2D editor** — **slices 1-6 done: it is now the DEFAULT** (`--richedit` and the
-  Settings checkbox both still opt out). **0.1.8 published** carrying it as an opt-in; the flip
-  itself is unreleased. **Slice 7 (delete the RichEdit path) remains — do not run it until the
-  new default has had real use**, see phase 46; dark **title-bar menu bar**; a
-  project-templates picker (lib/exe/multi-target) for New Project.
+- **The Direct2D editor is DONE** — phase 46 is closed and the RichEdit *editor* is deleted, so
+  there is one editor and no setting to choose another. **Unreleased**: 0.1.9 shipped the flip
+  with all three escape hatches intact, and HEAD has none of them, so the next release note has to
+  say that unticking is no longer possible. The human checks that were owed are **DONE** — keys,
+  mouse drag and a guarded file drop, all on the released 0.1.9.185 build (2026-09-04).
+  Then: dark **title-bar menu bar**; a project-templates picker
+  (lib/exe/multi-target) for New Project.
 - **Reconcile the spines/PRD** to ADR-0061 signing + the project/tier model (un-park PRD work).
 
 ---

@@ -7,16 +7,17 @@
 // lazily and only for lines that are actually on screen.
 //
 // SCOPE. Slice 2 built the renderer + input surface; SLICE 3 added the RichEdit message
-// dialect (the ~20 EM_* messages MainWindow.cpp actually sends) and the synchronous
-// EN_CHANGE / EN_SELCHANGE / EN_VSCROLL / EN_HSCROLL funnel, and linked the control into
-// the Sentinel-IDE exe behind ONE CreateWindowExW in createControls, DEFAULT OFF
-// ([editor] d2d in settings.ini, or --d2d-editor / --richedit for one run).
-// SLICE 4 added syntax colouring and the error-line tints, both PAINTED: the rules come
-// from src/editor/SyntaxLexer.h (the same unit the RichEdit path uses, so the two editors
-// cannot disagree about a file), and drawContent draws each coloured run by clipping the
-// ONE per-line layout — never IDWriteTextLayout::SetDrawingEffect, which would make the
-// shared, device-loss-surviving layout cache device-bound. EM_SETCHARFORMAT with
-// SCF_SELECTION stays a permanent no-op: the host does not send it to this control,
+// dialect (the ~20 EM_* messages MainWindow.cpp sends) and the synchronous EN_CHANGE /
+// EN_SELCHANGE / EN_VSCROLL / EN_HSCROLL funnel, and linked the control into the
+// Sentinel-IDE exe. SLICE 4 added syntax colouring and the error-line tints, both PAINTED:
+// the rules come from src/editor/SyntaxLexer.h and drawContent draws each coloured run by
+// clipping the ONE per-line layout — never IDWriteTextLayout::SetDrawingEffect, which would
+// make the shared, device-loss-surviving layout cache device-bound. SLICE 5 gave it a real
+// system caret, slice 6 made it the default, slice 7 closed the last feature gap (text
+// drag-and-drop), and SLICE 8 DELETED THE RICHEDIT EDITOR: this
+// is now the only editor there is, there is no setting to choose another, and
+// createControls treats a failure to build it as fatal rather than falling back.
+// EM_SETCHARFORMAT with SCF_SELECTION stays a permanent no-op — the host never sends it,
 // because its cost is undo granularity rather than pixels.
 // tests/d2d_editor_demo.cpp remains a standalone host for driving it without the IDE.
 //

@@ -22,26 +22,6 @@ struct Settings {
     std::wstring sncPath;                         // optional snc.exe override (else auto-detected)
     std::wstring vcvarsPath;                      // optional vcvars64.bat override (MSVC linker env; else auto-detected)
     bool         lineNumbers = false;             // show the editor line-number gutter
-    // Opt-in: use the Direct2D editor control instead of RichEdit (phase 46 slice 3).
-    // STILL DEFAULT OFF — RichEdit is what every user gets unless they ask otherwise.
-    // Surfaced in the Settings dialog since slice 5 (it was held back until slice 4 gave the
-    // control syntax colouring, because a checkbox that offers a visibly worse editor is
-    // worse than no checkbox). READ EXACTLY ONCE, by wantD2DEditor() at WM_CREATE, so a
-    // change here needs a restart — which is what the dialog's hint line says.
-    // SLICE 6: FLIPPED. The Direct2D control is now the default and RichEdit is the
-    // fallback. What makes that defensible is that it is still a DEFAULT, not a removal:
-    // `--richedit` overrides it at any time, unticking the box overrides it permanently, and
-    // createControls falls back on its own if the window class fails to register. Slice 7 is
-    // what removes the choice, and it should not run until this default has had real use.
-    //
-    // SLICE 7 CLOSED THE LAST GAP: the Direct2D control now supports dragging TEXT within a
-    // file (move, Ctrl-drag to copy, CF_UNICODETEXT from other applications), so the two
-    // editors are feature-identical and the escape hatch is now only about taste and risk.
-    // Dropping a FILE still opens it on BOTH — measured on both paths after the change, not
-    // assumed: on RichEdit the drop falls through to MainWindow's guarded WM_DROPFILES, and
-    // on the Direct2D control the drop target forwards CF_HDROP to that same handler,
-    // because registering a target for text takes file drops away from the parent.
-    bool         d2dEditor   = true;
     std::wstring updateSkipVersion;               // appcast version the user chose to skip (never re-offer it)
     std::vector<std::wstring> recents;            // recently-opened project folders (most-recent first)
 };
@@ -81,7 +61,6 @@ inline void loadSettings(Settings& s) {
     GetPrivateProfileStringW(L"build", L"snc", L"", buf, 1024, path.c_str()); s.sncPath = buf;
     GetPrivateProfileStringW(L"build", L"vcvars", L"", buf, 1024, path.c_str()); s.vcvarsPath = buf;
     s.lineNumbers = GetPrivateProfileIntW(L"editor", L"line_numbers", s.lineNumbers ? 1 : 0, path.c_str()) != 0;
-    s.d2dEditor   = GetPrivateProfileIntW(L"editor", L"d2d", s.d2dEditor ? 1 : 0, path.c_str()) != 0;
     GetPrivateProfileStringW(L"update", L"skip_version", L"", buf, 1024, path.c_str()); s.updateSkipVersion = buf;
     s.recents.clear();
     int rc = GetPrivateProfileIntW(L"recents", L"count", 0, path.c_str());
@@ -99,7 +78,12 @@ inline void saveSettings(const Settings& s) {
     WritePrivateProfileStringW(L"build", L"snc", s.sncPath.c_str(), path.c_str());
     WritePrivateProfileStringW(L"build", L"vcvars", s.vcvarsPath.c_str(), path.c_str());
     WritePrivateProfileStringW(L"editor", L"line_numbers", s.lineNumbers ? L"1" : L"0", path.c_str());
-    WritePrivateProfileStringW(L"editor", L"d2d", s.d2dEditor ? L"1" : L"0", path.c_str());
+    // [editor] d2d chose between the Direct2D editor and RichEdit; phase 46 slice 8 deleted
+    // the RichEdit editor, so the key means nothing. Nothing READS it any more — that alone
+    // is what makes a stale `d2d=0` from 0.1.8/0.1.9 harmless rather than an editor-less
+    // window — and passing nullptr as the value DELETES it, so the file stops carrying a
+    // setting the program no longer has. Safe to drop this line once 0.1.10 is old news.
+    WritePrivateProfileStringW(L"editor", L"d2d", nullptr, path.c_str());
     WritePrivateProfileStringW(L"update", L"skip_version", s.updateSkipVersion.c_str(), path.c_str());
     WritePrivateProfileStringW(L"recents", nullptr, nullptr, path.c_str());   // clear stale itemN first
     WritePrivateProfileStringW(L"recents", L"count", std::to_wstring((int)s.recents.size()).c_str(), path.c_str());
