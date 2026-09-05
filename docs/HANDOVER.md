@@ -1,6 +1,6 @@
 # Sentinel-IDE — Handover
 
-_Last updated: 2026-08-30._
+_Last updated: 2026-09-05._
 
 > **Naming:** the product/exe is **`Sentinel-IDE`** (matching `Sentinel-lang` / `Sentinel-learning`);
 > the build output is `build\Sentinel-IDE.exe`. **Internal identifiers stay `SentinelIDE`** by design —
@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–49 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–51 built and verified.
 
 ---
 
@@ -32,6 +32,10 @@ exist so far:
   **New / Open / Close Project + Recent Projects + New File**, a **structured Project Settings
   editor with per-target editing**, and a **Signing & Trust panel** driving *real* ADR-0061
   `snc keygen`/`sign`/`verify` with a live status-bar trust chip.
+- Since phase 51 the editor also notices when a file changes **underneath** it: coming back to the
+  window re-checks the open file, reloads it silently when nothing is unsaved, and raises a
+  **Reload / Keep my edits** prompt when something is. An identical rewrite under a newer timestamp
+  (what a `git checkout` looks like) raises nothing.
 - Unsaved edits are **never discarded silently**: closing a file, the project, the window, or an
   update install all route through one **Save / Don't Save / Cancel** prompt (phase 39).
 - Also: **sealed projects** (password-encrypted, `core/Seal.h`), **file associations**
@@ -43,7 +47,7 @@ exist so far:
   `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
   fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
   disables auto-update for every installed client.
-- **Released.** Latest is **v0.1.12 (build 196)**; twelve releases so far. Every file reader/parser in
+- **Released.** Latest is **v0.1.15 (build 213)**; sixteen releases so far. Every file reader/parser in
   the IDE runs in Sentinel — including, since phase 47, the **update appcast**, which is the only one
   of them fed off the network. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`), but read
   phases 40–41 before trusting it: v0.1.0–v0.1.4 offered updates that **could never install**, and
@@ -72,11 +76,14 @@ exist so far:
 | `src/host/win32/PasswordDialog.{h,cpp}` | Themed modal password prompt (one field, or two with a match check for sealing) |
 | `src/host/win32/UpdateDialog.{h,cpp}` | Themed modal **update offer** (class `SentinelUpdateDlg`, Skip/Install/Later) raised by the updater's own appcast poll — WinSparkle's equivalent prompt leads to the install path that does nothing (phase 41). |
 | `src/host/win32/SaveChangesDialog.{h,cpp}` | Themed modal **Save / Don't Save / Cancel** prompt for unsaved edits (class `SentinelSaveDlg`). Driven by `MainWindow.cpp::confirmSaveIfDirty` — the single choke point every discarding path goes through (phase 39). |
+| `src/host/win32/ReloadDialog.{h,cpp}` | Themed modal **Reload / Keep my edits** prompt for a file that changed on disk under unsaved edits (class `SentinelReloadDlg`). Raised only from `MainWindow.cpp::checkExternalChange`, and only when the buffer is dirty — a clean one reloads silently (phase 51). **Keep is the default**, including for a stray Enter: Reload is the answer that destroys work. |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
 | `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38, 44, 47, 48). `parsers.sentinel` = **eight** `export "C"` entry points — seven readers (diagnostic, trust manifest, `.sig` carrier, project manifest, **update appcast**, **sealed-container header**, **sealed archive index**) and the manifest writer — built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject` / `saveProject` / `Updater.cpp::readAppcast` / `Seal.h::readSealHeader` / `Seal.h::readSealArchive`. Every file reader in the IDE, the one NETWORK reader, and the one fully attacker-chosen BINARY container. The seal CRYPTO is deliberately NOT here (R1, secure-zero). About box shows the % in Sentinel. |
 | `tests/*_xcheck.cpp` | Prove each Sentinel parser stays byte-identical to its C++ oracle: `diag` (11), `trust` (12), `sig` (12), `manifest` (14). **`appcast` (25) is the exception** — its oracle had two real defects (an unbounded `int` accumulate, no validation at all), so it asserts the NEW behaviour where the old C++ was wrong and declares each divergence; a parity test there would have pinned the bugs. Plus `seal_test`. `ctest --test-dir build`. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
+| `src/core/FileStamp.h` | **External-change detection** — has the open file changed underneath the editor? A stat pair (mtime+size) as the cheap filter, an FNV-1a digest of the disk bytes as the answer, so an identical rewrite under a new timestamp raises nothing. Portable question, Win32 syscalls; a non-Windows host reimplements `stampFile` and keeps `changedFrom` (phase 51). |
+| `tests/file_stamp_test.cpp` | Tests `FileStamp.h` against real files (48 assertions), including the 64 KiB chunk boundary and a file held open exclusively. `ctest -R file_stamp`. |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
 | `src/core/Signing.h` | Trust manifest (`[[keys]]`) + `.sig` parsers, `verifyFile`, and `sncSigningCaps` — which reports **verify** and **keygen/sign** as separate capabilities (they fail independently; see phase 30) |
 | `src/core/Toolchain.h` | `findVcvars` (auto-detect MSVC env) + `captureMsvcEnv` (vcvars → env block for builds) |
@@ -207,7 +214,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–48 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–51 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -1614,6 +1621,88 @@ sessions but no image was committed — treat their screenshots as absent, not l
     unrelated repainted the status bar, and an indicator that is only right after an unrelated
     repaint is not an indicator.
 
+51. **THE FILE CHANGED UNDERNEATH THE EDITOR AND NOBODY SAID SO.** The last gap in the
+    unsaved-changes family, open since phase 39 shipped the guard. Nothing in the IDE ever asked
+    whether the open file was still the file it had loaded, so a `git checkout`, a formatter, or a
+    second editor could rewrite it and the next Ctrl+S would put the stale buffer straight over the
+    top — silently, which is the shape of all three defects v0.1.0–v0.1.4 shipped. Four files:
+    `src/core/FileStamp.h` (the detector), `src/host/win32/ReloadDialog.{h,cpp}` (the prompt), plus
+    the stamp points and the `WM_ACTIVATEAPP` trigger in `MainWindow.cpp`.
+
+    **THE STAMP CARRIES A DIGEST, NOT JUST (mtime, size), AND THAT IS THE DESIGN.** A stat pair
+    answers "was this file written", not "is its content different", and in a source tree the two
+    diverge constantly: `git checkout` of the branch you are already on, a formatter that rewrites
+    identical bytes, a backup tool touching timestamps. Every one of those raises a prompt about a
+    file nobody changed — and a prompt that is usually wrong is one users learn to dismiss unread,
+    which would destroy the one case that is a real either/or. So the stat pair is the CHEAP FILTER
+    (two syscalls, no open handle, and the answer on the overwhelmingly common path) and an FNV-1a
+    digest is the ANSWER, computed only when the timestamp or length has already moved. **FNV-1a is
+    not a security claim** and the header says so out loud, because this repo ships signature
+    verification and someone will ask: a collision means one edit goes unnoticed, i.e. exactly
+    today's behaviour with no detection at all, so it fails no worse than the status quo.
+
+    **THE DIGEST IS OVER DISK BYTES ON BOTH SIDES, and that is not an implementation detail.**
+    `editorText()` returns the buffer with lone `\r` while the file holds CRLF — `MainWindow.cpp`'s
+    own comment says the two "are never compared against each other" — so the obvious comparison
+    (buffer vs file) would report *every* file as changed, on the first activation, forever.
+    Stamping both sides off disk sidesteps it: nothing in `FileStamp.h` knows how the editor spells
+    a newline. This was nearly written the wrong way round; the existing comment is what caught it.
+
+    **A CLEAN BUFFER RELOADS WITHOUT ASKING; ONLY A DIRTY ONE PROMPTS.** The asymmetry is
+    deliberate. With nothing unsaved the buffer holds exactly what the file held, so a reload
+    cannot lose anything a user typed — the only thing at stake is the view, and
+    `reloadCurrentFile` puts the caret back on its line (and its column, but only while that column
+    still lands on the same line — a shortened line would otherwise carry the caret into the next
+    one, which reads as the reload having moved it). Prompting there would be a question with one
+    sane answer asked over and over.
+
+    **KEEP IS THE DEFAULT, AND ENTER OBEYS FOCUS — v0.1.12's defect, transplanted rather than
+    rediscovered.** Reload throws away typing that exists nowhere else and that no undo can recover
+    (a reload resets the undo buffer); Keep only risks a later, separately-initiated save. So
+    `DM_GETDEFID` answers `IDCANCEL` (Keep) — without it `IsDialogMessageW`'s `VK_RETURN` fallback
+    sends `IDOK`, and an unattended Enter would discard someone's work — *and* the loop clicks the
+    focused button itself, or a keyboard user who Tabbed to Reload and pressed Enter would get
+    Keep. Both halves, because v0.1.11 shipped the first and v0.1.12 had to ship the second.
+
+    **Deletion is reported, not prompted about**, and `g.dirty` is deliberately NOT forced to make
+    the buffer un-closable: it is a pure function of `(editorText(), savedText)` that
+    `onEditChanged` REASSIGNS on the next keystroke, so a forced flag would survive only until the
+    user typed — an indicator that stops being true when touched. Save recreates the file, which
+    loses nothing. **An unreadable file (locked mid-write) stores no stamp at all**: recording a
+    file caught half-written as its own final state would make the real change invisible forever.
+
+    **Verified, and every claim below was run.** `BUILD_OK`, zero warnings, **ctest 15/15** with
+    every `EXCLUDE_FROM_ALL` target rebuilt first. New: `file_stamp_test` (**48 assertions**,
+    `ctest -R file_stamp`) — real files on disk, no window. Its load-bearing cases are 3 (a
+    same-length edit under an IDENTICAL pinned mtime is still Modified), 4 (a rewrite with identical
+    bytes under a NEWER mtime is None — the false positive the digest exists to kill), 6 (a file
+    held open exclusively classifies Unreadable, not None) and 7 (the digest is stable across the
+    64 KiB chunk boundary, and a bit flipped at offset 70,000 is still caught).
+    **The tests were checked for teeth, not assumed to have them.** Replacing `changedFrom`'s
+    digest comparison with the naive `(mtime, size)` design failed exactly cases 3 and 4; resetting
+    the FNV seed per chunk failed case 7 — *including* its "still reported Modified" assertion,
+    because a per-chunk reset makes a change outside the final chunk vanish silently. Both reverted
+    and re-run green.
+    Then, **live against the shipping `Sentinel-IDE.exe`**, driven cross-process from a background
+    session (the phase 49 precedent; a scratch file under `%TEMP%`, `git status --porcelain
+    examples/` empty throughout) — **25/25, twice**: a clean buffer reloaded with no prompt and an
+    edit+save then wrote the EXTERNAL text back (a stale buffer would have written the original over
+    it); a dirty buffer raised a real `SentinelReloadDlg`, modal, with both answers found by the
+    caption a user reads rather than by control id; Keep kept the edit, saved it over the newer
+    file, and **did not ask again on the next activation**; Reload discarded both the kept and the
+    live edit and took the file; an identical rewrite under a new mtime raised nothing *with the
+    buffer dirty*; and a deleted file raised no prompt, stayed deleted, and came back on Save with
+    the live edits intact. Disabling the one `WM_ACTIVATEAPP` line failed 9 of those 25, so the
+    driver fails when the mechanism is gone.
+
+    **NOT COVERED, said plainly.** The dialog's PIXELS — the band, the button treatment, the dark
+    ground — are asserted nowhere; `capture.ps1` needs a foreground window an automated session
+    cannot arrange. Nor is a real mouse click (`BM_CLICK` sends the `WM_COMMAND` a click would, but
+    not the hit-test or the pressed state), the Tab cycle, or a real alt-tab producing
+    `WM_ACTIVATEAPP` from hardware rather than a posted message. **A human should alt-tab away,
+    change the open file in another editor, and alt-tab back once** — the same short list phases 46
+    and 49 closed by hand.
+
 ## Releases
 
 Public releases on GitHub (`arcanii/Sentinel-IDE/releases`), each an EdDSA-signed Inno installer that
@@ -1793,8 +1882,10 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Unsaved-changes follow-ons** (guard shipped phase 39): ~~undo-to-original still leaves `●` set~~
   **fixed** — `g.dirty` is now a comparison against `g.savedText` (a snapshot taken at load and at
   save) rather than a one-way latch, so undoing back to the loaded *or* saved text clears the dot and
-  the prompt. Still open: there is no "reload from disk" prompt when a file changes underneath the
-  editor.
+  the prompt. ~~Still open: there is no "reload from disk" prompt when a file changes underneath the
+  editor.~~ **Done, phase 51.** Nothing is open in this family now. The follow-on that phase names
+  for itself: a change arriving while Sentinel-IDE is *already* the foreground window is not noticed
+  until focus leaves and returns, because the trigger is `WM_ACTIVATEAPP`.
 - **Installer follow-ons** (installer shipped phase 28; ~~build-number pickup~~ + ~~real `AppUrl`~~
   done phase 33; ~~non-reproducible build number~~ done phase 34 — now `git rev-list --count HEAD`
   + `BUILDBASE`, so a released `Sentinel-IDE-0.1.0.<n>-setup.exe` can be rebuilt from its tag).

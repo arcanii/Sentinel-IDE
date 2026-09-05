@@ -29,6 +29,11 @@ add_executable(SentinelIDE WIN32
   src/host/win32/AboutDialog.cpp
   src/host/win32/PasswordDialog.cpp
   src/host/win32/SaveChangesDialog.cpp
+  # The changed-on-disk prompt. Separate from SaveChangesDialog because the answers differ
+  # (two, not three) and so does which one is safe: there Save is both affirmative and
+  # harmless, here the affirmative-looking button discards typing, so the default is the
+  # other one. See src/core/FileStamp.h for how the change is detected.
+  src/host/win32/ReloadDialog.cpp
   src/host/win32/UpdateDialog.cpp
   src/host/win32/Updater.cpp
   # Joined the exe in phase 46 slice 3, behind the single CreateWindowExW in
@@ -151,6 +156,18 @@ target_include_directories(seal_test PRIVATE src/core)
 target_link_libraries(seal_test PRIVATE bcrypt cabinet shell32 advapi32)
 set_target_properties(seal_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME seal_format COMMAND seal_test)
+
+# file_stamp_test — src/core/FileStamp.h, the external-change detector behind the
+# changed-on-disk prompt. It touches real files, but no window and no editor, so the
+# question "did anyone else write this file" is provable without driving a UI.
+# The case that carries the design is 4: a rewrite with IDENTICAL bytes under a newer
+# timestamp must NOT be reported, because that is what a git checkout looks like and a
+# prompt that is usually wrong is one users stop reading.
+#     cmake --build build --target file_stamp_test  &&  build\file_stamp_test.exe
+add_executable(file_stamp_test tests/file_stamp_test.cpp)
+target_include_directories(file_stamp_test PRIVATE src)
+set_target_properties(file_stamp_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME file_stamp COMMAND file_stamp_test)
 
 # Characterization tests for Project.h::saveProject -- the comment-preserving manifest
 # WRITER, the last file-touching path still in C++. It had no coverage at all while being

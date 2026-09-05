@@ -18,12 +18,14 @@
 #include "core/Toolchain.h"
 #include "core/Seal.h"
 #include "core/FileAssoc.h"
+#include "core/FileStamp.h"
 #include "host/win32/SettingsDialog.h"
 #include "host/win32/ProjectSettingsDialog.h"
 #include "host/win32/SigningDialog.h"
 #include "host/win32/AboutDialog.h"
 #include "host/win32/PasswordDialog.h"
 #include "host/win32/SaveChangesDialog.h"
+#include "host/win32/ReloadDialog.h"
 #include "host/win32/UpdateDialog.h"
 #include "host/win32/SingleInstance.h"
 #include "host/win32/Updater.h"
@@ -64,8 +66,10 @@ constexpr UINT WM_APP_DONE = WM_APP + 2;   // wParam = exit code
 constexpr UINT_PTR kUpdateOfferTimer  = 1;   // retry the update offer once no modal is up
 constexpr UINT_PTR kOpenPathTimer     = 2;   // retry an externally-delivered open once no modal is up
 constexpr UINT_PTR kUpdateResultTimer = 3;   // retry a manual check's "up to date" / "failed" report
+constexpr UINT_PTR kExtChangeTimer    = 4;   // retry the changed-on-disk check once no modal is up
 constexpr UINT WM_APP_OPEN_PATH = WM_APP + 4;   // lParam = heap wchar_t* (UI frees): open this path
 constexpr UINT WM_APP_SIGN = WM_APP + 3;   // wParam = SignState, lParam = heap "file\tkey\tgrants" (UI frees)
+constexpr UINT WM_APP_EXT_CHANGE = WM_APP + 5;  // no params: re-check whether the open file changed on disk
 
 enum CtrlId : int { IDC_TREE = 2001, IDC_EDIT = 2002, IDC_OUT = 2003, IDC_PROBLEMS = 2004 };
 enum TreeImg : int { IMG_PROJECT = 0, IMG_FOLDER, IMG_FILE, IMG_TOML };
@@ -114,6 +118,11 @@ struct AppState {
                                   // poll must not raise it a second time (a manual check still may)
     std::wstring pendingOpenPath; // path handed in from outside (IPC / drag-drop), held until the UI is free
     std::wstring savedText;   // editor text as of the last load/save — the saved point undo can return to
+    FileStamp fileStamp;      // the OPEN FILE as it was on disk at that same moment (core/FileStamp.h).
+                              // Held beside savedText and always set with it: savedText answers "has the
+                              // user changed this", fileStamp answers "has anyone ELSE changed it", and
+                              // the two questions are independent. Not comparable to savedText — that is
+                              // editor text with lone '\r', this is a digest of the CRLF bytes on disk.
     std::wstring statusLeft = L"Ln 1, Col 1", statusMsg = L"Open a folder to start", pendingMsg;
     std::vector<std::wstring> nodePaths;
     std::vector<Diag> problems;
@@ -710,6 +719,10 @@ void loadFileIntoEditor(HWND hwnd, const std::wstring& path) {
     g.loadingFile = false;
     g.fileOpen = true; g.curFilePath = path; g.curFileName = baseName(path);
     g.savedText = editorText();   // the point undo can return to
+    // …and the file as it was on disk at that same instant. Stamped from a FRESH read rather
+    // than from `bytes` above, so the stamp is what stampFile would compute on the next check
+    // — one function produces both sides of every comparison and they cannot drift apart.
+    g.fileStamp = stampFile(path);
     g.dirty = false; g.errorMarks = false;
     g.tbCanUndo = false; g.tbCanRedo = false;   // SetWindowText cleared the undo buffer
     g.statusMsg = path;
@@ -793,6 +806,8 @@ bool saveFile(HWND hwnd) {
     }
     if (!writeUtf8(g.curFilePath, s)) { g.statusMsg = L"Could not save " + g.curFileName; InvalidateRect(hwnd, &g.rStatus, FALSE); return false; }
     g.savedText = editorText();   // the saved point moves to what we just wrote
+    g.fileStamp = stampFile(g.curFilePath);   // …and so does the on-disk stamp, or the very next
+                                              // activation would report OUR OWN write as an external one
     g.dirty = false;
     logMsg(LogLevel::Info, L"Saved: " + g.curFilePath);
     g.statusMsg = L"Saved " + g.curFileName;
@@ -800,6 +815,128 @@ bool saveFile(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
     return true;
 }
+
+// Reload the open file from disk, putting the caret back on the line it was on. The
+// caller has already established that discarding the buffer is what the user wants —
+// this is loadFileIntoEditor with the position preserved, not a guarded open.
+void reloadCurrentFile(HWND hwnd) {
+    CHARRANGE cr{ 0, 0 };
+    SendMessageW(g.hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    const LONG line = (LONG)SendMessageW(g.hEdit, EM_EXLINEFROMCHAR, 0, (LPARAM)cr.cpMin);
+    const LONG lineStart = (LONG)SendMessageW(g.hEdit, EM_LINEINDEX, line, 0);
+    const LONG col = (lineStart >= 0 && cr.cpMin >= lineStart) ? cr.cpMin - lineStart : 0;
+
+    const std::wstring path = g.curFilePath;
+    loadFileIntoEditor(hwnd, path);
+
+    // Clamp to the reloaded document: the whole point is that it is a DIFFERENT file now, so
+    // the old line may be past the end. EM_LINEINDEX answers -1 for an out-of-range line, and
+    // a -1 fed to EM_EXSETSEL would select from the end of the buffer backwards.
+    const LONG lines = (LONG)SendMessageW(g.hEdit, EM_GETLINECOUNT, 0, 0);   // always >= 1
+    LONG want = line < 0 ? 0 : (line >= lines ? lines - 1 : line);
+    if (want < 0) want = 0;                       // a negative would mean "the caret's line"
+    LONG ci = (LONG)SendMessageW(g.hEdit, EM_LINEINDEX, want, 0);
+    if (ci < 0) ci = 0;
+
+    // Keep the column too, but only while it still lands on the SAME line: a line that got
+    // shorter would otherwise carry the caret into the next one, which reads as the reload
+    // having moved it. The end of `want` is the next line's start less its break, or the end
+    // of the buffer when `want` is the last line.
+    if (col > 0) {
+        const LONG nextStart = (LONG)SendMessageW(g.hEdit, EM_LINEINDEX, want + 1, 0);
+        LONG lineEnd;
+        if (nextStart > ci) {
+            lineEnd = nextStart - 1;
+        } else {
+            GETTEXTLENGTHEX gtl{ GTL_NUMCHARS, 1200 };
+            lineEnd = (LONG)SendMessageW(g.hEdit, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
+        }
+        if (lineEnd < ci) lineEnd = ci;
+        ci = (ci + col > lineEnd) ? lineEnd : ci + col;
+    }
+    CHARRANGE put{ ci, ci };
+    SendMessageW(g.hEdit, EM_EXSETSEL, 0, (LPARAM)&put);
+    SendMessageW(g.hEdit, EM_SCROLLCARET, 0, 0);
+}
+
+// Has the open file changed underneath the editor, and what should happen about it?
+//
+// WHY THIS RUNS ON ACTIVATION RATHER THAN FROM A WATCHER. ReadDirectoryChangesW would be
+// live, but it costs a thread, a cancellation path, and a way to tell the app's OWN writes
+// apart from everyone else's — and the moment a user needs to know is the moment they come
+// back to the window, not the moment the byte lands. Editors converge on this for the same
+// reason. The residual gap is honest and worth stating: a file changed while Sentinel-IDE is
+// already in front is not noticed until focus leaves and returns.
+//
+// THE CLEAN CASE RELOADS WITHOUT ASKING, and that is a deliberate asymmetry rather than an
+// oversight. With no unsaved edits the buffer holds exactly what the file held, so a reload
+// cannot lose anything a user typed; the only thing at stake is the view, which
+// reloadCurrentFile puts back. Prompting there would be a question with one sane answer,
+// asked repeatedly, which is how prompts get dismissed unread — including the one below,
+// which is a real either/or.
+void checkExternalChange(HWND hwnd) {
+    if (!g.fileOpen || g.curFilePath.empty()) return;
+
+    // Cheap filter first: no open handle, no read. Unmoved timestamp AND length is the
+    // overwhelmingly common answer and it costs two syscalls.
+    if (!mightHaveChanged(g.fileStamp, statFile(g.curFilePath))) return;
+
+    bool readOk = true;
+    const FileStamp now = stampFile(g.curFilePath, &readOk);
+    switch (changedFrom(g.fileStamp, now, readOk)) {
+        case DiskChange::None:
+            // Touched but not changed — a checkout that restored identical bytes, a formatter
+            // that rewrote them, a backup tool. Take the new stat so the filter stops firing;
+            // say nothing, because nothing happened.
+            g.fileStamp = now;
+            return;
+
+        case DiskChange::Unreadable:
+            // Almost certainly being written right now. Do NOT store this stamp: recording a
+            // file caught mid-write as its own final state would make the real change invisible.
+            logMsg(LogLevel::Debug, L"Changed-on-disk check could not read " + g.curFileName + L" — will re-check");
+            return;
+
+        case DiskChange::Deleted:
+            // Nothing to reload, so there is no question to ask. Say it once and stop: the
+            // stamp is updated so a re-check does not repeat the message, and the buffer is
+            // left exactly as it is — Ctrl+S recreates the file, which is the sane outcome
+            // and loses nothing. g.dirty is deliberately NOT forced: it is a pure function of
+            // (editorText(), savedText) that onEditChanged reassigns on the next keystroke,
+            // so a forced flag would survive only until the user typed.
+            g.fileStamp = now;
+            g.statusMsg = g.curFileName + L" was deleted on disk — Save to write it back";
+            logMsg(LogLevel::Warn, L"Open file deleted on disk: " + g.curFilePath);
+            InvalidateRect(hwnd, &g.rStatus, FALSE);
+            return;
+
+        case DiskChange::Modified:
+            break;
+    }
+
+    if (!g.dirty) {
+        reloadCurrentFile(hwnd);
+        g.statusMsg = L"Reloaded " + g.curFileName + L" — it changed on disk";
+        logMsg(LogLevel::Info, L"Reloaded (changed on disk, no unsaved edits): " + g.curFilePath);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (showReloadDialog(hwnd, g.curFileName) == ReloadChoice::Reload) {
+        reloadCurrentFile(hwnd);
+        g.statusMsg = L"Reloaded " + g.curFileName + L" from disk — unsaved changes discarded";
+        logMsg(LogLevel::Info, L"Reloaded on request, discarding unsaved changes: " + g.curFilePath);
+    } else {
+        // Keep. Adopt the new stamp: the user has been told and has answered, and re-asking on
+        // every activation about a change they already declined would be nagging. It also makes
+        // the answer mean what the dialog says — the next save overwrites, with no second prompt.
+        g.fileStamp = now;
+        g.statusMsg = g.curFileName + L" changed on disk — keeping your edits";
+        logMsg(LogLevel::Info, L"Kept unsaved edits over a newer file on disk: " + g.curFilePath);
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 void populateFiles() {
     g.nodePaths.clear(); TreeView_DeleteAllItems(g.hTree);
     HTREEITEM root = insertNode(TVI_ROOT, projBase(g.rootPath), -1, IMG_FOLDER);
@@ -1409,6 +1546,7 @@ void closeProject(HWND hwnd) {
     g.rootPath.clear(); g.curFilePath.clear(); g.curFileName.clear();
     g.nodePaths.clear();
     g.savedText.clear();
+    g.fileStamp = FileStamp{};   // beside savedText, as everywhere else the two are set together
     g.dirty = false; g.errorMarks = false; g.tbCanUndo = false; g.tbCanRedo = false; g.target = 0;
     g.signState = SignState::Unknown; g.signKey.clear(); g.signGrants.clear();
     TreeView_DeleteAllItems(g.hTree);
@@ -1697,6 +1835,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DragFinish(drop);
         return 0;
     }
+    case WM_ACTIVATEAPP:
+        // Coming back from another application is when a file may have changed underneath
+        // the editor — a build script, a git checkout, another editor. POSTED rather than
+        // checked inline for the same reason requestOpenPath posts: the work can raise a
+        // modal, and doing that inside activation handling runs it on whatever stack the
+        // activation change arrived on. WM_ACTIVATEAPP and not WM_ACTIVATE, because
+        // WM_ACTIVATE also fires for every one of this app's OWN modals closing, which
+        // would re-run the check after each dialog for nothing.
+        if (wParam) PostMessageW(hwnd, WM_APP_EXT_CHANGE, 0, 0);
+        break;   // DefWindowProc still sees it
+    case WM_APP_EXT_CHANGE:
+        // Never while a modal or a menu owns the UI: this can raise the reload prompt, and a
+        // second modal over the first is the phase-41 defect. The deferral is safe to drop
+        // rather than queue — unlike a pending open there is no payload to lose, and the
+        // retimed check re-reads the file and reaches the same answer.
+        if (uiIsBusy(hwnd)) { SetTimer(hwnd, kExtChangeTimer, 4000, nullptr); return 0; }
+        KillTimer(hwnd, kExtChangeTimer);
+        if (updaterShutdownPending()) return 0;   // seconds from exiting; a reload helps nobody
+        checkExternalChange(hwnd);
+        return 0;
     case WM_COPYDATA: {
         auto* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
         if (!cds || cds->dwData != kCopyDataOpenPath) return 0;
@@ -1889,6 +2047,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kUpdateResultTimer);
             if (g.pendingCheckResult >= 0)
                 PostMessageW(hwnd, WM_APP_UPDATE_CHECK_RESULT, (WPARAM)g.pendingCheckResult, 0);
+            return 0;
+        }
+        if (wParam == kExtChangeTimer) {
+            KillTimer(hwnd, kExtChangeTimer);
+            PostMessageW(hwnd, WM_APP_EXT_CHANGE, 0, 0);   // no pending state to carry — it re-reads
             return 0;
         }
         break;
