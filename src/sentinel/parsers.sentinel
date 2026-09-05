@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // parsers.sentinel — Sentinel-IDE's runtime PRODUCT logic, written in Sentinel and
-// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Five
-// exports the host used to do in C++ — four "interpret untrusted bytes" readers and
+// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Six
+// exports the host used to do in C++ — five "interpret untrusted bytes" readers and
 // the one writer that closes the loop:
 //
 //   parse_diag(line)     — one line of snc build output -> a diagnostic (file:line:col)
@@ -13,6 +13,10 @@
 //   save_manifest(text, model)
 //                        — the old manifest + the managed values -> the new manifest
 //                          text, rewritten surgically (the host does the file write)
+//   parse_appcast(body, mine)
+//                        — the update feed -> found/valid/newer + the version. The one
+//                          input that comes off the NETWORK, and the only reader that
+//                          also VALIDATES rather than merely transcribing.
 //
 // Kept as ONE lib on purpose: each Sentinel lib bundles the whole runtime, so linking
 // several would collide on sentinel_free_bytes / the allocator. One lib = one runtime,
@@ -1269,4 +1273,231 @@ export "C" fn save_manifest(text: &[u8], model: &[u8]) -> [u8] {
         z = z + 1;
     }
     vec_to_array(fin)
+}
+
+// ---- appcast reader (the update feed) ---------------------------------------
+//
+// The last parser that was still C++, and the only one whose bytes arrive off the
+// NETWORK: Updater.cpp fetches the feed over deliberately unauthenticated HTTPS (it
+// is public raw.githubusercontent.com; the trust anchor is the Ed25519 signature
+// WinSparkle checks on the DOWNLOAD, not the transport — see kAppcastUrl). So this
+// is the one parser whose input an attacker, a captive portal or a corrupt CDN can
+// choose, and what it decides is whether the IDE offers an update at all.
+//
+// It replaces three C++ functions in ONE crossing — the check runs hourly and on a
+// menu click, so a single FFI call is free and it moves the most C++:
+//   appcastVersion  — find sparkle:version="…" in the feed
+//   parseVersion    — split "a.b.c.d" into components
+//   versionIsNewer  — compare it against ours
+// plus the validation step the C++ never had at all.
+//
+// TWO DEFECTS IN THAT C++ CLOSE BY CONSTRUCTION HERE.
+//
+//  1. UNBOUNDED SIGNED OVERFLOW. `out[i] = out[i] * 10 + (*v - '0')` accumulated into
+//     an `int` over however many digits the feed supplied. sparkle:version=
+//     "99999999999999" is undefined behaviour and in practice wraps — so a LOWER
+//     version could compare as newer, or a real release could be suppressed, and this
+//     is the arithmetic that decides whether to offer one. Here a component is capped
+//     at 9 digits (<= 999_999_999, four orders of magnitude inside i64), and a
+//     component that exceeds the cap does not wrap and does not saturate: it makes the
+//     WHOLE version invalid (see ver_valid).
+//
+//  2. NO VALIDATION. appcastVersion returned whatever sat between the quotes — any
+//     bytes at all, up to the ~256 KB fetch cap — and the host then showed it in the
+//     offer dialog, logged it, and on "Skip this version" PERSISTED IT into
+//     settings.ini. Here the bytes come back only when they are a well-formed version,
+//     so unvalidated feed content cannot reach a dialog, a log line or the ini file.
+//
+// FIRST MATCH, NOT HIGHEST — deliberate, and the cross-check pins the choice. Our feed
+// carries exactly one <item> (scripts\make-appcast.ps1 emits one), so the two rules
+// agree today and first-match is what shipped. It is also not the weaker rule against
+// a hostile feed: taking the highest would let any entry anywhere in a 256 KB body
+// dictate what we offer, where first-match bounds that to the first one. And nothing
+// here is the security decision — the only question answered is whether to OFFER;
+// WinSparkle re-reads the feed itself, downloads, and refuses anything that does not
+// verify against the compiled-in public key. A rule that diverged from WinSparkle's
+// own would only mean offering updates it then declines to install.
+//
+// Result record the host unpacks:
+//   byte 0: found  — sparkle:version="…" located, opening AND closing quote
+//   byte 1: valid  — ... and the text between them is a well-formed version
+//   byte 2: newer  — ... and it is strictly newer than `mine`
+//   then [len i64 LE][version bytes] — len 0 unless `valid`.
+// The flags nest: newer implies valid implies found. Anything that cannot be parsed is
+// NOT an update, which is the fail-closed half of defect 2.
+
+// Index of `lit` in text[from..n), or -1. (C++ std::string::find.)
+fn find_lit(text: &[u8], from: i64, n: i64, lit: &[u8]) -> i64 {
+    let ll: i64 = len(*lit);
+    let mut at: i64 = 0 - 1;
+    let mut i: i64 = from;
+    while i + ll <= n && at < 0 {
+        let mut m: bool = true;
+        let mut j: i64 = 0;
+        while m && j < ll {
+            m = m && ((*text)[i + j] == (*lit)[j]);
+            j = j + 1;
+        }
+        if m { at = i; 0 } else { i = i + 1; 0 };
+    }
+    at
+}
+
+// THE VERSION GRAMMAR, and the only one accepted:
+//     comp ( '.' comp ){0,3}          comp = 1..9 digits
+// One to four components, every one non-empty, digits only, nothing else: no leading
+// or trailing dot, no spaces, no 'v', no build metadata, no empty string.
+//
+// 9 DIGITS PER COMPONENT IS THE OVERFLOW BOUND. 999_999_999 * 10 + 9 still sits eleven
+// digits inside i64, so ver_comp's accumulate cannot overflow for any accepted input.
+// It also caps the whole string at 4*9+3 = 39 bytes, which is the "bounded length"
+// half of the validation — a 256 KB feed cannot hand us a 256 KB "version".
+//
+// AN OVER-LONG COMPONENT REJECTS THE WHOLE VERSION. It is not saturated and not
+// truncated: both of those invent a number the feed never stated, and a wrong number
+// here either offers a downgrade or hides a real release. Refusing is the only answer
+// that cannot be wrong in the dangerous direction — a version that cannot be parsed is
+// simply not an update.
+//
+// MORE THAN FOUR COMPONENTS IS ALSO A REJECTION. The C++ read four and silently
+// ignored the rest, so "1.2.3.4.5" and "1.2.3.4" compared EQUAL. We publish
+// `^\d+\.\d+\.\d+\.\d+$` (make-appcast.ps1 enforces it before writing the feed), so
+// refusing a fifth component can never suppress a real update — and comparing two
+// versions while ignoring part of one of them is not a comparison.
+fn ver_valid(text: &[u8], a: i64, b: i64) -> bool {
+    let m: i64 = b - a;
+    let mut ok: bool = m >= 1 && m <= 39;
+    let mut dots: i64 = 0;
+    let mut digits: i64 = 0;
+    let mut i: i64 = a;
+    while ok && i < b {
+        let c: u8 = (*text)[i];
+        if c == '.' {
+            if digits == 0 { ok = false; 0 } else { 0 };      // empty component
+            dots = dots + 1;
+            if dots > 3 { ok = false; 0 } else { 0 };          // 5th component
+            digits = 0;
+            0
+        } else {
+            if is_digit(c) {
+                digits = digits + 1;
+                if digits > 9 { ok = false; 0 } else { 0 };    // the overflow bound
+                0
+            } else {
+                ok = false;                                    // not a digit or a dot
+                0
+            };
+            0
+        };
+        i = i + 1;
+    }
+    ok && digits > 0                                           // trailing '.' -> empty
+}
+
+// Value of component `k` (0-based) of text[a..b). Missing trailing components read as
+// 0, so "0.1.6" == "0.1.6.0" — existing behaviour, and the cross-check holds it.
+//
+// PRECONDITION: ver_valid(text, a, b) already said yes, so the `digits < 9` guard is
+// unreachable. It is written anyway so that this function cannot overflow for ANY
+// input, which is exactly what Updater.cpp::parseVersion could not say. A clamped
+// value can never be offered: the caller has already refused the version.
+fn ver_comp(text: &[u8], a: i64, b: i64, k: i64) -> i64 {
+    let mut cur: i64 = 0;
+    let mut digits: i64 = 0;
+    let mut v: i64 = 0;
+    let mut i: i64 = a;
+    while i < b {
+        let c: u8 = (*text)[i];
+        if c == '.' {
+            cur = cur + 1;
+            digits = 0;
+            0
+        } else {
+            if cur == k && is_digit(c) && digits < 9 {
+                v = v * 10 + digit_val(c);
+                digits = digits + 1;
+                0
+            } else { 0 };
+            0
+        };
+        i = i + 1;
+    }
+    v
+}
+
+export "C" fn parse_appcast(body: &[u8], mine: &[u8]) -> [u8] {
+    let bn: i64 = len(*body);
+    let mn: i64 = len(*mine);
+
+    // Locate sparkle:version="…". The C++ searched for the attribute name AND the
+    // opening quote as ONE literal and took the first hit, so an unquoted
+    // `sparkle:version=0.1.2` does not match and the scan continues past it — that is
+    // what resuming at `at + 1` reproduces. Once an opening quote IS found the search
+    // stops, exactly as find() does: a missing closing quote means no version, not
+    // "go and look at the next item".
+    let key: [u8] = "sparkle:version=";
+    let klen: i64 = len(key);
+    let mut found: bool = false;
+    let mut va: i64 = 0;
+    let mut vb: i64 = 0;
+    let mut from: i64 = 0;
+    let mut searching: bool = true;
+    while searching {
+        let at: i64 = find_lit(body, from, bn, &key);
+        let mut next: i64 = 0 - 1;                 // where to resume; -1 = stop
+        if at < 0 { 0 } else {
+            if at + klen < bn && (*body)[at + klen] == '"' {
+                let s: i64 = at + klen + 1;
+                let mut q: i64 = s;
+                let mut hasq: bool = false;
+                while q < bn && hasq == false {
+                    if (*body)[q] == '"' { hasq = true; 0 } else { q = q + 1; 0 };
+                }
+                if hasq { found = true; va = s; vb = q; 0 } else { 0 };
+                0
+            } else {
+                next = at + 1;
+                0
+            };
+            0
+        };
+        searching = next >= 0;
+        from = next;
+    }
+
+    // Validate before anything downstream looks at these bytes. The offer dialog, the
+    // log line and settings.ini's [update] skip_version all read the string this
+    // returns, and it is returned only when this passes — so there is no path by which
+    // unvalidated feed bytes reach the user or the disk.
+    let mut valid: bool = false;
+    if found { valid = ver_valid(body, va, vb); 0 } else { 0 };
+
+    // Compare component by component, numerically — which is the whole point: a string
+    // compare puts 0.1.10 BEFORE 0.1.9 and the project has already been bitten by that
+    // once (see the releases table in docs/HANDOVER.md).
+    //
+    // `mine` is the running build's own version. If OUR side does not parse we cannot
+    // compare at all, and then nothing is newer: fail closed on both sides, never
+    // "assume an update".
+    let mut newer: bool = false;
+    if valid && ver_valid(mine, 0, mn) {
+        let mut k: i64 = 0;
+        let mut decided: bool = false;
+        while k < 4 && decided == false {
+            let x: i64 = ver_comp(body, va, vb, k);
+            let y: i64 = ver_comp(mine, 0, mn, k);
+            if x != y { newer = x > y; decided = true; 0 } else { 0 };
+            k = k + 1;
+        }
+        0
+    } else { 0 };
+
+    let mut out: Vec<u8> = vec_new();
+    if found { push(&mut out, i64_to_u8(1)); 0 } else { push(&mut out, i64_to_u8(0)); 0 };
+    if valid { push(&mut out, i64_to_u8(1)); 0 } else { push(&mut out, i64_to_u8(0)); 0 };
+    if newer { push(&mut out, i64_to_u8(1)); 0 } else { push(&mut out, i64_to_u8(0)); 0 };
+    // The version bytes ONLY when valid. An invalid version is not returned at all, so
+    // the host has nothing to show, log or persist even if it forgot to check `valid`.
+    if valid { push_lenpref(&mut out, body, va, vb); 0 } else { push_le8(&mut out, 0); 0 };
+    vec_to_array(out)
 }

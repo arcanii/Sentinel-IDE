@@ -1,6 +1,7 @@
 # Sentinel-lang: capability requests from Sentinel-IDE
 
 _Filed 2026-07-19 by the Sentinel-IDE team (`arcanii/Sentinel-IDE`) against `G:\Sentinel-lang`._
+_Framing last revised 2026-09-04; the requests R1–R15 are unchanged since filing._
 _Every claim below was reproduced on this machine; the method is in section 1._
 
 > **For Sentinel-lang maintainers.** This is a prioritised list of what Sentinel-IDE needs
@@ -20,12 +21,41 @@ _Every claim below was reproduced on this machine; the method is in section 1._
 > described. One number worth adding: a *referenced* export pulls in the runtime — our exe grew
 > ~1.05 MB (Debug), where an unreferenced lib added +512 bytes. Both figures are honest; they
 > measure different things.
+>
+> **Update 2026-09-04 — every reader in the IDE is now Sentinel, and one of them is fed by the
+> network.** Four more ports followed the first: the trust-manifest reader, the `.sig` carrier
+> reader, the project-manifest reader, that manifest's surgical *writer*, and now the update-appcast
+> reader. They are one `snc build --lib` archive — `src/sentinel/parsers.sentinel`, 1,503 lines, six
+> `export "C"` entry points — linked into every shipped installer since `v0.1.1`. Four things this
+> stretch adds to the record, none of which changes an ask below:
+>
+> * **One lib, not several.** Each Sentinel lib bundles the whole runtime, so linking two collides on
+>   `sentinel_free_bytes` and the allocator. Keeping all six exports in one library means every port
+>   after the first costs only its own code (~8 KB), not another runtime. Worth documenting upstream;
+>   we found it by hitting it.
+> * **The owned `-> [u8]` return ABI scaled.** All six exports use it, including the writer, which
+>   returns a whole rewritten file. **R3 has still never bitten us** — six ports in, the sidestep in
+>   the 2026-07-19 note above is holding, which is evidence that R3 is narrow rather than that it is
+>   unimportant.
+> * **R2's exposure changed; the request has not.** The appcast reader parses bytes fetched over
+>   deliberately unauthenticated HTTPS. For the first time a Sentinel export in this product is
+>   handed input an attacker, a captive portal or a broken CDN chooses, rather than a local file the
+>   user already owns. A bounds violation there still terminates a `/subsystem:windows` process with
+>   no dialog and no save prompt. We have not rewritten R2 and we are not raising its priority — it
+>   was already P0 — but its blast radius is no longer hypothetical.
+> * **What we got wrong, again.** The appcast reader is the port that finally made us read our own
+>   C++ instead of transcribing it, and it had two real defects: an `int` accumulator with no digit
+>   bound (`out[i] = out[i]*10 + …` over a feed-supplied digit string), and no validation of the
+>   extracted version at all — bytes straight from the feed reached a dialog, the log, and
+>   `settings.ini`. Neither is a Sentinel problem and neither is an ask; we record it because the
+>   honest lesson of the port is that "move it to Sentinel" caught bugs that "keep it byte-identical"
+>   would have preserved.
 
 ---
 
 ## 1. Context
 
-Sentinel-IDE is a native Win32 C++ IDE for Sentinel. Its stated thesis is "a thin native host that shrinks over time as more moves into Sentinel," and it is deliberately built as a forcing function: every time we try to move a real subsystem out of C++ and into Sentinel, whatever we hit is a genuine toolchain gap rather than a hypothetical one. Today the shipped binary contains **zero Sentinel code** — the only `.sentinel` file in the repo is a build-time LOC counter. Our concrete near-term target is `src/core/Seal.h`: the project-sealing crypto core, currently AES-256-GCM + PBKDF2-HMAC-SHA256 (600 000 iterations) via Windows CNG, to be rebuilt as a Sentinel C-ABI static library that the host links. The `.sealed` v2 format already reserves `aead_alg = 2` for a ChaCha20-Poly1305 variant (`src/core/Seal.h:17`, `:246`), so the migration path exists in the format. This document is what we found when we actually tried to walk it.
+Sentinel-IDE is a native Win32 C++ IDE for Sentinel. Its stated thesis is "a thin native host that shrinks over time as more moves into Sentinel," and it is deliberately built as a forcing function: every time we try to move a real subsystem out of C++ and into Sentinel, whatever we hit is a genuine toolchain gap rather than a hypothetical one. Today the shipped binary contains **1,503 lines of Sentinel**, and has since `v0.1.1` (twelve public releases so far): one C-ABI static library built by `snc build --lib` (ADR 0059) with six `export "C"` entry points, holding **every file reader in the IDE** — build diagnostics, the trust manifest, the `.sig` carrier, the project manifest and its writer — plus the update-appcast reader, which is the only input this IDE takes off the network. Two things about that number, so it is not read as more than it is. It is ~12% of a ~12,800-line codebase, so the host has not meaningfully shrunk yet; and it is **all parsing** — no crypto, no key material, no UI, no file or socket I/O, all of which are still C++. What the ports do prove is that the C-ABI path carries real product traffic every day rather than a benchmark. Our concrete near-term target is the part that is none of those things — `src/core/Seal.h`: the project-sealing crypto core, currently AES-256-GCM + PBKDF2-HMAC-SHA256 (600 000 iterations) via Windows CNG, to be rebuilt as a Sentinel C-ABI static library that the host links. The `.sealed` v2 format already reserves `aead_alg = 2` for a ChaCha20-Poly1305 variant (`src/core/Seal.h:17`, `:246`), so the migration path exists in the format. This document is what we found when we actually tried to walk it.
 
 **How we measured.** All figures below were produced on an AMD Ryzen 9 9950X3D (16C/32T), Windows 11 Pro 26200, using `G:\Sentinel-lang\target\release\snc.exe` against `SNC_LIB_PATH=G:\Sentinel-lang\sentinel_library`, linked with MSVC 14.51 x64 via `vcvars64.bat`. Sentinel timings come from `kernel32!GetTickCount64` called from inside the program via `extern "C"`, wrapping only the workload; C baselines use `QueryPerformanceCounter`. Reported values are medians of 7–11 runs; run-to-run variance is ±12% and does not affect any conclusion here. Every crypto result was cross-checked against an independent implementation (NIST/RFC vectors, .NET `SHA256`/`HMACSHA256`/`AesGcm`, Python `hashlib`, or Windows CNG) and is byte-exact unless stated. `G:\Sentinel-lang` was not modified by any of this work; the one compiler experiment (§5) was done on a scratchpad clone.
 
@@ -328,7 +358,7 @@ This section is not a courtesy. The reason this document is as short as it is, a
 
 We are not asking for work we will not consume. Concretely, per item:
 
-**On R4 landing (`chacha20poly1305_open`), with R1 (secure-zero):** we implement Seal's AEAD + KDF core as a Sentinel `--lib` that the host links, add `aead_alg = 2` (ChaCha20-Poly1305) to the `.sealed` v2 writer — the format already reserves the id at `src/core/Seal.h:246` — and keep CNG AES-256-GCM as the read path for existing v2 files, which the skippable-slot design already accommodates. That ships the first Sentinel code in the Sentinel-IDE binary, and we will say so publicly. R1 is a hard precondition: we will not move key material into Sentinel while we cannot wipe it.
+**On R4 landing (`chacha20poly1305_open`), with R1 (secure-zero):** we implement Seal's AEAD + KDF core as a Sentinel `--lib` that the host links, add `aead_alg = 2` (ChaCha20-Poly1305) to the `.sealed` v2 writer — the format already reserves the id at `src/core/Seal.h:246` — and keep CNG AES-256-GCM as the read path for existing v2 files, which the skippable-slot design already accommodates. That ships the first **security-critical** Sentinel code in the Sentinel-IDE binary — the six parsers already ship, but not one of them touches a key — and we will say so publicly. R1 is a hard precondition: we will not move key material into Sentinel while we cannot wipe it.
 
 **On R6 and R7 landing (SHA-256 K-table, PBKDF2 + midstate):** we drop our vendored PBKDF2 and consume the stdlib one, and we contribute back our 120-line midstate implementation, our unrolled variant, and our vector set (c = 1, 2, 4096, 100 000, 600 000) as stdlib tests.
 

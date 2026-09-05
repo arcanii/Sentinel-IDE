@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–46 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–47 built and verified.
 
 ---
 
@@ -41,8 +41,9 @@ exist so far:
   `main` tracks `origin/main`. **PUBLIC since phase 32 — and it must stay that way:** WinSparkle
   fetches the update appcast over unauthenticated HTTPS, so going private returns 404 and silently
   disables auto-update for every installed client.
-- **Released.** Latest is **v0.1.7 (build 164)**; eight releases so far. Every file reader/parser in
-  the IDE runs in Sentinel. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`), but read
+- **Released.** Latest is **v0.1.12 (build 196)**; twelve releases so far. Every file reader/parser in
+  the IDE runs in Sentinel — including, since phase 47, the **update appcast**, which is the only one
+  of them fed off the network. Auto-update is live (WinSparkle + Ed25519-signed `appcast.xml`), but read
   phases 40–41 before trusting it: v0.1.0–v0.1.4 offered updates that **could never install**, and
   0.1.5 fixed only the **manual** ≡ ▸ Check for Updates… path. Since **phase 41** the background path
   works too, on **our own timer** — WinSparkle's periodic check is switched off because its prompt is
@@ -71,8 +72,8 @@ exist so far:
 | `src/host/win32/SaveChangesDialog.{h,cpp}` | Themed modal **Save / Don't Save / Cancel** prompt for unsaved edits (class `SentinelSaveDlg`). Driven by `MainWindow.cpp::confirmSaveIfDirty` — the single choke point every discarding path goes through (phase 39). |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
-| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38). `parsers.sentinel` = four parsers (diagnostic, trust manifest, `.sig` carrier, project manifest), built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject`. Every file reader in the IDE. About box shows the % in Sentinel. |
-| `tests/*_xcheck.cpp` | Prove each Sentinel parser stays byte-identical to its C++ oracle: `diag` (11), `trust` (12), `sig` (12), `manifest` (14). Plus `seal_test`. `ctest --test-dir build`. |
+| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38, 47). `parsers.sentinel` = **six** `export "C"` entry points — five readers (diagnostic, trust manifest, `.sig` carrier, project manifest, **update appcast**) and the manifest writer — built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject` / `saveProject` / `Updater.cpp::readAppcast`. Every file reader in the IDE, plus the one NETWORK reader. About box shows the % in Sentinel. |
+| `tests/*_xcheck.cpp` | Prove each Sentinel parser stays byte-identical to its C++ oracle: `diag` (11), `trust` (12), `sig` (12), `manifest` (14). **`appcast` (25) is the exception** — its oracle had two real defects (an unbounded `int` accumulate, no validation at all), so it asserts the NEW behaviour where the old C++ was wrong and declares each divergence; a parity test there would have pinned the bugs. Plus `seal_test`. `ctest --test-dir build`. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
 | `src/core/Signing.h` | Trust manifest (`[[keys]]`) + `.sig` parsers, `verifyFile`, and `sncSigningCaps` — which reports **verify** and **keygen/sign** as separate capabilities (they fail independently; see phase 30) |
@@ -88,7 +89,7 @@ exist so far:
 | `scripts/loc.ps1` | Counts the IDE's source by language → `build/generated/Loc.h` (About-box badges); builds the corpus and runs **`tools/loc.sentinel`** via `snc` for the Sentinel-verified total. Called by `build.bat`. |
 | `packaging/Sentinel-IDE.iss` | **Inno Setup** installer script → per-user `setup.exe` (Start-Menu shortcut, file associations mirroring `FileAssoc.h`, uninstall). |
 | `scripts/make-installer.bat` | Build the app, then compile the installer (needs Inno Setup 6: `winget install JRSoftware.InnoSetup`) → `build/installer/`. |
-| `src/host/win32/Updater.{h,cpp}` | **Auto-update** over WinSparkle — EdDSA-signed appcast, `initUpdater`/`checkForUpdates`/`shutdownUpdater`. Inactive until a real public key replaces the placeholder (phase 32). |
+| `src/host/win32/Updater.{h,cpp}` | **Auto-update** over WinSparkle — EdDSA-signed appcast, `initUpdater`/`checkForUpdates`/`shutdownUpdater`. Inactive until a real public key replaces the placeholder (phase 32). Since phase 47 the FETCH is all that is C++ here: `fetchAppcast` (WinINet) stays, and `parseVersion`/`versionIsNewer`/`appcastVersion` are gone — `readAppcast` crosses into `parse_appcast`. |
 | `third_party/winsparkle/` | Vendored WinSparkle 0.9.3 x64 (DLL + import lib + headers, MIT). CMake copies the DLL beside the exe; the installer ships it. |
 | `scripts/make-appcast.ps1` | Generate `appcast.xml` for a release (takes the signature; never touches the private key). |
 | `docs/RELEASING.md` | Update-signing key setup + the per-release procedure. **Read before cutting a release.** |
@@ -204,7 +205,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–46 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–47 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -1332,6 +1333,43 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     - Ctrl+S on the signed `examples/crypto.sentinel` left it byte-identical at 426 bytes (`git status examples/` clean), independently re-checked.
 
     Phase 46 therefore has **no untested edges left**.
+
+47. **The appcast reader moves to Sentinel — the last parser out of C++, and the only one fed by
+    the NETWORK.** `parse_appcast(body, mine)` in `src/sentinel/parsers.sentinel` replaces
+    `Updater.cpp`'s `parseVersion` + `versionIsNewer` + `appcastVersion` in ONE crossing (the check
+    runs hourly and on a menu click, so a single FFI call is free and it moves all three). The
+    WinINet `fetchAppcast` **stays in C++** — porting a thin Win32 wrapper would move the FFI
+    boundary, not any logic; native fetch, Sentinel parse, the same split the other four ports use.
+    `readAppcast` returns `{found, valid, newer, version}` and the flags nest, so a caller that only
+    consults `newer` is already fail-closed.
+    **This is not a transcription — the C++ it replaces had two real defects**, and moving the code
+    is what made someone read it. (a) `out[i] = out[i] * 10 + (*v - '0')` accumulated into an `int`
+    over however many digits the feed supplied. UB, and in practice a wrap: measured, a feed saying
+    `sparkle:version="0.1.2147483648.0"` makes the shipped reader compute component **-2147483648**
+    and rank a hugely higher version BELOW `0.1.12.196`, silently suppressing it; a feed saying
+    `"99999999999999"` computes **276447231** and is OFFERED as newer. Components are now capped at
+    9 digits (≤ 999,999,999) and an over-long one **rejects the whole version** rather than wrapping
+    or truncating — inventing a number the feed never stated is what decides an update the wrong way.
+    (b) `appcastVersion` returned whatever sat between the quotes, unchecked, up to the ~256 KB fetch
+    cap — and it was then shown in the offer dialog, logged, and on **Skip this version** written
+    into `settings.ini`. Measured: `sparkle:version="99 red balloons"` was OFFERED as an update
+    (`99 > 0`) and that string was the one persisted. The version is now validated — 1–4 components,
+    1–9 digits each, single dots, nothing else — and the bytes are returned **only when valid**, so
+    an unvalidated feed string cannot reach a dialog, a log line or the ini file at all.
+    **FIRST match, not highest**, deliberately: our feed carries one `<item>` (make-appcast.ps1
+    emits one and enforces `^\d+\.\d+\.\d+\.\d+$`), first-match is what shipped, and it bounds
+    what a 256 KB body can steer us to — where "highest" would let any entry anywhere in it decide.
+    Nothing here is the security gate anyway: this only decides whether to OFFER; WinSparkle re-reads
+    the feed, downloads, and refuses anything that does not verify against the compiled-in key.
+    `tests/appcast_xcheck.cpp` (25 cases, `ctest -R appcast_parity`) runs THREE implementations on
+    every case — the verbatim shipped C++ as oracle, the verbatim `#else` fallback, and Sentinel —
+    and each case declares Parity or **Diverges** with a reason. A Diverges case FAILS if the two
+    ever agree again, so the old behaviour cannot be quietly restored and stay green. Also pinned:
+    `0.1.9` vs `0.1.10` (the trap the v0.1.10 release row calls out), `0.1.6 == 0.1.6.0`, a GitHub
+    404 page as the body, and the real `appcast.xml` still reading `0.1.12.196`.
+    **Verified on the live feed**, not just in the test: a manual ≡ ▸ Check for Updates… on build
+    200 fetched `raw.githubusercontent.com` over real HTTPS and reported *"Sentinel-IDE 0.1.12.200
+    is up to date"* — the path that silently broke for four releases still works.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.

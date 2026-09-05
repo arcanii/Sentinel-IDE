@@ -34,7 +34,7 @@ A native, **Windows-first IDE for the Sentinel language** — built, increasingl
 
 ## Built in Sentinel (the dogfood)
 
-[`tools/loc.sentinel`](tools/loc.sentinel) is a real Sentinel program in the build pipeline: it reads the concatenated source corpus and counts the lines that the About box's "Total" badge displays. The **sealing crypto core** (`Seal.h`'s AEAD + KDF) is the next planned rewrite target — Sentinel's `std/security` already has a machine-verified constant-time ChaCha20-Poly1305 + SHA-256, and the `.sealed` format reserves algorithm ids for it.
+[`tools/loc.sentinel`](tools/loc.sentinel) is a real Sentinel program in the build pipeline: it reads the concatenated source corpus and counts the lines that the About box's "Total" badge displays. More of the product than that ships in Sentinel: [`src/sentinel/parsers.sentinel`](src/sentinel/parsers.sentinel) is 1,503 lines compiled into one C-ABI static library the host links, and it holds **every file reader in the IDE** — build diagnostics, the trust manifest, the `.sig` carrier, the project manifest and its writer — plus the **update-appcast reader**, the only input the IDE takes off the network. It has been in every release since `v0.1.1`. It is all parsing, though: no crypto, no key material, no I/O. The **sealing crypto core** (`Seal.h`'s AEAD + KDF) is the next planned rewrite target — Sentinel's `std/security` already has a machine-verified constant-time ChaCha20-Poly1305 + SHA-256, and the `.sealed` format reserves algorithm ids for it.
 
 ## Building
 
@@ -70,7 +70,10 @@ asserts on real pixels, including that the colouring is not monochrome. `d2d_dia
 message dialect, that change notifications are **synchronous** (a `PostMessage` regression there
 would silently discard a buffer), the accelerator routing that keeps undo alive, and the DPI
 rescale the line-number gutter depends on. The `*_parity` tests cross-check each Sentinel parser
-against its retired C++ original.
+against its retired C++ original — except `appcast_parity`, whose original had two real
+defects (an unbounded `int` accumulate over feed-supplied digits, and no validation of the
+version string at all), so it asserts the **new** behaviour where the old code was wrong and
+names every divergence.
 
 Note the test targets are `EXCLUDE_FROM_ALL`, so `scripts\build.bat` does **not** rebuild them —
 build them explicitly or `ctest` runs against stale binaries.

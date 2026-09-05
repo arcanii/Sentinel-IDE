@@ -286,8 +286,12 @@ add_test(NAME d2d_dialect COMMAND d2d_dialect_test
 # the same parsers.lib + system libs the app does.
 #     cmake --build build --target diag_xcheck  &&  build\diag_xcheck.exe
 #     cmake --build build --target trust_xcheck &&  build\trust_xcheck.exe
+# appcast_xcheck is the one exception to "byte-identical": its oracle has two real
+# defects (an unbounded `int` accumulate and no validation at all), so it asserts the
+# NEW behaviour where the old C++ was wrong and declares each divergence explicitly —
+# a test that demanded parity there would be pinning the bugs in place.
 if(EXISTS "${SENTINEL_PARSERS_LIB}")
-  foreach(_xc diag_xcheck trust_xcheck sig_xcheck manifest_xcheck saveproject_xcheck)
+  foreach(_xc diag_xcheck trust_xcheck sig_xcheck manifest_xcheck saveproject_xcheck appcast_xcheck)
     add_executable(${_xc} tests/${_xc}.cpp)
     target_link_libraries(${_xc} PRIVATE
       "${SENTINEL_PARSERS_LIB}"
@@ -302,4 +306,10 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
   add_test(NAME sig_parity      COMMAND sig_xcheck)
   add_test(NAME manifest_parity COMMAND manifest_xcheck)
   add_test(NAME saveproject_parity COMMAND saveproject_xcheck)
+  # appcast_xcheck needs neither an include dir nor an extra lib: its oracle is the three
+  # free functions Updater.cpp used to hold, over const char*, with no Windows call in
+  # them. It DOES need the real published feed — the case that proves appcast.xml still
+  # reads as 0.1.12.196 — so the path is passed in rather than duplicated in the test.
+  add_test(NAME appcast_parity COMMAND appcast_xcheck
+    "${CMAKE_CURRENT_SOURCE_DIR}/appcast.xml")
 endif()
