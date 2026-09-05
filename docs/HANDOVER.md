@@ -1893,13 +1893,14 @@ read the handover belongs in the handover body, not here._
 > You're continuing **Sentinel-IDE** (`G:\SentinelIDE`) — a native Win32 IDE for the **Sentinel**
 > language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It is a
 > **released, public, auto-updating** product: **sixteen releases, latest v0.1.15 (build 213)**, and real
-> Sentinel code runs in the shipped binary (the four file parsers). Treat `main` as shippable.
+> Sentinel code runs in the shipped binary — every file reader, the network-fed update feed and the
+> sealed-container framing (eight exports, ~1,960 lines). Treat `main` as shippable.
 >
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
 > **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–50, Environment gotchas,
-> the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
+> the Releases table, What's next, per-area detail; ~1,940 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not
 > folklore). `docs/prototype.md` + `docs/sentinel-project.md` are older narrative detail.
