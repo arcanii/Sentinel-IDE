@@ -46,6 +46,15 @@
 //
 // v1 files ("SNTSEAL1") are still READ, so anything sealed before this change keeps
 // opening; only the writer moved to v2.
+//
+// THE FRAMING IS SENTINEL; THE CRYPTO IS NOT. Reading this container — the header, the
+// unlock-slot table, the archive index — is src/sentinel/parsers.sentinel
+// (parse_seal_header / parse_seal_archive), the seventh and eighth exports of the one
+// C-ABI lib. It hands back BYTE OFFSETS to the salt, the wrapped DEK, the nonces and
+// the tags; every CNG call below is unchanged and no secret ever crosses the boundary.
+// The crypto core stays here because docs/Sentinel-lang_request.md R1 (no secure-zero
+// for `[secret u8]`) would make moving it a net security regression. See the framing
+// section below, and the long comment above parse_seal_header.
 #pragma once
 #include <windows.h>
 #include <bcrypt.h>
@@ -198,14 +207,100 @@ inline Bytes sealPackArchive(const std::vector<std::pair<std::wstring, Bytes>>& 
     }
     return a;
 }
+// ---- container FRAMING: the parse half, in Sentinel -----------------------
+//
+// Everything from here to sealProject is the part of the container that INTERPRETS
+// attacker-chosen bytes: the header, the unlock-slot table and the archive index. It
+// moved to src/sentinel/parsers.sentinel (parse_seal_header / parse_seal_archive), the
+// seventh and eighth exports of the one C-ABI lib (ADR 0059). The long comment above
+// those two functions is the record of what changed and why.
+//
+// THE CRYPTO DID NOT MOVE, and deliberately: no password, salt, KEK or DEK crosses the
+// FFI boundary, and the CNG calls below are untouched. The crypto core is blocked on
+// docs/Sentinel-lang_request.md R1 — there is no way to secure-zero a `[secret u8]`, so
+// key handling outside SecureZeroMemory's reach would be a net security regression.
+// Sentinel gets the bytes with nothing secret in them and hands back OFFSETS; the host
+// reads the salt, the wrapped DEK, the nonces and the tags from those offsets exactly
+// as it did.
+//
+// A `.sealed` file is fully attacker-chosen — the feature exists so someone can SEND
+// you a sealed project — and GCM proves only that the bytes did not change in transit.
+// This was the last place in the IDE where such bytes met hand-rolled pointer
+// arithmetic BEFORE anything was authenticated.
+//
+// Cross-checked against the C++ below, case for case, by tests/seal_xcheck.cpp.
+
+// The on-disk FORMAT constants. They live with the framing because that is the only
+// thing that reads them; the PBKDF2 iteration policy stays down with the crypto.
+constexpr uint32_t kSealVersion1 = 1;           // legacy: no slot_len, no AAD (still read)
+constexpr uint32_t kSealVersion2 = 2;           // current writer
+constexpr uint32_t kAeadAesGcm   = 1;           // aead_alg id (2 = ChaCha20-Poly1305, reserved)
+constexpr uint32_t kSlotPassword = 1;           // slot_type id
+constexpr uint32_t kPasswordSlotLen = 16 + 8 + 12 + 32 + 16;   // salt|iters|nonce|wrapped|tag = 84
+constexpr size_t   kSealAadLen   = 24;          // magic(8) + version(4) + aead_alg(4) + archive_size(8)
+
+// Why a reason CODE and not a message: the parser is a library that knows the format,
+// not the UI. Every code below maps to a string unsealProject already had, so this port
+// added no user-facing text — see sealHeaderMessage.
+enum SealHeaderReason {
+    kSealHdrOk = 0,
+    kSealHdrBadMagic = 1,          // not 8 bytes, or not SNTSEAL1/SNTSEAL2
+    kSealHdrTruncHeader = 2,       // version/alg/archive_size/slot_count do not fit
+    kSealHdrBadVersion = 3,        // version disagrees with the magic, or unknown aead_alg
+    kSealHdrTruncSlots = 4,        // a slot header does not fit
+    kSealHdrSlotType = 5,          // v1 only: a slot type with no slot_len to step over
+    kSealHdrTruncSlotBody = 6,     // a slot body does not fit
+    kSealHdrTruncPayload = 7,      // payload nonce + length do not fit
+    kSealHdrTruncPayloadBody = 8,  // payload + tag do not fit, or payload_len >= 2^63
+    kSealHdrArchiveSize = 9,       // archive_size not plausible for the container — see readSealHeader
+    kSealHdrSlotCount = 10         // slot_count above the ceiling — a PBKDF2 hang, see readSealHeader
+};
+// Unlock slots a container may declare. See readSealHeader for why this is bounded.
+constexpr uint32_t kMaxUnlockSlots = 64;
+// The archive side has one outcome in the UI ("bad archive"); the codes are kept apart
+// only so the cross-check can name which bound fired.
+enum SealArchiveReason {
+    kSealArcOk = 0,
+    kSealArcShort = 1,       // fewer than the 4 bytes of file_count
+    kSealArcTrunc = 2,       // a path or a data run runs off the end
+    kSealArcUnsafePath = 3,  // rooted, drive-qualified, empty, or a ".." component
+    kSealArcDataLen = 4      // data_len >= 2^63
+};
+
+struct SealSlot { uint32_t type = 0; size_t bodyOff = 0; size_t bodyLen = 0; };
+// Byte offsets into the sealed file. Nothing here is secret: it is where to look, not
+// what is there.
+struct SealHeader {
+    int reason = kSealHdrBadMagic;
+    uint32_t version = 0;
+    uint64_t archiveSize = 0;
+    size_t payloadNonceOff = 0, payloadOff = 0, payloadLen = 0, payloadTagOff = 0;
+    std::vector<SealSlot> slots;
+};
+struct SealEntry { std::wstring rel; size_t dataOff = 0, dataLen = 0; };
+struct SealArchiveIndex { int reason = kSealArcShort; std::vector<SealEntry> files; };
+
 // Is this archive-relative path unsafe to write under destRoot?
 // The ".." test is PER COMPONENT: a substring search also rejects perfectly ordinary
 // names like "notes..txt" or "v1..2.md", which would abort the whole unseal over a
 // file that was never a traversal attempt.
+//
+// The colon is refused ANYWHERE, not just at position 1 as the pre-port code had it.
+// Two reasons, and neither costs a real file (':' is not legal in a Windows filename,
+// and every path in an archive came from FindFirstFileW walking a Windows directory):
+// `ab:c` used to be allowed and writes an NTFS ALTERNATE DATA STREAM rather than the
+// file a tree walk would show; and "second byte" and "second character" are the same
+// question only while the first character is ASCII, so this is also the one rule where
+// the UTF-8 and UTF-16 forms of the guard could otherwise part company.
+//
+// Defined unconditionally: the C++ readSealArchive below uses it, and tests/seal_test.cpp
+// pins its truth table directly. The Sentinel port applies the SAME rules to the UTF-8
+// bytes instead of this UTF-16 form — argued in full above seal_unsafe_rel in
+// parsers.sentinel, and held to it by tests/seal_xcheck.cpp.
 inline bool sealUnsafeRelPath(const std::wstring& p) {
     if (p.empty()) return true;
     if (p[0] == L'\\' || p[0] == L'/') return true;                   // rooted
-    if (p.size() > 1 && p[1] == L':') return true;                    // drive-qualified
+    if (p.find(L':') != std::wstring::npos) return true;              // drive-qualified / ADS
     for (size_t start = 0; start <= p.size(); ) {
         const size_t sep = p.find(L'\\', start);
         const size_t end = (sep == std::wstring::npos) ? p.size() : sep;
@@ -216,39 +311,225 @@ inline bool sealUnsafeRelPath(const std::wstring& p) {
     return false;
 }
 
-inline bool sealExtractArchive(const Bytes& a, const std::wstring& destRoot) {
-    if (a.size() < 4) return false;
-    size_t pos = 0; uint32_t n = getU32(&a[pos]); pos += 4;
-    // Bounds are written as `remaining < want` rather than `pos + want > size`:
-    // data_len is a u64 straight off disk, so the additive form can wrap and pass.
+// Reason code -> the message unsealProject reported before this port. One table, so the
+// strings live in one place and neither implementation carries them.
+inline const wchar_t* sealHeaderMessage(int reason) {
+    switch (reason) {
+        case kSealHdrTruncHeader:      return L"Sealed file is truncated.";
+        case kSealHdrBadVersion:       return L"Unsupported sealed-file version/algorithm.";
+        case kSealHdrTruncSlots:       return L"Sealed file is truncated (slots).";
+        case kSealHdrSlotType:         return L"Unsupported unlock-slot type (newer IDE?).";
+        case kSealHdrTruncSlotBody:    return L"Sealed file is truncated (slot body).";
+        case kSealHdrTruncPayload:     return L"Sealed file is truncated (payload).";
+        case kSealHdrTruncPayloadBody: return L"Sealed file is truncated (payload body).";
+        // A header field that cannot hold a real value is a bad header — the same
+        // message a bad magic gets, and not a new string.
+        case kSealHdrBadMagic:
+        case kSealHdrArchiveSize:      return L"Not a sealed project (bad header).";
+        case kSealHdrSlotCount:        return L"Not a sealed project (bad header).";
+        default:                       return L"";
+    }
+}
+
+#ifdef SENTINELIDE_SENTINEL
+#include "sentinel_parsers.h"   // generated by snc: parse_seal_header/_archive + sentinel_free_bytes()
+
+// A zero-length Bytes has a null data(); the FFI takes a slice, so hand it something.
+inline const uint8_t* sealPtr(const Bytes& b) {
+    static const uint8_t kNone = 0;
+    return b.empty() ? &kNone : b.data();
+}
+inline uint64_t sealRd8(const uint8_t* p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i); return v; }
+
+inline SealHeader readSealHeader(const Bytes& f) {
+    SealHeader h;
+    uint8_t* out = nullptr; int64_t olen = 0;
+    parse_seal_header(sealPtr(f), (int64_t)f.size(), &out, &olen);
+    // Record: [reason][version][archive_size][slot_count][pnonce][poff][plen][ptag]
+    // then slot_count * [type][body_off][body_len] — 57 bytes minimum.
+    if (out && olen >= 57) {
+        h.reason        = (int)out[0];
+        h.version       = (uint32_t)sealRd8(out + 1);
+        h.archiveSize   = sealRd8(out + 9);
+        const uint64_t nslots = sealRd8(out + 17);
+        h.payloadNonceOff = (size_t)sealRd8(out + 25);
+        h.payloadOff      = (size_t)sealRd8(out + 33);
+        h.payloadLen      = (size_t)sealRd8(out + 41);
+        h.payloadTagOff   = (size_t)sealRd8(out + 49);
+        for (uint64_t i = 0; i < nslots && (uint64_t)olen >= 57 + (i + 1) * 24; i++) {
+            const uint8_t* rec = out + 57 + (size_t)i * 24;
+            SealSlot s;
+            s.type    = (uint32_t)sealRd8(rec);
+            s.bodyOff = (size_t)sealRd8(rec + 8);
+            s.bodyLen = (size_t)sealRd8(rec + 16);
+            h.slots.push_back(s);
+        }
+    }
+    if (out) sentinel_free_bytes(out);
+    return h;
+}
+
+inline SealArchiveIndex readSealArchive(const Bytes& a) {
+    SealArchiveIndex idx;
+    uint8_t* out = nullptr; int64_t olen = 0;
+    parse_seal_archive(sealPtr(a), (int64_t)a.size(), &out, &olen);
+    // Record: [reason][file_count] then file_count * [data_off][data_len][path_len][path].
+    if (out && olen >= 9) {
+        idx.reason = (int)out[0];
+        const uint64_t n = sealRd8(out + 1);
+        size_t at = 9;
+        for (uint64_t i = 0; i < n; i++) {
+            if ((uint64_t)olen < (uint64_t)at + 24) break;
+            SealEntry e;
+            e.dataOff = (size_t)sealRd8(out + at);
+            e.dataLen = (size_t)sealRd8(out + at + 8);
+            const uint64_t pl = sealRd8(out + at + 16);
+            at += 24;
+            if ((uint64_t)olen < (uint64_t)at + pl) break;
+            // Already '\'-separated and already guarded, so this is a transcode and
+            // nothing else — no separator fixing, no second traversal check.
+            e.rel = sealWide((const char*)out + at, (size_t)pl);
+            at += (size_t)pl;
+            idx.files.push_back(std::move(e));
+        }
+    }
+    if (out) sentinel_free_bytes(out);
+    return idx;
+}
+#else
+// C++ fallback for a snc-less build (parsers.lib absent), as every earlier port keeps
+// one. It is the shipped parsing, restructured to hand back offsets instead of doing the
+// crypto inline, plus the two refusals the port added: a length off disk that does not
+// fit an i64 is refused rather than used. tests/seal_xcheck.cpp holds it and the Sentinel
+// side to the same corpus, and carries the pre-port code as a third opinion.
+//
+// Bounds are written as `remaining < want` rather than `pos + want > size`: the lengths
+// are u64 straight off disk, so the additive form can wrap and pass.
+inline SealHeader readSealHeader(const Bytes& f) {
+    SealHeader h;
+    size_t pos = 0;
+    auto remaining = [&]() -> size_t { return f.size() - pos; };
+    auto need = [&](size_t n) { return remaining() >= n; };
+
+    if (f.size() < 8) { h.reason = kSealHdrBadMagic; return h; }
+    const bool v2 = memcmp(f.data(), "SNTSEAL2", 8) == 0;
+    const bool v1 = memcmp(f.data(), "SNTSEAL1", 8) == 0;
+    if (!v1 && !v2) { h.reason = kSealHdrBadMagic; return h; }
+    pos = 8;
+    if (!need(20)) { h.reason = kSealHdrTruncHeader; return h; }
+    h.version = getU32(&f[pos]); pos += 4;
+    const uint32_t alg = getU32(&f[pos]); pos += 4;
+    const uint64_t archiveSize = getU64(&f[pos]); pos += 8;
+    const uint32_t slots = getU32(&f[pos]); pos += 4;
+    if (h.version != (v2 ? kSealVersion2 : kSealVersion1) || alg != kAeadAesGcm) {
+        h.reason = kSealHdrBadVersion; return h;
+    }
+    // archive_size is the output-buffer size sealDecompress is handed. v2 binds the
+    // 24-byte prefix in as GCM AAD so a tampered value fails authentication first; a v1
+    // file has no AAD at all, which is the exposure v2 exists to close and which v1
+    // files still carry because they are still read. A value that does not fit an i64
+    // is not a size any real file states, so it is refused before anything sizes a
+    // buffer with it. (Sentinel has no u64 — see rd_u64 in parsers.sentinel — so this
+    // is also the shape both implementations must share to stay comparable.)
+    // REFUSING ONLY "does not fit an i64" WAS NOT ENOUGH. A 206-byte container stating
+    // 64 GiB was measured committing 65,667 MB of private bytes and 14 seconds before
+    // failing, and near the top of the accepted range the std::bad_alloc escaped
+    // unsealProject. Authentication cannot help: the attacker is the SEALER, not a
+    // tamperer, which is exactly the threat model of "someone sent me a sealed project".
+    // So the size must be plausible for the container it arrived in — the ratio does the
+    // work, the floor keeps small real files working, the cap sits above any source tree.
+    // Kept identical to parse_seal_header so the two stay comparable.
+    const uint64_t capAbs = 2147483648ull;                       // 2 GiB
+    const uint64_t capFloor = 67108864ull;                       // 64 MiB whatever the ratio
+    uint64_t allow = (uint64_t)f.size() * 1024ull;
+    if (allow < capFloor) allow = capFloor;
+    if (allow > capAbs)   allow = capAbs;
+    if (archiveSize > (uint64_t)INT64_MAX || archiveSize > allow) {
+        h.reason = kSealHdrArchiveSize; return h;
+    }
+    h.archiveSize = archiveSize;
+
+    // THE SLOT-COUNT CEILING. unsealProject runs a full PBKDF2 per password-type slot
+    // until one unlocks, so a WRONG password runs them all — and the attacker guarantees
+    // that path by simply not giving you the right password. Measured: 200 slots in an
+    // 18 KB file took 18.7 s on the UI thread; a 1 MB file holds ~11,400, about 17.7
+    // minutes, with no progress and no cancel. Phase 31 bounded `iters` because "above
+    // the ceiling is a hang dressed up as a password prompt"; this is that hang by
+    // another route. 64 is far above anything real (LUKS, whose slot table this borrows
+    // from, has 8) and far below anything that costs a user their afternoon.
+    if (slots > kMaxUnlockSlots) { h.reason = kSealHdrSlotCount; return h; }
+
+    for (uint32_t i = 0; i < slots; i++) {
+        if (!need(v2 ? 8u : 4u)) { h.reason = kSealHdrTruncSlots; return h; }
+        SealSlot s;
+        s.type = getU32(&f[pos]); pos += 4;
+        // v1 has no slot_len, so its only navigable slot type is the password one.
+        uint32_t slen = kPasswordSlotLen;
+        if (v2) { slen = getU32(&f[pos]); pos += 4; }
+        else if (s.type != kSlotPassword) { h.reason = kSealHdrSlotType; return h; }
+        if (!need(slen)) { h.reason = kSealHdrTruncSlotBody; return h; }
+        s.bodyOff = pos; s.bodyLen = slen;
+        h.slots.push_back(s);
+        pos += slen;   // ALWAYS advance, understood or not — v1 broke exactly here
+    }
+
+    if (!need(12 + 8)) { h.reason = kSealHdrTruncPayload; return h; }
+    h.payloadNonceOff = pos; pos += 12;
+    const uint64_t plen = getU64(&f[pos]); pos += 8;
+    if (plen > (uint64_t)INT64_MAX || plen > (uint64_t)remaining() || remaining() - (size_t)plen < 16) {
+        h.reason = kSealHdrTruncPayloadBody; return h;
+    }
+    h.payloadOff = pos; h.payloadLen = (size_t)plen; h.payloadTagOff = pos + (size_t)plen;
+    h.reason = kSealHdrOk;
+    return h;
+}
+
+inline SealArchiveIndex readSealArchive(const Bytes& a) {
+    SealArchiveIndex idx;
+    if (a.size() < 4) { idx.reason = kSealArcShort; return idx; }
+    size_t pos = 0;
+    const uint32_t n = getU32(&a[pos]); pos += 4;
     for (uint32_t i = 0; i < n; i++) {
-        if (a.size() - pos < 4) return false;
-        uint32_t pl = getU32(&a[pos]); pos += 4;
-        if (a.size() - pos < pl) return false;
-        std::wstring rel = sealWide((const char*)&a[pos], pl); pos += pl;
-        if (a.size() - pos < 8) return false;
-        uint64_t dl = getU64(&a[pos]); pos += 8;
-        if (dl > (uint64_t)(a.size() - pos)) return false;
-        for (auto& ch : rel) if (ch == L'/') ch = L'\\';                 // → native separators
-        if (sealUnsafeRelPath(rel)) return false;
-        std::wstring full = destRoot + L"\\" + rel;
-        size_t s = full.find_last_of(L'\\');
-        if (s != std::wstring::npos) SHCreateDirectoryExW(nullptr, full.substr(0, s).c_str(), nullptr);
-        if (!sealWriteBytes(full, dl ? &a[pos] : (const uint8_t*)"", (size_t)dl)) return false;
+        if (a.size() - pos < 4) { idx.reason = kSealArcTrunc; return idx; }
+        const uint32_t pl = getU32(&a[pos]); pos += 4;
+        if (a.size() - pos < pl) { idx.reason = kSealArcTrunc; return idx; }
+        std::wstring rel = sealWide((const char*)a.data() + pos, pl); pos += pl;
+        if (a.size() - pos < 8) { idx.reason = kSealArcTrunc; return idx; }
+        const uint64_t dl = getU64(&a[pos]); pos += 8;
+        if (dl > (uint64_t)INT64_MAX) { idx.reason = kSealArcDataLen; return idx; }
+        if (dl > (uint64_t)(a.size() - pos)) { idx.reason = kSealArcTrunc; return idx; }
+        for (auto& ch : rel) if (ch == L'/') ch = L'\\';                // → native separators
+        if (sealUnsafeRelPath(rel)) { idx.reason = kSealArcUnsafePath; return idx; }
+        idx.files.push_back(SealEntry{ rel, pos, (size_t)dl });
         pos += (size_t)dl;
+    }
+    idx.reason = kSealArcOk;
+    return idx;
+}
+#endif
+
+// Write out an already-parsed index. NOTHING IS WRITTEN UNTIL EVERYTHING IS CHECKED:
+// the parse validates every bound and every path first, so an archive whose 500th entry
+// is `..\evil` no longer drops 499 files into the destination before it aborts. The old
+// shape interleaved the two, and MainWindow's failure cleanup is a RemoveDirectoryW,
+// which only removes an EMPTY directory — so those files stayed.
+inline bool sealExtractArchive(const Bytes& a, const std::wstring& destRoot) {
+    const SealArchiveIndex idx = readSealArchive(a);
+    if (idx.reason != kSealArcOk) return false;
+    for (const SealEntry& e : idx.files) {
+        const std::wstring full = destRoot + L"\\" + e.rel;
+        const size_t s = full.find_last_of(L'\\');
+        if (s != std::wstring::npos) SHCreateDirectoryExW(nullptr, full.substr(0, s).c_str(), nullptr);
+        if (!sealWriteBytes(full, e.dataLen ? a.data() + e.dataOff : (const uint8_t*)"", e.dataLen)) return false;
     }
     return true;
 }
 
 // ---- seal / unseal --------------------------------------------------------
 constexpr uint64_t kSealPbkdf2Iters = 600000;   // OWASP-class for PBKDF2-HMAC-SHA256
-
-constexpr uint32_t kSealVersion1 = 1;           // legacy: no slot_len, no AAD (still read)
-constexpr uint32_t kSealVersion2 = 2;           // current writer
-constexpr uint32_t kAeadAesGcm   = 1;           // aead_alg id (2 = ChaCha20-Poly1305, reserved)
-constexpr uint32_t kSlotPassword = 1;           // slot_type id
-constexpr uint32_t kPasswordSlotLen = 16 + 8 + 12 + 32 + 16;   // salt|iters|nonce|wrapped|tag = 84
-constexpr size_t   kSealAadLen   = 24;          // magic(8) + version(4) + aead_alg(4) + archive_size(8)
+// The on-disk format constants (kSealVersion1/2, kAeadAesGcm, kSlotPassword,
+// kPasswordSlotLen, kSealAadLen) moved up to the framing section — that is what reads
+// them. What is left here is crypto POLICY, which is not the parser's business.
 
 // `iters` lives in the slot body, which is neither covered by the AAD nor checked by
 // the slot's own GCM tag (that tag only authenticates the wrapped DEK). So a crafted
@@ -313,44 +594,33 @@ inline SealResult sealProject(const std::wstring& projectDir, const std::wstring
     return r;
 }
 
+// The parsing is gone from here: readSealHeader (Sentinel, or the C++ fallback)
+// validates the container and hands back byte offsets, and what is left below is the
+// crypto and only the crypto. Every CNG call, every SecureZeroMemory and the AAD rule
+// are unchanged — the offsets just say where to read.
 inline SealResult unsealProject(const std::wstring& sealedPath, const std::wstring& destDir, const Bytes& password) {
     SealResult r;
     Bytes f; if (!sealReadBytes(sealedPath, f)) { r.message = L"Cannot read the sealed file."; return r; }
-    size_t pos = 0;
-    // `remaining() < n` rather than `pos + n <= size`: lengths come off disk as u64
-    // and the additive form can wrap past the check.
-    auto remaining = [&]() -> size_t { return f.size() - pos; };
-    auto need = [&](size_t n) { return remaining() >= n; };
 
-    if (f.size() < 8) { r.message = L"Not a sealed project (bad header)."; return r; }
-    const bool v2 = memcmp(f.data(), "SNTSEAL2", 8) == 0;
-    const bool v1 = memcmp(f.data(), "SNTSEAL1", 8) == 0;
-    if (!v1 && !v2) { r.message = L"Not a sealed project (bad header)."; return r; }
-    pos = 8;
-    if (!need(20)) { r.message = L"Sealed file is truncated."; return r; }
-    uint32_t ver = getU32(&f[pos]); pos += 4;
-    uint32_t alg = getU32(&f[pos]); pos += 4;
-    uint64_t archiveSize = getU64(&f[pos]); pos += 8;
-    uint32_t slots = getU32(&f[pos]); pos += 4;
-    if (ver != (v2 ? kSealVersion2 : kSealVersion1) || alg != kAeadAesGcm) {
-        r.message = L"Unsupported sealed-file version/algorithm."; return r;
+    const SealHeader h = readSealHeader(f);
+    // A payload-framing failure is held back until AFTER the unlock attempt, because
+    // that is the order the messages came out in before: a file that is both truncated
+    // and given the wrong password still says "wrong password". Everything earlier than
+    // the payload is fatal here, exactly as it was.
+    if (h.reason != kSealHdrOk && h.reason != kSealHdrTruncPayload && h.reason != kSealHdrTruncPayloadBody) {
+        r.message = sealHeaderMessage(h.reason); return r;
     }
+    const bool v2 = h.version == kSealVersion2;
 
     uint8_t dek[32]; bool unlocked = false;
     bool sawUnknownSlot = false;
-    for (uint32_t i = 0; i < slots; i++) {
-        if (!need(v2 ? 8u : 4u)) { r.message = L"Sealed file is truncated (slots)."; return r; }
-        uint32_t type = getU32(&f[pos]); pos += 4;
-        // v1 has no slot_len, so its only navigable slot type is the password one.
-        uint32_t slen = kPasswordSlotLen;
-        if (v2) { slen = getU32(&f[pos]); pos += 4; }
-        else if (type != kSlotPassword) { r.message = L"Unsupported unlock-slot type (newer IDE?)."; return r; }
-        if (!need(slen)) { r.message = L"Sealed file is truncated (slot body)."; return r; }
-        const uint8_t* body = &f[pos];
-
+    for (const SealSlot& s : h.slots) {
         // Try this slot only if we still need a DEK and we understand the shape.
-        // Everything else is stepped over via slen — that is the whole point of v2.
-        if (!unlocked && type == kSlotPassword && slen == kPasswordSlotLen) {
+        // Everything else was stepped over by slot_len during the parse — that is the
+        // whole point of v2, and here it costs nothing: an unknown slot is simply a
+        // record we do not act on.
+        if (!unlocked && s.type == kSlotPassword && s.bodyLen == kPasswordSlotLen) {
+            const uint8_t* body = f.data() + s.bodyOff;
             const uint8_t* salt = body;
             uint64_t iters = getU64(body + 16);
             const uint8_t* nonce = body + 24;
@@ -367,10 +637,9 @@ inline SealResult unsealProject(const std::wstring& sealedPath, const std::wstri
                     SecureZeroMemory(dekOut.data(), dekOut.size());
                 }
             }
-        } else if (!unlocked && type != kSlotPassword) {
+        } else if (!unlocked && s.type != kSlotPassword) {
             sawUnknownSlot = true;
         }
-        pos += slen;   // ALWAYS advance, unlocked or not — v1 broke exactly here
     }
     if (!unlocked) {
         r.message = sawUnknownSlot
@@ -378,25 +647,23 @@ inline SealResult unsealProject(const std::wstring& sealedPath, const std::wstri
             : L"Wrong password — could not unlock the project.";
         return r;
     }
+    if (h.reason != kSealHdrOk) { SecureZeroMemory(dek, 32); r.message = sealHeaderMessage(h.reason); return r; }
 
-    if (!need(12 + 8)) { SecureZeroMemory(dek, 32); r.message = L"Sealed file is truncated (payload)."; return r; }
-    const uint8_t* pnonce = &f[pos]; pos += 12;
-    uint64_t plen = getU64(&f[pos]); pos += 8;
-    if (plen > (uint64_t)remaining() || remaining() - (size_t)plen < 16) {
-        SecureZeroMemory(dek, 32); r.message = L"Sealed file is truncated (payload body)."; return r;
-    }
-    Bytes payload(&f[pos], &f[pos] + plen); pos += (size_t)plen;
-    uint8_t ptag[16]; memcpy(ptag, &f[pos], 16); pos += 16;
+    const uint8_t* pnonce = f.data() + h.payloadNonceOff;
+    Bytes payload(f.data() + h.payloadOff, f.data() + h.payloadOff + h.payloadLen);
+    uint8_t ptag[16]; memcpy(ptag, f.data() + h.payloadTagOff, 16);
 
     // v2 binds the 24-byte header prefix into the payload tag, so a tampered
     // archive_size fails here rather than steering the allocation below. v1 files
-    // have no AAD to check — read as-is; that exposure is why v2 exists.
+    // have no AAD to check — read as-is; that exposure is why v2 exists, and it is
+    // also why an archive_size that cannot fit an i64 is refused during the parse
+    // rather than reaching sealDecompress.
     Bytes comp;
     bool decOk = sealAesGcm(false, dek, pnonce, payload, comp, ptag,
                             v2 ? f.data() : nullptr, v2 ? (ULONG)kSealAadLen : 0);
     SecureZeroMemory(dek, 32);
     if (!decOk) { r.message = L"Payload failed authentication — the sealed file is corrupt or tampered."; return r; }
-    Bytes archive; if (!sealDecompress(comp, (size_t)archiveSize, archive)) { r.message = L"Decompression failed."; return r; }
+    Bytes archive; if (!sealDecompress(comp, (size_t)h.archiveSize, archive)) { r.message = L"Decompression failed."; return r; }
     if (!sealExtractArchive(archive, destDir)) { r.message = L"Could not extract the project (bad archive)."; return r; }
     r.ok = true; r.outPath = destDir; r.message = L"Unsealed " + std::to_wstring(archive.size()) + L" B to " + destDir;
     return r;

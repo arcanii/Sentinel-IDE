@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // parsers.sentinel — Sentinel-IDE's runtime PRODUCT logic, written in Sentinel and
-// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Six
-// exports the host used to do in C++ — five "interpret untrusted bytes" readers and
+// compiled into the shipped binary as ONE C-ABI static library (ADR 0059). Eight
+// exports the host used to do in C++ — seven "interpret untrusted bytes" readers and
 // the one writer that closes the loop:
 //
 //   parse_diag(line)     — one line of snc build output -> a diagnostic (file:line:col)
@@ -17,6 +17,16 @@
 //                        — the update feed -> found/valid/newer + the version. The one
 //                          input that comes off the NETWORK, and the only reader that
 //                          also VALIDATES rather than merely transcribing.
+//   parse_seal_header(file)
+//                        — a .sealed container's header + unlock-slot table -> byte
+//                          offsets to each slot body and to the payload framing
+//   parse_seal_archive(archive)
+//                        — the decrypted archive index -> one {path, offset, length}
+//                          per file, traversal-guarded. The only BINARY inputs of the
+//                          eight, and the only ones that are fully attacker-chosen by
+//                          design: the seal feature exists so a .sealed file can be
+//                          SENT to you. The seal CRYPTO deliberately did NOT move —
+//                          see the framing section at the bottom of this file.
 //
 // Kept as ONE lib on purpose: each Sentinel lib bundles the whole runtime, so linking
 // several would collide on sentinel_free_bytes / the allocator. One lib = one runtime,
@@ -24,16 +34,23 @@
 // All use the owned `-> [u8]` return ABI (not `&mut [u8]`), sidestepping the
 // header-emits-&mut-as-const defect (Sentinel-lang R3). Each export's record format is
 // documented above it. The C++ fallbacks (MainWindow.cpp::parseDiag, Signing.h::
-// loadTrust/readSig, Project.h::loadProject/saveProject) stay byte-identical, each
-// guarded by a tests/ cross-check.
+// loadTrust/readSig, Project.h::loadProject/saveProject, Seal.h::readSealHeader/
+// readSealArchive) stay byte-identical, each guarded by a tests/ cross-check.
 //
-// ONE DELIBERATE DIVERGENCE, in save_manifest only: it is BYTE-TRANSPARENT, while the C++
-// saveProject round-trips the file through UTF-16 (readUtf8 calls MultiByteToWideChar
-// without MB_ERR_INVALID_CHARS), so the C++ rewrites every invalid UTF-8 byte to U+FFFD
-// and this does not. It surfaces only on bytes inside a line the writer does not rewrite
-// — a Latin-1 comment, an unmodeled value. Sentinel's behaviour is the better one, so it
-// is kept rather than bug-compatibly broken; the cross-check feeds valid UTF-8, where the
-// two agree exactly.
+// TWO DELIBERATE DIVERGENCES, both stated at the site rather than left to be found:
+//
+//   save_manifest is BYTE-TRANSPARENT, while the C++ saveProject round-trips the file
+//   through UTF-16 (readUtf8 calls MultiByteToWideChar without MB_ERR_INVALID_CHARS), so
+//   the C++ rewrites every invalid UTF-8 byte to U+FFFD and this does not. It surfaces
+//   only on bytes inside a line the writer does not rewrite — a Latin-1 comment, an
+//   unmodeled value. Sentinel's behaviour is the better one, so it is kept rather than
+//   bug-compatibly broken; the cross-check feeds valid UTF-8, where the two agree exactly.
+//
+//   seal_unsafe_rel applies the traversal guard to the UTF-8 BYTES, while the C++
+//   sealUnsafeRelPath applies it to the UTF-16 form after folding '/' to '\'. The two
+//   cannot disagree — every UTF-8 continuation byte is >= 0x80, so a separator, a colon
+//   or a dot can only appear as itself — and the argument is written out in full above
+//   seal_unsafe_rel.
 
 // ---- shared helpers ---------------------------------------------------------
 
@@ -1499,5 +1516,447 @@ export "C" fn parse_appcast(body: &[u8], mine: &[u8]) -> [u8] {
     // The version bytes ONLY when valid. An invalid version is not returned at all, so
     // the host has nothing to show, log or persist even if it forgot to check `valid`.
     if valid { push_lenpref(&mut out, body, va, vb); 0 } else { push_le8(&mut out, 0); 0 };
+    vec_to_array(out)
+}
+
+// ---- sealed-container FRAMING (the .sealed reader) --------------------------
+//
+// The seventh and eighth exports, and the first two that read a BINARY container
+// rather than text: the `.sealed` project format's header, its unlock-slot table and
+// its archive index. The on-disk layout is documented at the top of src/core/Seal.h.
+//
+// WHAT THIS IS NOT: THE SEAL CRYPTO. No password, no salt-derived key, no DEK and
+// nothing else that must be wiped ever crosses this boundary. The host keeps doing
+// PBKDF2-HMAC-SHA256 and AES-256-GCM in CNG exactly as it did. The crypto core is
+// blocked on a real language gap — docs/Sentinel-lang_request.md R1, there is no way
+// to secure-zero a `[secret u8]`, so moving key handling out of SecureZeroMemory's
+// reach would be a net security REGRESSION, not a port. What moves here is the half
+// with no secret in it: these two exports read attacker-chosen bytes and hand back
+// BYTE OFFSETS — to the salt, the wrapped DEK, the nonces, the tags, and each file's
+// data — which the host then feeds to the same CNG calls as before.
+//
+// WHY THIS CODE. It was the last place in the IDE where attacker-chosen bytes were
+// interpreted by hand-rolled pointer arithmetic BEFORE anything was authenticated. A
+// `.sealed` file is fully attacker-controlled — the feature exists precisely so that
+// someone can SEND you a sealed project — and GCM proves only that the bytes did not
+// change in transit, not that whoever sealed them meant well. Phase 31 found five
+// real defects in this framing, three of them integer/bounds ones; the C++ carries
+// hand-written mitigations for the wrapping ones, and those properties are preserved
+// here rather than re-derived.
+//
+// TWO EXPORTS, BECAUSE THEY RUN AT DIFFERENT TIMES. The header is parsed BEFORE
+// anything is decrypted (it is what tells the host where the salt and the wrapped DEK
+// are). The archive index only exists AFTER the DEK has been unwrapped and the
+// payload decrypted and decompressed. They cannot be one call.
+//
+// THREE PROPERTIES THAT ARE LOAD-BEARING HERE:
+//
+//  1. THERE IS NO `u64` IN SENTINEL. The scalar integers are i64/i32/u8/u128 (checked
+//     against crates/sentinel-types: `Type::I64 | I32 | U8 | U128 | F64 | Bool`; the
+//     library has no u64 anywhere). Every length in this container is a u64 on disk,
+//     so a hostile `archive_size`, `payload_len` or `data_len` of 2^63 or more reads
+//     back NEGATIVE. `rd_u64` below therefore refuses the value rather than returning
+//     a wrapped one, and every caller tests for that refusal before the number is used
+//     in any comparison. (u128 would hold the value, but the right answer is refusal:
+//     a length that cannot be a length is a lying file, not a big file.)
+//
+//  2. BOUNDS ARE WRITTEN `remaining < want`, NEVER `pos + want > size`. The additive
+//     form wraps on a length that came off disk and then passes. The C++ says so at
+//     both of its sites (Seal.h:222-223 and :321-322) and the property is kept here.
+//     `pos` only ever advances by an amount already checked, so `n - pos` is never
+//     negative and the subtractive form cannot itself wrap.
+//
+//  3. THE `..` TEST IS PER COMPONENT, NEVER A SUBSTRING. `notes..txt` and `v1..2.md`
+//     are ordinary file names; phase 31 found the substring form aborting an entire
+//     unseal over one of them, which is a denial of the whole feature, not a guard.
+//
+// ONE ORDERING IMPROVEMENT OVER THE C++, and it is deliberate. sealExtractArchive
+// interleaved parsing with writing: it wrote each file as it went, so an archive whose
+// 500th entry was `..\evil` had already dropped 499 files into the destination before
+// it aborted. parse_seal_archive validates the WHOLE index — every bound, every path —
+// and returns only then, so the host writes nothing at all for an archive it will
+// reject. Nothing is written before everything is checked.
+//
+// Reason codes. Each maps to a message unsealProject ALREADY had; this port invents no
+// new user-facing string.
+//   parse_seal_header
+//     0  ok
+//     1  bad magic, or shorter than the magic  -> "Not a sealed project (bad header)."
+//     2  fixed header truncated                -> "Sealed file is truncated."
+//     3  unsupported version / aead_alg        -> "Unsupported sealed-file version/algorithm."
+//     4  slot header truncated                 -> "Sealed file is truncated (slots)."
+//     5  v1 slot type that cannot be stepped   -> "Unsupported unlock-slot type (newer IDE?)."
+//     6  slot body truncated                   -> "Sealed file is truncated (slot body)."
+//     7  payload header truncated              -> "Sealed file is truncated (payload)."
+//     8  payload body truncated                -> "Sealed file is truncated (payload body)."
+//     9  archive_size not plausible            -> "Not a sealed project (bad header)."  (NEW)
+//    10  slot_count above the ceiling          -> "Not a sealed project (bad header)."  (NEW)
+//   parse_seal_archive — every code is the C++'s single "bad archive" outcome, kept
+//   apart only so the cross-check can name which bound fired:
+//     0 ok · 1 shorter than the file count · 2 truncated · 3 unsafe path · 4 data_len >= 2^63
+
+// Read 4 little-endian bytes at `off` as an i64. A u32 is at most 4294967295, which
+// always fits, so this cannot fail and cannot overflow. Out of range reads 0 — every
+// call site has already bounds-checked, and this is the belt to that brace.
+fn rd_u32(f: &[u8], n: i64, off: i64) -> i64 {
+    let mut v: i64 = 0;
+    if off >= 0 && off <= n - 4 {
+        let mut i: i64 = 3;
+        while i >= 0 {
+            v = v * 256 + ((*f)[off + i] as i64);
+            i = i - 1;
+        }
+        0
+    } else { 0 };
+    v
+}
+
+// Read 8 little-endian bytes at `off` as a NON-NEGATIVE i64, or -1 when the value does
+// not fit one. This is property 1 above, in one place.
+//
+// The top byte is tested BEFORE the accumulate, not after: with `(*f)[off+7] < 128`
+// established, the running value is at most 0x7FFFFFFFFFFFFF before the last multiply,
+// so `v * 256 + b` cannot overflow for ANY input. Detecting the overflow afterwards
+// would mean performing it first, and this function must be total.
+//
+// -1 is the refusal, and it is unambiguous: every field this reads is a length or a
+// size, so a real one is >= 0. Callers test `< 0` and stop; they never clamp. A clamped
+// length is a number the file never stated, and here that number decides how many bytes
+// get read out of a buffer.
+//
+// The bound is `off <= n - 8`, never `off + 8 <= n` — see property 2.
+fn rd_u64(f: &[u8], n: i64, off: i64) -> i64 {
+    let mut v: i64 = 0 - 1;
+    if off >= 0 && off <= n - 8 && ((*f)[off + 7] as i64) < 128 {
+        v = 0;
+        let mut i: i64 = 7;
+        while i >= 0 {
+            v = v * 256 + ((*f)[off + i] as i64);
+            i = i - 1;
+        }
+        0
+    } else { 0 };
+    v
+}
+
+// parse_seal_header(file) -> record
+//
+// Replaces the parsing half of Seal.h::unsealProject (:316-360). Validates the magic,
+// the version and the AEAD algorithm id, reads `archive_size` and the slot count, then
+// walks the slot table and returns one record per slot: {type, body_offset, body_len}.
+// The host does every byte of crypto from those offsets.
+//
+// v1 vs v2 IS THE WHOLE POINT OF THE SLOT WALK. v1 has no `slot_len`, so its only
+// navigable slot type is the password one and anything else is fatal — that is the
+// defect v2 exists to fix. v2 carries `slot_len`, so an unknown slot type MUST be
+// STEPPED OVER, not refused: skipping what you do not understand is the property that
+// lets a keyfile/Ed25519/TPM slot be added later without re-encrypting anything.
+//
+// The record:
+//   byte 0            reason (above)
+//   i64               version
+//   i64               archive_size
+//   i64               slot_count  — also the number of triples that follow
+//   i64               payload_nonce_offset
+//   i64               payload_offset
+//   i64               payload_len
+//   i64               payload_tag_offset
+//   slot_count * { i64 slot_type, i64 body_offset, i64 body_len }
+//
+// The payload fields are part of the header parse because the payload nonce, length
+// and tag sit immediately after the slot table — the host would otherwise have to
+// re-derive the end of the table from the last slot record, which is the same pointer
+// arithmetic this export exists to take away from it.
+export "C" fn parse_seal_header(f: &[u8]) -> [u8] {
+    let n: i64 = len(*f);
+
+    // Function-scope state: Sentinel has no early `return`, so every outcome is decided
+    // here and encoded once at the end.
+    let mut reason: i64 = 0;
+    let mut ver: i64 = 0;
+    let mut arcsz: i64 = 0;
+    let mut nslots: i64 = 0;
+    let mut pnonce: i64 = 0;
+    let mut poff: i64 = 0;
+    let mut plen: i64 = 0;
+    let mut ptag: i64 = 0;
+    let mut recs: Vec<u8> = vec_new();
+
+    // `&&` short-circuits, so the length test guards lit_eq's eight indexes.
+    let v2: bool = n >= 8 && lit_eq(f, 0, 8, "SNTSEAL2");
+    let v1: bool = n >= 8 && lit_eq(f, 0, 8, "SNTSEAL1");
+    if v1 == false && v2 == false { reason = 1; 0 } else { 0 };
+
+    let mut pos: i64 = 8;
+    if reason == 0 && n - pos < 20 { reason = 2; 0 } else { 0 };
+    if reason == 0 {
+        ver = rd_u32(f, n, pos);
+        let alg: i64 = rd_u32(f, n, pos + 4);
+        let asz: i64 = rd_u64(f, n, pos + 8);
+        let sc: i64 = rd_u32(f, n, pos + 16);
+        pos = pos + 20;
+
+        // Version/alg is checked BEFORE the archive_size range test, so a file that is
+        // wrong in both ways still reports what the C++ reported.
+        let want: i64 = if v2 { 2 } else { 1 };
+        if ver != want || alg != 1 { reason = 3; 0 } else { 0 };
+
+        // THE ARCHIVE-SIZE PLAUSIBILITY BOUND. `archive_size` is the output-buffer size
+        // handed to sealDecompress. In a v2 file the 24-byte prefix is bound in as GCM
+        // AAD, so a tampered value fails authentication first; in a v1 file it is
+        // authenticated by nothing at all — the exposure v2 was created to close, and
+        // which v1 files still carry because they are still read.
+        //
+        // REFUSING ONLY `< 0` WAS NOT ENOUGH, and saying so is the point: a 206-byte
+        // container stating 64 GiB was measured committing 65,667 MB of private bytes
+        // and 14 seconds before failing, and at the top of the accepted range the
+        // std::bad_alloc escaped unsealProject entirely. Authentication cannot help —
+        // the attacker is the SEALER, not a tamperer, which is the whole threat model
+        // of "someone sent me a sealed project".
+        //
+        // So the size must be plausible for the container it arrived in. Two bounds,
+        // and the ratio is the one doing the work: no compressor turns 206 bytes into
+        // gigabytes, so a claim that far out of step with the file is a lying file.
+        // The floor keeps small-but-real containers working regardless of ratio, and
+        // the absolute cap is well above any source tree anyone seals.
+        let cap_abs: i64 = 2147483648;            // 2 GiB
+        let cap_floor: i64 = 67108864;            // 64 MiB, allowed whatever the ratio
+        let mut allow: i64 = n * 1024;            // n is the container size; no overflow
+        if allow < cap_floor { allow = cap_floor; 0 } else { 0 };
+        if allow > cap_abs { allow = cap_abs; 0 } else { 0 };
+        if reason == 0 && (asz < 0 || asz > allow) { reason = 9; 0 } else { 0 };
+        if reason == 0 { arcsz = asz; 0 } else { 0 };
+
+        // THE SLOT-COUNT CEILING. unsealProject runs a full PBKDF2 per password-type
+        // slot until one unlocks, so a WRONG password runs every one of them — and the
+        // attacker guarantees the wrong-password path simply by not giving you the
+        // right one. Measured: 200 slots in an 18 KB file took 18.7 seconds on the UI
+        // thread; a 1 MB file holds ~11,400 slots, about 17.7 minutes, with no progress
+        // and no cancel. Phase 31 bounded `iters` because "above the ceiling is a hang
+        // dressed up as a password prompt"; this is the same hang by another route, and
+        // bounding iters alone never closed it.
+        //
+        // 64 is far above anything real — LUKS, the design this borrows its slot table
+        // from, has 8 — and far below anything that costs a user their afternoon.
+        let max_slots: i64 = 64;
+        if reason == 0 && sc > max_slots { reason = 10; 0 } else { 0 };
+
+        let mut i: i64 = 0;
+        while reason == 0 && i < sc {
+            // v1: slot_type only. v2: slot_type + slot_len.
+            let hdr: i64 = if v2 { 8 } else { 4 };
+            if n - pos < hdr { reason = 4; 0 } else { 0 };
+            let mut ty: i64 = 0;
+            let mut slen: i64 = 84;              // kPasswordSlotLen — v1's only shape
+            if reason == 0 {
+                ty = rd_u32(f, n, pos);
+                pos = pos + 4;
+                if v2 {
+                    slen = rd_u32(f, n, pos);
+                    pos = pos + 4;
+                    0
+                } else {
+                    // v1 has no slot_len, so a slot it does not understand cannot be
+                    // stepped over and the read has to stop. Not a v2 outcome.
+                    if ty != 1 { reason = 5; 0 } else { 0 };
+                    0
+                };
+                0
+            } else { 0 };
+            if reason == 0 && n - pos < slen { reason = 6; 0 } else { 0 };
+            if reason == 0 {
+                // EVERY slot is emitted, understood or not, and `pos` ALWAYS advances by
+                // slot_len. v1's reader exited this loop the moment it unlocked, without
+                // advancing past the slots it had not read, so the payload read began
+                // inside the next slot body — latent only because v1 always wrote
+                // exactly one slot. Handing back a record per slot and letting the host
+                // pick makes that class of bug unrepresentable: there is no "stop early"
+                // to get wrong.
+                push_le8(&mut recs, ty);
+                push_le8(&mut recs, pos);
+                push_le8(&mut recs, slen);
+                pos = pos + slen;
+                nslots = nslots + 1;
+                0
+            } else { 0 };
+            i = i + 1;
+        }
+
+        // payload_nonce(12) | payload_len:u64 | payload | payload_tag(16)
+        if reason == 0 && n - pos < 20 { reason = 7; 0 } else { 0 };
+        if reason == 0 {
+            pnonce = pos;
+            let pl: i64 = rd_u64(f, n, pos + 12);
+            pos = pos + 20;
+            // pl < 0 is a payload_len of 2^63 or more. The other two are the C++'s own
+            // pair of tests, in its order, in the subtractive form.
+            if pl < 0 || pl > n - pos || (n - pos) - pl < 16 { reason = 8; 0 }
+            else { poff = pos; plen = pl; ptag = pos + pl; 0 };
+            0
+        } else { 0 };
+        0
+    } else { 0 };
+
+    let rarr: [u8] = vec_to_array(recs);
+    let rn: i64 = len(rarr);
+    let mut out: Vec<u8> = vec_new();
+    push(&mut out, i64_to_u8(reason));
+    push_le8(&mut out, ver);
+    push_le8(&mut out, arcsz);
+    push_le8(&mut out, nslots);
+    push_le8(&mut out, pnonce);
+    push_le8(&mut out, poff);
+    push_le8(&mut out, plen);
+    push_le8(&mut out, ptag);
+    push_bytes(&mut out, &rarr, 0, rn);
+    vec_to_array(out)
+}
+
+// Is the archive-relative path in a[s..e) unsafe to write under the destination root?
+// Replaces Seal.h::sealUnsafeRelPath (:205-217). Rejected: empty, rooted (a leading
+// '/' or '\'), any ':' anywhere, and any component that is exactly "..".
+//
+// THE ".." TEST IS PER COMPONENT. A substring search also rejects `notes..txt` and
+// `v1..2.md`, and because one bad path aborts the whole extraction, that is not a
+// tightening — it is the entire unseal failing over a file that was never a traversal
+// attempt. Phase 31 found exactly that.
+//
+// ONE DELIBERATE DIVERGENCE FROM THE C++, stated here rather than left to be
+// rediscovered (the same courtesy save_manifest's divergence gets at the top of this
+// file). The C++ runs this guard on the UTF-16 string, AFTER MultiByteToWideChar and
+// AFTER folding '/' to '\'. This runs on the UTF-8 bytes, before either. For the
+// separator and ".." rules the two cannot disagree:
+//   * every byte of a multi-byte UTF-8 sequence is >= 0x80, so '\' (0x5C), '/' (0x2F),
+//     ':' (0x3A) and '.' (0x2E) can only ever appear as themselves — no character
+//     encodes to a sequence that CONTAINS one of them;
+//   * MultiByteToWideChar without MB_ERR_INVALID_CHARS maps an invalid sequence to
+//     U+FFFD, which is not a separator, a colon or a dot — so a byte string cannot be
+//     safe here and become dangerous there.
+// The bytes are also the stronger place to check: this is the form the guard runs on
+// before anything has re-encoded it. Both separators are treated as separators here,
+// which is what the C++'s fold to '\' amounts to.
+//
+// THE COLON IS THE ONE RULE WHERE "BYTE 1" AND "CHARACTER 1" ARE NOT THE SAME QUESTION,
+// so it is not asked that way. The C++ tests `p[1] == ':'` on UTF-16 — the second
+// CHARACTER. On UTF-8 bytes, a path whose first character is multi-byte has a
+// continuation byte at index 1, so a byte-indexed version of that test would miss
+// `é:foo` (which the C++ catches) and would need MultiByteToWideChar's exact behaviour
+// on malformed input to line up, which is not reproducible here. So the colon is
+// refused ANYWHERE instead:
+//   * it cannot cost a real file — ':' is not a legal character in a Windows filename,
+//     and every path in a `.sealed` archive came from FindFirstFileW walking a Windows
+//     directory, so no name that could be sealed can contain one;
+//   * it is strictly safer than the position-1 test it replaces, which let `ab:c`
+//     through — a path that writes an NTFS ALTERNATE DATA STREAM `c` on a zero-length
+//     file `ab`, i.e. content that a tree walk of the unsealed project does not show.
+// This is a tightening, not a transcription, and seal_xcheck declares it as one.
+fn seal_unsafe_rel(a: &[u8], s: i64, e: i64) -> bool {
+    let mut bad: bool = e - s < 1;                                       // empty
+    if bad == false {
+        let c0: u8 = (*a)[s];
+        if c0 == '\\' || c0 == '/' { bad = true; 0 } else { 0 };         // rooted
+        let mut ci: i64 = s;                                             // any ':' at all
+        while ci < e {
+            if (*a)[ci] == ':' { bad = true; 0 } else { 0 };
+            ci = ci + 1;
+        }
+        let mut start: i64 = s;
+        let mut walking: bool = true;
+        while walking && start <= e {
+            let mut q: i64 = start;
+            let mut sep: i64 = 0 - 1;
+            while q < e && sep < 0 {
+                if (*a)[q] == '\\' || (*a)[q] == '/' { sep = q; 0 } else { q = q + 1; 0 };
+            }
+            let end: i64 = if sep < 0 { e } else { sep };
+            // Exactly "..", not "contains ..". `&&` short-circuits, so the length test
+            // guards both indexes — an empty trailing component reads nothing.
+            if end - start == 2 && (*a)[start] == '.' && (*a)[start + 1] == '.' {
+                bad = true;
+                0
+            } else { 0 };
+            if sep < 0 { walking = false; 0 } else { start = sep + 1; 0 };
+        }
+        0
+    } else { 0 };
+    bad
+}
+
+// parse_seal_archive(archive) -> record
+//
+// Replaces the parsing half of Seal.h::sealExtractArchive (:219-241) plus
+// sealUnsafeRelPath (:205-217). The archive is the DECRYPTED, decompressed blob:
+//   file_count:u32 | { path_len:u32 | path(utf8, '/'-separated) | data_len:u64 | data } *
+// It is still attacker-chosen — authenticated means "the sealer's bytes", not "a
+// friendly sealer's bytes" — so every field is bounds-checked and every path is
+// guarded before a single byte is written.
+//
+// The record:
+//   byte 0     reason (above)
+//   i64        file_count — the number of entries that follow
+//   file_count * { i64 data_offset, i64 data_len, i64 path_len, path bytes }
+//
+// Paths come back with '/' folded to '\', so the host writes what it is given: the
+// bytes that were guarded and the bytes that get written are the same bytes.
+export "C" fn parse_seal_archive(a: &[u8]) -> [u8] {
+    let n: i64 = len(*a);
+
+    let mut reason: i64 = 0;
+    let mut nfiles: i64 = 0;
+    let mut recs: Vec<u8> = vec_new();
+
+    if n < 4 { reason = 1; 0 } else { 0 };
+    if reason == 0 {
+        let count: i64 = rd_u32(a, n, 0);
+        let mut pos: i64 = 4;
+        let mut i: i64 = 0;
+        // `count` is a u32 and could claim four billion files, but every iteration that
+        // does not stop consumes at least twelve bytes of the archive, so a short blob
+        // stops at its first truncated field. Same bound the C++ loop has.
+        while reason == 0 && i < count {
+            if n - pos < 4 { reason = 2; 0 } else { 0 };
+            let mut pl: i64 = 0;
+            if reason == 0 { pl = rd_u32(a, n, pos); pos = pos + 4; 0 } else { 0 };
+            if reason == 0 && n - pos < pl { reason = 2; 0 } else { 0 };
+            let pa: i64 = pos;
+            let mut pb: i64 = pos;
+            if reason == 0 { pb = pos + pl; pos = pb; 0 } else { 0 };
+            if reason == 0 && n - pos < 8 { reason = 2; 0 } else { 0 };
+            let mut dl: i64 = 0;
+            if reason == 0 { dl = rd_u64(a, n, pos); pos = pos + 8; 0 } else { 0 };
+            // A data_len of 2^63 or more. The C++ compared it as a u64 against the bytes
+            // remaining and refused it too — the failure mode this closes is the one the
+            // i64 world creates, where the same value reads NEGATIVE and would sail
+            // under every `dl > remaining` test written the obvious way.
+            if reason == 0 && dl < 0 { reason = 4; 0 } else { 0 };
+            if reason == 0 && dl > n - pos { reason = 2; 0 } else { 0 };
+            // Guard order matches the C++: the length bound first, then the path.
+            if reason == 0 && seal_unsafe_rel(a, pa, pb) { reason = 3; 0 } else { 0 };
+            if reason == 0 {
+                push_le8(&mut recs, pos);
+                push_le8(&mut recs, dl);
+                push_le8(&mut recs, pb - pa);
+                let mut k: i64 = pa;
+                while k < pb {
+                    let c: u8 = (*a)[k];
+                    // '/' -> '\': native separators, as the C++ does before it writes.
+                    if c == '/' { push(&mut recs, i64_to_u8(92)); 0 } else { push(&mut recs, c); 0 };
+                    k = k + 1;
+                }
+                pos = pos + dl;
+                nfiles = nfiles + 1;
+                0
+            } else { 0 };
+            i = i + 1;
+        }
+        0
+    } else { 0 };
+
+    let rarr: [u8] = vec_to_array(recs);
+    let rn: i64 = len(rarr);
+    let mut out: Vec<u8> = vec_new();
+    push(&mut out, i64_to_u8(reason));
+    push_le8(&mut out, nfiles);
+    push_bytes(&mut out, &rarr, 0, rn);
     vec_to_array(out)
 }

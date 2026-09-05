@@ -250,6 +250,22 @@ static void check(const char* name, const std::string& body, const std::string& 
     if (ok) pass++; else fail++;
 }
 
+// The last dotted component of a version, or -1 if there isn't a numeric one. Used only
+// to build "one build older" / "one build newer" out of whatever the feed publishes.
+static long long lastComponent(const std::string& v) {
+    const size_t dot = v.find_last_of('.');
+    const std::string tail = (dot == std::string::npos) ? v : v.substr(dot + 1);
+    if (tail.empty()) return -1;
+    long long n = 0;
+    for (char c : tail) { if (c < '0' || c > '9') return -1; n = n * 10 + (c - '0'); }
+    return n;
+}
+static std::string bumpLast(const std::string& v, int delta) {
+    const size_t dot = v.find_last_of('.');
+    const std::string head = (dot == std::string::npos) ? std::string() : v.substr(0, dot + 1);
+    return head + std::to_string(lastComponent(v) + delta);
+}
+
 static bool readFileBytes(const char* path, std::string& out) {
     FILE* fp = nullptr;
     if (fopen_s(&fp, path, "rb") != 0 || !fp) return false;
@@ -374,6 +390,13 @@ int main(int argc, char** argv) {
           "offers; nothing is newer than a version we cannot read");
 
     // ---- 23-25: the real published feed ------------------------------------
+    // The published version is READ OUT of the feed, not pinned here as a literal. It
+    // was pinned once, and the release that bumped appcast.xml to 0.1.13.202 turned this
+    // test red without changing anything it is about — a maintenance trap that fires
+    // every release. What these three cases actually assert is the RELATION: the
+    // published version is well-formed, the same version is not an update, one build
+    // older is, one build newer is not. The extraction is oracle::appcastVersion, so the
+    // string never comes from the code under test.
     {
         const char* path = argc > 1 ? argv[1] : "appcast.xml";
         std::string body;
@@ -381,12 +404,21 @@ int main(int argc, char** argv) {
             printf("[FAIL] could not read the real appcast at \"%s\" — pass its path as argv[1]\n", path);
             fail++;
         } else {
-            check("23 real appcast.xml, same version (no update)", body, "0.1.12.196",
-                  true, true, false, "0.1.12.196", Rel::Parity, "");
-            check("24 real appcast.xml, older build (update)", body, "0.1.12.195",
-                  true, true, true, "0.1.12.196", Rel::Parity, "");
-            check("25 real appcast.xml, newer build (no update)", body, "0.1.13.0",
-                  true, true, false, "0.1.12.196", Rel::Parity, "");
+            const std::string pub = oracle::appcastVersion(body);
+            const long long last = lastComponent(pub);
+            if (!fallback::acVersionValid(pub) || last < 1) {
+                printf("[FAIL] the published feed's sparkle:version is \"%s\" — not a version this "
+                       "build could ever offer, or a build number below 1\n", pub.c_str());
+                fail++;
+            } else {
+                printf("       (published feed says %s)\n", pub.c_str());
+                check("23 real appcast.xml, same version (no update)", body, pub,
+                      true, true, false, pub.c_str(), Rel::Parity, "");
+                check("24 real appcast.xml, older build (update)", body, bumpLast(pub, -1),
+                      true, true, true, pub.c_str(), Rel::Parity, "");
+                check("25 real appcast.xml, newer build (no update)", body, bumpLast(pub, +1),
+                      true, true, false, pub.c_str(), Rel::Parity, "");
+            }
         }
     }
 

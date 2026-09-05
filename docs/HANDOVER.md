@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–47 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–48 built and verified.
 
 ---
 
@@ -72,7 +72,7 @@ exist so far:
 | `src/host/win32/SaveChangesDialog.{h,cpp}` | Themed modal **Save / Don't Save / Cancel** prompt for unsaved edits (class `SentinelSaveDlg`). Driven by `MainWindow.cpp::confirmSaveIfDirty` — the single choke point every discarding path goes through (phase 39). |
 | `src/core/Seal.h` | **Project sealing** (ADR-style): archive → LZMS-compress → AES-256-GCM under a random DEK, wrapped per password slot (PBKDF2-HMAC-SHA256). LUKS-like extensible unlock slots — **format v2** (`SNTSEAL2`): slots carry `slot_len` so unknown types are skipped, and the 24-byte header prefix is AEAD-bound as AAD. Reads v1. Native CNG; the AEAD+KDF core is a Sentinel-rewrite target. |
 | `tests/seal_test.cpp` | Tests the `.sealed` format: one case per defect + a v1 back-compat case (25 assertions). `cmake --build build --target seal_test` or `ctest`. |
-| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38, 47). `parsers.sentinel` = **six** `export "C"` entry points — five readers (diagnostic, trust manifest, `.sig` carrier, project manifest, **update appcast**) and the manifest writer — built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject` / `saveProject` / `Updater.cpp::readAppcast`. Every file reader in the IDE, plus the one NETWORK reader. About box shows the % in Sentinel. |
+| `src/sentinel/` | **Product logic written *in* Sentinel, compiled into the binary** (phases 35–38, 44, 47, 48). `parsers.sentinel` = **eight** `export "C"` entry points — seven readers (diagnostic, trust manifest, `.sig` carrier, project manifest, **update appcast**, **sealed-container header**, **sealed archive index**) and the manifest writer — built to `build/generated/parsers.lib` (one C-ABI lib, ADR 0059) and called from `parseDiag` / `loadTrust` / `readSig` / `loadProject` / `saveProject` / `Updater.cpp::readAppcast` / `Seal.h::readSealHeader` / `Seal.h::readSealArchive`. Every file reader in the IDE, the one NETWORK reader, and the one fully attacker-chosen BINARY container. The seal CRYPTO is deliberately NOT here (R1, secure-zero). About box shows the % in Sentinel. |
 | `tests/*_xcheck.cpp` | Prove each Sentinel parser stays byte-identical to its C++ oracle: `diag` (11), `trust` (12), `sig` (12), `manifest` (14). **`appcast` (25) is the exception** — its oracle had two real defects (an unbounded `int` accumulate, no validation at all), so it asserts the NEW behaviour where the old C++ was wrong and declares each divergence; a parity test there would have pinned the bugs. Plus `seal_test`. `ctest --test-dir build`. |
 | `src/core/FileAssoc.h` | Per-user (`HKCU\Software\Classes`) file associations for `.sntproject`/`.sentinel` → open in this exe (`registerFileAssociations`; ≡ ▸ Register File Associations…). |
 | `src/core/Proc.h` | `runCapture` (synchronous run-and-capture) + `stripAnsi` |
@@ -205,7 +205,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## Prototype status — phases 1–47 (all done; screenshots cover 1–11, 13, 15 — see note below)
+## Prototype status — phases 1–48 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
 1. **Themed shell** — DWM dark titlebar, `≡` popup menu, dark/coral identity, status bar.
 2. **Real controls** — dark `WC_TREEVIEW` + RichEdit editor, draggable splitter, Open Project (`IFileOpenDialog`).
@@ -1366,10 +1366,92 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     and each case declares Parity or **Diverges** with a reason. A Diverges case FAILS if the two
     ever agree again, so the old behaviour cannot be quietly restored and stay green. Also pinned:
     `0.1.9` vs `0.1.10` (the trap the v0.1.10 release row calls out), `0.1.6 == 0.1.6.0`, a GitHub
-    404 page as the body, and the real `appcast.xml` still reading `0.1.12.196`.
+    404 page as the body, and the real `appcast.xml` still parsing as a well-formed version
+    (read out of the feed, not pinned — see phase 48).
     **Verified on the live feed**, not just in the test: a manual ≡ ▸ Check for Updates… on build
     200 fetched `raw.githubusercontent.com` over real HTTPS and reported *"Sentinel-IDE 0.1.12.200
     is up to date"* — the path that silently broke for four releases still works.
+
+48. **The sealed-container FRAMING moves to Sentinel — attacker-chosen bytes, parsed before
+    anything is authenticated.** `parse_seal_header(file)` and `parse_seal_archive(archive)` in
+    `src/sentinel/parsers.sentinel` (exports 7 and 8, the first BINARY readers of the eight)
+    replace the parsing halves of `Seal.h::unsealProject` and `Seal.h::sealExtractArchive`, plus
+    `sealUnsafeRelPath`. **TWO exports because they run at different times**: the header is read
+    BEFORE decryption (it is what says where the salt and the wrapped DEK are); the archive index
+    only exists AFTER the DEK is unwrapped and the payload decrypted. They cannot be one call.
+    **THE CRYPTO DID NOT MOVE, and that is the design, not a compromise.** No password, salt, KEK
+    or DEK crosses the FFI boundary; every CNG call and every `SecureZeroMemory` is untouched.
+    Sentinel gets the bytes that contain no secret and hands back **byte offsets** — to the salt,
+    the wrapped DEK, the nonces, the tags and each file's data — and the host reads from those
+    offsets exactly as it did. The crypto core stays blocked on **R1 (no secure-zero for
+    `[secret u8]`)**, where porting it would be a net security *regression*; the framing has no such
+    problem, which is precisely why it was separable. If a future change finds key material moving
+    into Sentinel, that is a misread of this split.
+    **Why this code and not another reader:** it was the last place in the IDE where
+    attacker-chosen bytes met hand-rolled pointer arithmetic **before anything was authenticated**.
+    A `.sealed` file is fully attacker-controlled — the feature exists so someone can SEND you a
+    sealed project — and GCM proves only that the bytes did not change in transit, not that the
+    sealer was benign. Phase 31 found five real defects here; the wrapping ones carried hand-written
+    mitigations in comments, and those properties are now structural.
+    **Two defects close by construction, and both are asserted as divergences, not parity:**
+    (a) **THERE IS NO `u64` IN SENTINEL** — verified against `crates/sentinel-types` (`I64 | I32 |
+    U8 | U128 | F64 | Bool`) and against the whole of `sentinel_library`, which contains the token
+    `u64` **zero** times. Every length in this container is a u64 on disk, so a hostile
+    `archive_size`, `payload_len` or `data_len` of 2^63 or more reads back NEGATIVE. `rd_u64` tests
+    the top byte BEFORE accumulating, so it cannot overflow for any input at all, and returns −1
+    rather than a wrapped value; callers refuse, never clamp. For `archive_size` that is a
+    **behaviour change**: the shipped reader accepted `0xFFFFFFFFFFFFFFFF` and handed it to
+    `sealDecompress` as the output-buffer size — measured end-to-end, the ported build now answers
+    *"Not a sealed project (bad header)"* instead. In a v2 file the AAD would have caught it; a v1
+    file has no AAD at all, and v1 files are still read.
+    (b) **NOTHING IS WRITTEN UNTIL EVERYTHING IS CHECKED.** `sealExtractArchive` parsed and wrote in
+    one loop, so an archive whose last entry was `..\evil` had already dropped every earlier file
+    into the destination before it refused — and `openSealedProject`'s failure cleanup is a
+    `RemoveDirectoryW`, which only removes an EMPTY directory, so they stayed. The parse now
+    validates the whole index — every bound, every path — and the host writes only after it returns
+    clean. Measured: the shipped extractor left 3 files behind on that archive; the port leaves 0.
+    (c) **THE COLON IS REFUSED ANYWHERE**, not only at position 1 as the pre-port guard had it.
+    Measured: `ab:c` passed that guard, and on NTFS it writes an ALTERNATE DATA STREAM `c` on a
+    zero-length file `ab` — content a tree walk of the unsealed project never shows. It cannot cost
+    a real file (':' is illegal in a Windows filename, and every archived path came from
+    `FindFirstFileW` walking a Windows directory), and it is also the one rule where "second byte"
+    and "second character" are different questions, so asking it this way is what makes the UTF-8
+    guard exactly as strong as the UTF-16 one instead of nearly so.
+    **The `..` test is PER COMPONENT**, and stays that way: `notes..txt`, `v1..2.md` and
+    `sub\ok..name.txt` all still unseal (the phase-31 regression, re-pinned in both tests), while
+    `..`, `../evil.txt`, `sub/../../x`, rooted and drive-qualified paths are refused.
+    **One documented divergence at the site:** the C++ guard runs on the UTF-16 string after folding
+    `/` to `\`; Sentinel guards the UTF-8 bytes. For the separator and `..` rules they cannot
+    disagree — every UTF-8 continuation byte is ≥ 0x80, so `\`, `/`, `:` and `.` can only appear as
+    themselves, and `MultiByteToWideChar` without `MB_ERR_INVALID_CHARS` maps an invalid sequence to
+    U+FFFD, never to a separator. The colon was the one rule where a byte-indexed test would NOT have
+    matched (a multi-byte first character puts a continuation byte at index 1), which is why (c)
+    above asks it differently rather than transcribing it. Argued in full above `seal_unsafe_rel`,
+    following `save_manifest`'s precedent.
+    **Failure is a reason CODE, not a string**: `sealHeaderMessage` maps each to a message
+    `unsealProject` already had, so the port added **no new user-facing text**. Payload-framing
+    failures are deliberately held back until after the unlock attempt, so a file that is both
+    truncated and given the wrong password still says "wrong password" — the order the messages came
+    out in before.
+    `tests/seal_xcheck.cpp` (**53 cases**, `ctest -R seal_parity`) reuses `seal_test.cpp`'s corpus
+    directly — it seals a real three-file tree with the real `sealProject`, then patches bytes at the
+    same named offsets — and runs THREE implementations on every case: the shipped C++ at 72a6b82 as
+    oracle, `Seal.h`'s own `#else` fallback, and Sentinel. Each case declares Parity or **Diverges**
+    with a reason, and a Diverges case FAILS if the two ever agree again. The archive cases compare
+    the **directory tree each side leaves behind**, not just the verdict, because (b) differs only in
+    what got written before the refusal. `tests/seal_test.cpp` (25 assertions) is unchanged and still
+    green against the restructured C++ fallback. **Verified end-to-end on the shipping
+    configuration** (`SENTINELIDE_SENTINEL` + `parsers.lib`), not only in the parity test: an
+    11-file project sealed and unsealed with every path and every SHA-256 identical; a hostile
+    `data_len` of 2^64−1 inside a container that AUTHENTICATES correctly, refused after decryption
+    and before any write; an unknown v2 slot type 99 stepped over with the password slot behind it
+    still unlocking.
+    **Also fixed here, and unrelated to the port:** `tests/appcast_xcheck.cpp` cases 23–25 pinned the
+    published feed as the literal `0.1.12.196`, so the `0.1.13.202` release commit turned
+    `appcast_parity` red without touching anything the test is about — it was already failing at
+    HEAD. Those cases now read the version out of the feed (via the oracle's own extractor, not the
+    code under test) and assert the RELATION: well-formed, same is not an update, one build older is,
+    one build newer is not. A release bump cannot break it again.
 
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
@@ -1608,9 +1690,15 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
   the second port (phase 36) — a real security boundary, and it proved the "one lib, further ports
   nearly free" economics (+8 KB). The `.sig` carrier parser (`Signing.h::readSig`) followed as the third port (phase 37), so every
   signing/trust file parser is now Sentinel. The manifest reader (`Project.h::loadProject`) followed as the fourth port (phase 38), so **every
-  file reader/parser in the IDE is now Sentinel**. The one file-touching path still in C++ is the
-  comment-preserving manifest *writer* (`saveProject`) — a surgical structure-preserving TOML rewrite,
-  the genuinely hard part, deliberately left native. The crypto core stays blocked on R1 (secure-zero).
+  file reader/parser in the IDE is now Sentinel**. `saveProject` — the comment-preserving manifest
+  writer, a surgical structure-preserving TOML rewrite — followed as the fifth (phase 44), the
+  appcast reader as the sixth (phase 47), and the **sealed-container FRAMING** as the seventh and
+  eighth (phase 48): `parse_seal_header` + `parse_seal_archive`, the first BINARY readers, and the
+  last place in the IDE where attacker-chosen bytes met hand-rolled pointer arithmetic before
+  anything was authenticated. The seal **crypto** core stays blocked on R1 (secure-zero) — and note
+  that the framing port was possible precisely BECAUSE it touches no secret: nothing that must be
+  wiped crosses the FFI boundary, Sentinel returns byte offsets and the host keeps doing CNG. Do not
+  read phase 48 as the crypto port having started.
 - **Signing follow-ons (remaining):** surface capability-bound verify failures as Problems; an
   editable trust manifest (policy/grants) beyond add+import; a Settings field for a default signing
   key (today post-build signing uses `sentinel.key` in the project dir).

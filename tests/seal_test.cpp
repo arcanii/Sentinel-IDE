@@ -90,7 +90,14 @@ int main() {
     printf("== 4. header tamper (the v2 AAD property) ==\n");
     {
         Bytes t = sealed;
-        putU64At(t, OFF_ARCHIVE_SIZE, 0x40000000ULL);   // claim a 1 GiB archive
+        // Tamper by ONE BYTE, not to 1 GiB. This case exists to prove the v2 AAD
+        // property — that the header is bound into GCM, so altering it fails
+        // authentication — and a wildly implausible size no longer reaches
+        // authentication at all: the archive_size plausibility bound (Seal.h,
+        // readSealHeader) refuses it first, which would make this test pass for the
+        // wrong reason and stop proving anything about AAD. A value one larger than
+        // the truth is inside every bound and still wrong.
+        putU64At(t, OFF_ARCHIVE_SIZE, getU64(&sealed[OFF_ARCHIVE_SIZE]) + 1);
         sealWriteBytes(base + L"\\hdr.sealed", t.data(), t.size());
         SealResult r = unsealProject(base + L"\\hdr.sealed", base + L"\\t2", pw("correct horse"));
         check(!r.ok, "tampered archive_size rejected (v1 would have honoured it)");

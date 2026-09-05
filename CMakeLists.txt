@@ -112,7 +112,8 @@ target_link_libraries(SentinelIDE PRIVATE
 
 # Sentinel-native parsers (src/sentinel/parsers.sentinel — the diagnostic + trust
 # parsers). scripts\build.bat compiles them to build/generated/parsers.lib via
-# `snc build --lib`; when that lib is present the host's parseDiag / loadTrust / readSig / loadProject call
+# `snc build --lib`; when that lib is present the host's parseDiag / loadTrust / readSig /
+# loadProject / saveProject / readAppcast / readSealHeader / readSealArchive call
 # INTO Sentinel (SENTINELIDE_SENTINEL), otherwise they use the C++ fallbacks. Linking a
 # Sentinel static lib additionally requires these Windows system libs (they satisfy the
 # Rust runtime the lib pulls in — undocumented upstream, filed as R8 in
@@ -123,9 +124,9 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
   target_link_libraries(SentinelIDE PRIVATE
     "${SENTINEL_PARSERS_LIB}"
     legacy_stdio_definitions ntdll userenv ws2_32 dbghelp)
-  message(STATUS "SentinelIDE: diagnostic + trust + sig + manifest parsers = Sentinel (parsers.lib linked)")
+  message(STATUS "SentinelIDE: diag + trust + sig + manifest + appcast + seal-framing parsers = Sentinel (parsers.lib linked)")
 else()
-  message(STATUS "SentinelIDE: diagnostic + trust + sig + manifest parsers = C++ fallback (parsers.lib absent)")
+  message(STATUS "SentinelIDE: diag + trust + sig + manifest + appcast + seal-framing parsers = C++ fallback (parsers.lib absent)")
 endif()
 
 # The .rc embeds app.manifest; stop the linker generating a competing one.
@@ -286,12 +287,13 @@ add_test(NAME d2d_dialect COMMAND d2d_dialect_test
 # the same parsers.lib + system libs the app does.
 #     cmake --build build --target diag_xcheck  &&  build\diag_xcheck.exe
 #     cmake --build build --target trust_xcheck &&  build\trust_xcheck.exe
-# appcast_xcheck is the one exception to "byte-identical": its oracle has two real
-# defects (an unbounded `int` accumulate and no validation at all), so it asserts the
-# NEW behaviour where the old C++ was wrong and declares each divergence explicitly —
-# a test that demanded parity there would be pinning the bugs in place.
+# appcast_xcheck and seal_xcheck are the exceptions to "byte-identical": their oracles
+# have real defects (an unbounded `int` accumulate and no validation at all; a u64 length
+# steering an allocation and files written before the archive was fully checked), so they
+# assert the NEW behaviour where the old C++ was wrong and declare each divergence
+# explicitly — a test that demanded parity there would be pinning the bugs in place.
 if(EXISTS "${SENTINEL_PARSERS_LIB}")
-  foreach(_xc diag_xcheck trust_xcheck sig_xcheck manifest_xcheck saveproject_xcheck appcast_xcheck)
+  foreach(_xc diag_xcheck trust_xcheck sig_xcheck manifest_xcheck saveproject_xcheck appcast_xcheck seal_xcheck)
     add_executable(${_xc} tests/${_xc}.cpp)
     target_link_libraries(${_xc} PRIVATE
       "${SENTINEL_PARSERS_LIB}"
@@ -301,6 +303,8 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
   target_include_directories(manifest_xcheck PRIVATE src/core)  # needs Project.h (C++ oracle)
   target_include_directories(saveproject_xcheck PRIVATE src/core)  # needs Project.h (C++ oracle) + encodeSaveModel
   target_link_libraries(saveproject_xcheck PRIVATE shell32 advapi32)
+  target_include_directories(seal_xcheck PRIVATE src/core)  # needs Seal.h (C++ oracle + the real seal writer)
+  target_link_libraries(seal_xcheck PRIVATE shell32 advapi32)  # SHCreateDirectoryExW; bcrypt/cabinet come from Seal.h's #pragma comment
   add_test(NAME diag_parity  COMMAND diag_xcheck)
   add_test(NAME trust_parity COMMAND trust_xcheck)
   add_test(NAME sig_parity      COMMAND sig_xcheck)
@@ -312,4 +316,8 @@ if(EXISTS "${SENTINEL_PARSERS_LIB}")
   # reads as 0.1.12.196 — so the path is passed in rather than duplicated in the test.
   add_test(NAME appcast_parity COMMAND appcast_xcheck
     "${CMAKE_CURRENT_SOURCE_DIR}/appcast.xml")
+  # seal_xcheck needs no arguments and no repo file: it BUILDS its corpus, sealing a
+  # three-file tree under %TEMP%\sealxcheck with the real sealProject and then patching
+  # bytes at the offsets tests/seal_test.cpp names. Nothing under examples/ is touched.
+  add_test(NAME seal_parity COMMAND seal_xcheck)
 endif()
