@@ -531,6 +531,12 @@ void findBarBufferChanged(HWND bar) {
     FindState* st = state(bar);
     if (!st || !st->open) return;
     if (st->inEdit > 0) return;  // our own replace, still in flight — see FindState::inEdit
+    // DROP A ONE-SHOT NOTE. "Replaced 241" stops being true the instant the buffer moves
+    // under it, and updateCount shows the note INSTEAD of the live count — so a stale one
+    // hides exactly the number the user is now looking for. `note`'s own comment claimed
+    // the next thing the user did would clear it; editing the DOCUMENT is that thing, and
+    // it did not, because only bar input reached the clearing paths.
+    st->note.clear();
     // pick == 0: the user typed in the EDITOR, so the count must follow but the caret is
     // theirs and must not be dragged to a match.
     recompute(st, 0);

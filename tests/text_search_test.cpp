@@ -287,6 +287,39 @@ int main() {
         check(m.textCrlf() == L"a b c", "the CRLF form of a one-line buffer has no CR");
     }
 
+    printf("\n14. replacing WITH a CR cannot put a lone CR in the buffer\n");
+    {
+        // The edge the CR coverage above did not reach: it replaced a break WITH a space,
+        // never with a string CONTAINING a break. replaceRanges was the only writer into
+        // text_ that did not normalise, so this went in raw — and textCrlf expands '\n'
+        // while passing a bare '\r' straight through, so it reached saveFile and landed on
+        // disk as a lone CR. Reloading normalises it back, making the round trip LOSSY;
+        // on examples/crypto.sentinel, a committed SIGNED file that Build auto-saves, that
+        // is a byte change with nobody pressing a key.
+        //
+        // Not reachable from the find bar today (its replace field is a single-line EDIT
+        // that filters CR), but SetWindowTextW and EM_REPLACESEL both get through it, and
+        // the bar already seeds the FIND field that way. The invariant should not depend
+        // on a control's input filtering.
+        EditorModel m;
+        m.setText(L"one two\nthree two\n");
+        check(m.replaceRanges(find(m.text(), L"two"), L"A\rB"), "replaced with a CR-bearing string");
+        check(m.text().find(L'\r') == std::wstring::npos,
+              "the buffer holds NO bare CR - the replacement was normalised");
+        check(m.text() == L"one A\nB\nthree A\nB\n", "...the CR became a line break");
+        size_t lone = 0;
+        const std::wstring disk = m.textCrlf();
+        for (size_t i = 0; i < disk.size(); i++)
+            if (disk[i] == L'\r' && (i + 1 >= disk.size() || disk[i + 1] != L'\n')) lone++;
+        check(lone == 0, "and textCrlf emits no LONE CR - nothing lossy reaches saveFile");
+
+        // A CRLF in the replacement collapses to one break, not two.
+        EditorModel m2;
+        m2.setText(L"x");
+        check(m2.replaceRanges(find(m2.text(), L"x"), L"a\r\nb"), "replaced with a CRLF");
+        check(m2.text() == L"a\nb", "CRLF in a replacement becomes ONE '\\n'");
+    }
+
     printf("\n%d passed, %d failed\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

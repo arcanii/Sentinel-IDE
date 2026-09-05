@@ -223,12 +223,31 @@ bool EditorModel::replaceRanges(const std::vector<Range>& ranges, const std::wst
     // Build first, commit second — the identical-result test below needs the answer before
     // any undo step is pushed, and building into a fresh string is O(n) once rather than
     // O(n) per match (an in-place erase+insert loop shifts the whole tail every time).
+    // NORMALISE THE REPLACEMENT. Every other writer into text_ already does — setText
+    // above, and both of the control's insert paths (clipboard and drop) — because the
+    // buffer's invariant is '\n' ONLY. This function was the exception, and it is the
+    // funnel its own header claims to be, so the gap was invisible.
+    //
+    // What it costs when it is missed: textCrlf() expands '\n' and passes a bare '\r'
+    // straight through, so a CR in the replacement reaches saveFile and lands on disk as
+    // a LONE CR. Reloading normalises it back, which makes the round trip LOSSY — and on
+    // examples/crypto.sentinel, a committed SIGNED file that opens by default and that
+    // Build auto-saves, that is a byte change with nobody pressing a key, and an
+    // invalidated .sig.
+    //
+    // Not reachable from the bar today: its replace field is a single-line EDIT, which
+    // filters WM_CHAR 0x0D and truncates a pasted CRLF. But EM_REPLACESEL and
+    // SetWindowTextW both get through, the bar already calls SetWindowTextW to seed the
+    // FIND field, and a search-history dropdown or an ES_MULTILINE replace box would open
+    // it silently. One line here is cheaper than the invariant depending on a control's
+    // input filtering.
+    const std::wstring safeRepl = normalizeNewlines(repl);
     std::wstring out;
-    out.reserve(text_.size() + ranges.size() * repl.size());
+    out.reserve(text_.size() + ranges.size() * safeRepl.size());
     size_t at = 0, lastEnd = 0;
     for (const Range& r : ranges) {
         out.append(text_, at, r.start - at);
-        out.append(repl);
+        out.append(safeRepl);
         lastEnd = out.size();
         at = r.end;
     }
@@ -239,7 +258,7 @@ bool EditorModel::replaceRanges(const std::vector<Range>& ranges, const std::wst
                                // Replace All is not a keystroke and must not be folded
                                // into a typing step that happens to be open.
     text_.swap(out);
-    sel_.anchor = lastEnd - repl.size();
+    sel_.anchor = lastEnd - safeRepl.size();
     sel_.caret = lastEnd;
     typingRun_ = false;
     return true;
