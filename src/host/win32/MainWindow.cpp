@@ -494,6 +494,27 @@ void onPaint(HWND hwnd) {
         case SignState::Checking: chip = L"…  verifying";         cc = th.textMuted;     break;
         default:                  chip = L"⊘ Unsigned";           cc = th.textSecondary; break;
       }
+      // A SIGNATURE DESCRIBES THE FILE ON DISK, NOT THE BUFFER. signState is computed by
+      // an async `snc verify` of the FILE (refreshSignState), so the moment the buffer is
+      // dirty the green tick is asserting something about the text on screen that nobody
+      // checked — the file it verified no longer exists in that form. That is the exact
+      // shape of defect this project keeps finding: an indicator that is not checking what
+      // it appears to claim.
+      //
+      // The fix is NOT to re-verify on every keystroke. refreshSignState spawns a process,
+      // so that would be one `snc verify` per character, which is why this was never wired
+      // to onEditChanged and why it sat open. Nothing needs re-verifying: the answer is
+      // already known the instant the buffer differs from what was signed.
+      //
+      // Only the Signed case is overridden. An INVALID signature does not become more
+      // invalid because you typed, and Unsigned stays unsigned — in both, the chip is
+      // still true of the file on disk, so changing them would trade one inaccuracy for
+      // another. Saving re-runs refreshSignState and the green tick returns on its own if
+      // the file is re-signed.
+      if (g.dirty && g.signState == SignState::Signed) {
+        chip = L"✎ Edited since signing";
+        cc = th.diagWarning;
+      }
       int cw = measure(chip, g.uiSm);
       g.rStatusSign = { x - cw - sc(8), g.rStatus.top, x + sc(2), g.rStatus.bottom };
       drawText(mem, { x - cw, g.rStatus.top, x, g.rStatus.bottom }, chip, cc, g.uiSm, DT_RIGHT | DT_VCENTER | DT_SINGLELINE); }
@@ -584,7 +605,14 @@ void onEditChanged(HWND hwnd) {
     // the text we loaded/saved clears the dot and the Save prompt, as any editor should.
     bool wasDirty = g.dirty;
     g.dirty = editorText() != g.savedText;
-    if (g.dirty != wasDirty) { InvalidateRect(hwnd, &g.rTabs, FALSE); InvalidateRect(hwnd, &g.rSave, FALSE); }
+    // rStatus is in this list because the trust chip now reads g.dirty: without it the
+    // chip keeps its old text until something else happens to repaint the status bar, and
+    // an indicator that is right only after an unrelated repaint is not an indicator.
+    if (g.dirty != wasDirty) {
+        InvalidateRect(hwnd, &g.rTabs, FALSE);
+        InvalidateRect(hwnd, &g.rSave, FALSE);
+        InvalidateRect(hwnd, &g.rStatus, FALSE);
+    }
     if (g.errorMarks) clearErrorMarks();
     if (g.lineNumbers) InvalidateRect(hwnd, &g.rGutter, FALSE);
     refreshUndoButtons(hwnd);   // edits/undo/redo all arrive here via EN_CHANGE
