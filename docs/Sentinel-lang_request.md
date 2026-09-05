@@ -50,6 +50,47 @@ _Every claim below was reproduced on this machine; the method is in section 1._
 >   `settings.ini`. Neither is a Sentinel problem and neither is an ask; we record it because the
 >   honest lesson of the port is that "move it to Sentinel" caught bugs that "keep it byte-identical"
 >   would have preserved.
+>
+> **Update 2026-09-05 — R1 blocks less than we filed, and Sentinel now parses genuinely hostile
+> input.** We moved the *sealed-container framing* — the header, the unlock-slot table and the
+> archive index of `Seal.h` — into Sentinel. `parsers.sentinel` is now 1,962 lines and eight
+> exports. Four things, and the first is a correction to our own P0.
+>
+> * **R1 gates key handling, not the sealed-file subsystem, and we had not seen the difference.**
+>   We filed R1 as the thing blocking "the port" of `Seal.h`, and then treated the whole subsystem
+>   as unavailable for six weeks. Splitting *framing* from *crypto* moved 85 lines with **no secret
+>   crossing the boundary at all**: the Sentinel side returns byte offsets to the salt, the wrapped
+>   DEK, the nonces and the tags, and the host does CNG exactly as before — every `SecureZeroMemory`
+>   in that file is byte-for-byte what it was. R1 is unchanged and still P0; what changed is our
+>   estimate of its blast radius. If other consumers are stalled behind it, the same split may be
+>   available to them, and that is worth more to you than another restatement of the ask.
+>
+> * **This is the first Sentinel code in this product that reads bytes an adversary chose.** Not a
+>   file the user owns — a container someone else sealed and sent them, where AEAD proves only that
+>   it was not altered in transit. It is also where the language should pay for itself, so we tested
+>   it that way rather than asserting it: 24 hostile containers through the real unsealer (overlong
+>   UTF-8 `\xC0\xAE`, mixed separators, `\\?\` prefixes, drive-relative paths) with zero writes
+>   outside the destination; the cross-check mutation-tested with 8 non-equivalent mutations of the
+>   Sentinel source, all 8 caught and the 3 survivors proven equivalent; 45,000 mutated containers
+>   under ASan with zero reports.
+>
+> * **There is no `u64` — an observation, deliberately NOT an ask.** The token appears zero times in
+>   all of `sentinel_library`, and `crates/sentinel-types` `Type` is `I64 | I32 | U8 | U128 | F64 |
+>   Bool`. Every 64-bit length we read off a hostile file is therefore read as `i64` and refused if
+>   negative. We are not requesting `u64`, because the workaround is not merely adequate — it is
+>   **better**: a length field that cannot fit an `i64` is a lying file, not a big file, and refusing
+>   it is the correct behaviour rather than a concession. Worth knowing only because a reader must
+>   test the top byte *before* accumulating: detecting the overflow afterwards would require
+>   performing it. If anything here is a request, it is one sentence of documentation, not a type.
+>
+> * **What we got wrong, a third time, and this one we shipped.** Our own port notes claimed it had
+>   closed a phase-31 defect where an unauthenticated `archive_size` steers a multi-GB allocation. It
+>   had closed only the `>= 2^63` case. An adversarial review then measured a **206-byte container
+>   stating 64 GiB committing 65,667 MB and 14 seconds** before failing — and near the top of the
+>   accepted range the `std::bad_alloc` escaped the unsealer entirely. Fitting in an `i64` was never
+>   evidence a size was *real*. Fixed by requiring the size to be plausible for the container it
+>   arrived in; re-measured at 6 MB peak and 0 ms. We record it because it is the same failure this
+>   document was written to avoid: a claim that sounded like a measurement.
 
 ---
 
