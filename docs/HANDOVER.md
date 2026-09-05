@@ -1598,6 +1598,22 @@ release + update-signing procedure.
 14 PNGs covering phases 1–11, 13, 15 and 39. Phases 12, 14 and 16–38 were verified live during their
 sessions but no image was committed — treat their screenshots as absent, not lost.
 
+50. **The trust chip stops overstating itself.** The status-bar chip read **✓ Signed** while you
+    edited a signed file. `signState` comes from an async `snc verify` of the FILE ON DISK
+    (`refreshSignState`), so the instant the buffer went dirty the green tick was vouching for text
+    that nothing had checked — the exact defect shape this project keeps finding, in the one
+    indicator whose entire job is trust. It had sat open in *What's next* for sessions because the
+    obvious fix does not work: `refreshSignState` spawns a process, so calling it from
+    `onEditChanged` would be one `snc verify` **per keystroke**. Nothing needs re-verifying — the
+    answer is known for free the moment the buffer differs from what was signed. The chip now reads
+    **✎ Edited since signing** (amber) while `g.dirty && signState == Signed`, and saving re-runs
+    the real verify. **Only the Signed case is overridden:** an INVALID signature does not become
+    more invalid because you typed, and Unsigned stays unsigned — in both the chip is still true of
+    the file on disk, so changing them would trade one inaccuracy for another. `rStatus` joined the
+    invalidation list in `onEditChanged`; without it the chip kept its old text until something
+    unrelated repainted the status bar, and an indicator that is only right after an unrelated
+    repaint is not an indicator.
+
 ## Releases
 
 Public releases on GitHub (`arcanii/Sentinel-IDE/releases`), each an EdDSA-signed Inno installer that
@@ -1617,6 +1633,11 @@ commit**, so `git checkout <tag> && scripts\build.bat` reproduces that build num
 | `v0.1.8` | 180 | `Sentinel-IDE-0.1.8.180-setup.exe` | Minor. **The Direct2D editor, as an opt-in preview** (phase 46 slices 1-5) — Settings ▸ *Use the Direct2D editor (preview)*, restart required; RichEdit stays the DEFAULT, so the release is behaviourally a no-op for anyone who does not tick the box, which is the entire point of baking it before slice 6 flips it. Carries no-wrap with real horizontal scroll, syntax colouring from a lexer now SHARED with the RichEdit path (so the two cannot drift), painted error-line tints, and a **real system caret** — the painted-only caret was invisible to Narrator, Magnifier's follow-the-cursor and IME candidate lists, a genuine accessibility regression against the control it replaces. Only visible lines are laid out and lexed. Known gap at the time of that release, stated in its release notes and **closed since, in slice 7**: dragging TEXT within the editor was not supported (dropping a FILE always opened it, and still does). |
 | `v0.1.9` | 185 | `Sentinel-IDE-0.1.9.185-setup.exe` | Minor. **The Direct2D editor becomes the DEFAULT** (phase 46 slice 6), and **text drag-and-drop** closes the last regression against RichEdit — the two editors are feature-equivalent for the first time, which is the stated precondition for slice 7. Escape hatches intact: `--richedit`, the Settings checkbox, and a `d2d=0` written by 0.1.8 all outrank the new default. **All three are gone at HEAD** — phase 46's last slice deleted the RichEdit editor — so this row is the last release in which unticking was possible. Dropping a FILE on the editor still opens it guarded — the new `IDropTarget` classifies `CF_HDROP` first and forwards it to the host's existing `WM_DROPFILES` handler, because registering a text drop target would otherwise have swallowed file drops silently. |
 | `v0.1.10` | 189 | `Sentinel-IDE-0.1.10.189-setup.exe` | Minor. **The RichEdit editor path is deleted** (phase 46 complete) — the Settings checkbox, `--richedit`/`--d2d-editor` and `Settings::d2dEditor` are gone, a stale `[editor] d2d` key is ignored *and* deleted, and there is now exactly one editor. `msftedit.dll` and `MSFTEDIT_CLASS` stay: the OUTPUT pane is still RichEdit and its `EN_LINK` → `parseDiag` → `gotoLineCol` chain is what makes `file:line:col` clickable. Also carries a fix older than the flags it came from: an unrecognised switch used to fall into `else openArg = a` and be mistaken for the path, so `Sentinel-IDE.exe C:\proj --richedit` (which 0.1.9's own notes told people to use) opened an empty window with no message — as did any typo. Unknown switches are now ignored and logged at Warn. **0.1.9 → 0.1.10 is the version-comparison trap**; `versionIsNewer` parses components to ints, so it offers correctly. |
+| `v0.1.11` | 193 | `Sentinel-IDE-0.1.11.193-setup.exe` | Patch. **Check for Updates… asks before it installs again.** The menu item had gone straight to download-install-restart since 0.1.5, because WinSparkle 0.9.3's prompt-then-install flow is broken (empty payload path, no error — the defect behind four dead releases). The manual check now runs our OWN appcast poll and raises the themed Install now / Later / Skip dialog, and — the half that matters — REPORTS all three outcomes: offered, already current, or the check failed. Silence was indistinguishable from a menu item that does nothing. |
+| `v0.1.12` | 196 | `Sentinel-IDE-0.1.12.196-setup.exe` | Patch. **Enter obeys focus in the update prompt.** 0.1.11 answered `DM_GETDEFID` with IDCANCEL so a stray Enter could not accept an offer nobody was looking at (it had happened — an unattended Enter ran an installer). But `IsDialogMessageW` only routes Enter to the FOCUSED control when it reports `DLGC_DEFPUSHBUTTON`, so a keyboard user who Tabbed to *Install now* and pressed Enter got **Later** — an affirmative keystroke silently doing the negative thing. **Shipped by 0.1.11 because that release went out before its own review finished.** |
+| `v0.1.13` | 202 | `Sentinel-IDE-0.1.13.202-setup.exe` | Patch. **The appcast reader moves to Sentinel** (phase 47), closing two real defects by construction: an unbounded `int` accumulate over feed-supplied digits (a crafted version could suppress a real update or fake a newer one) and NO validation of the extracted string, which reached the offer dialog, the log and `settings.ini`. **`appcast_parity` was red at HEAD when this shipped** — the appcast commit moves the feed the test reads, and nothing re-ran ctest after it. `RELEASING.md` now has that step. |
+| `v0.1.14` | 207 | `Sentinel-IDE-0.1.14.207-setup.exe` | Minor. **The sealed-container framing moves to Sentinel** (phase 48) — the first port that parses genuinely hostile input rather than files the IDE wrote. Closes an alternate-data-stream hole (`ab:c` passed the traversal guard and wrote a hidden NTFS stream), partial extraction leaving files behind on a rejected archive, and two DoS bounds (a 206-byte container could commit 65,667 MB; 11,400 unlock slots ≈ 17.7 min of PBKDF2 on the UI thread). |
+| `v0.1.15` | 213 | `Sentinel-IDE-0.1.15.213-setup.exe` | Minor. **Find and Replace** (phase 49), absent for fifteen releases. Ctrl+F / Ctrl+H, F3 / Shift+F3, wrap, live match count, *No results*, Match case, Whole word; Replace All is ONE undo step. Plus **the trust chip stops claiming the buffer is signed after you edit it** (phase 50). |
 
 **0.1.10 IS PUBLISHED (2026-09-04) and PHASE 46 IS COMPLETE.** Tag `v0.1.10` points at **44322fe** (`rev-list` 89 + `BUILDBASE` 100 = build **189**). Same order of checks as 0.1.9 — no debug CRT, *Valid signature*, the **enclosure confirmed HTTP 200 at 3,619,304 bytes against both the appcast `length` and the local installer BEFORE the feed was pushed**, then the live feed. One extra check this release needed: **0.1.9 → 0.1.10 is the version-comparison trap** — a string compare makes `0.1.10` look OLDER than `0.1.9` and clients would never be offered it. `Updater.cpp::versionIsNewer` parses each component to an int, so `[0,1,10,189]` beats `[0,1,9,185]`; verified before publishing rather than discovered from silence afterwards.
 
@@ -1750,12 +1771,15 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - ~~**Post-build signing can report success when it failed.**~~ **FIXED in phase 45.** It printed
   `[signed · <name>.sig]` off `snc sign`'s **exit code alone**, with `verifyFile` never called —
   the exact thing the spec forbade ("never on the signer's exit code alone"). RD-06.
-- **The trust chip does not recompute on edit.** `refreshSignState`'s only call sites are
-  `loadFileIntoEditor`, `saveFile`, `openSigning` and Settings-OK; `onEditChanged` never touches
-  it, so a signed file being edited keeps showing `✓ Signed` until saved. The `// edits invalidate
-  any existing .sig` comment at the `saveFile` call site explains why SAVING re-verifies and must
-  not be read as an edit hook — the first reconciliation pass misread it exactly that way and
-  asserted the wrong behaviour in four documents before the critic caught it.
+- **The trust chip — FIXED in phase 50, and the shape of the fix is the reusable part.** It used
+  to keep showing `✓ Signed` while you edited a signed file. The reason it stayed open so long is
+  that the obvious fix is wrong: `refreshSignState` spawns `snc verify`, so hooking it to
+  `onEditChanged` is one process per keystroke. Nothing needed re-verifying — the answer is free
+  the moment the buffer differs from what was signed, so only the RENDERING changed. Kept here
+  because the misreading it caused is still a live trap: the `// edits invalidate any existing
+  .sig` comment at the `saveFile` call site explains why SAVING re-verifies and must not be read
+  as an edit hook — a reconciliation pass misread it exactly that way and asserted the wrong
+  behaviour in four documents before the critic caught it.
 
 ## What's next (open options)
 
@@ -1868,13 +1892,13 @@ read the handover belongs in the handover body, not here._
 
 > You're continuing **Sentinel-IDE** (`G:\SentinelIDE`) — a native Win32 IDE for the **Sentinel**
 > language, whose thesis is a thin C++ host that shrinks as logic moves *into* Sentinel. It is a
-> **released, public, auto-updating** product: eight releases, latest **v0.1.7 (build 164)**, and real
+> **released, public, auto-updating** product: **sixteen releases, latest v0.1.15 (build 213)**, and real
 > Sentinel code runs in the shipped binary (the four file parsers). Treat `main` as shippable.
 >
 > **If no task follows this prompt, read the handover and then ASK before changing anything.** Do not
 > pick something off "What's next" and start — this is live software with users on auto-update.
 >
-> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–46, Environment gotchas,
+> **Read `docs/HANDOVER.md` first — it is the current state** (phase list 1–50, Environment gotchas,
 > the Releases table, What's next, per-area detail; ~780 lines, so skim `grep -n '^## '` for the
 > section map). Then as needed: `docs/RELEASING.md` (cutting a release) and
 > `docs/Sentinel-lang_request.md` (what the Sentinel toolchain can actually do — measured, not
@@ -1907,8 +1931,17 @@ read the handover belongs in the handover body, not here._
 > auto-updater that offered updates it could never install. The last is the cautionary one — the docs
 > called auto-update "verified end-to-end" when only the *offer* path had ever been tested, and the
 > install had never once worked. So: when something here says "verified", check **what** was verified,
-> and prefer running the thing over reading that it works. (Auto-update is still only half-fixed —
-> the manual check installs, the background check does not. See phase 40.)
+> and prefer running the thing over reading that it works.
+>
+> That habit is not historical. In the session that produced v0.1.9–v0.1.15 it caught, among
+> others: a claim that the screenshot tool "cannot capture Direct2D", generalised from ONE blank
+> capture — false, and it led to accusing two reviewers of fabricating readings they had actually
+> taken; a port claiming it had closed a multi-GB allocation defect when it had closed only part,
+> leaving a 206-byte file able to commit 65,667 MB; a "7 objects" figure that was ninja's
+> incremental step counter; and v0.1.13 shipping with a red test because nothing re-ran ctest after
+> the release procedure's own last commit. **Every one was found by re-measuring a claim, not by
+> reading code.** When you break something on purpose to prove a test catches it, revert and re-run
+> — that loop is why those are on this list instead of in the product.
 >
 > That's the seed. The phase history, build/screenshot commands and window classes, the
 > trust-manifest four-site lockstep rule, the release procedure and the full gotcha list are all in
