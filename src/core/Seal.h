@@ -322,11 +322,24 @@ inline const wchar_t* sealHeaderMessage(int reason) {
         case kSealHdrTruncSlotBody:    return L"Sealed file is truncated (slot body).";
         case kSealHdrTruncPayload:     return L"Sealed file is truncated (payload).";
         case kSealHdrTruncPayloadBody: return L"Sealed file is truncated (payload body).";
-        // A header field that cannot hold a real value is a bad header — the same
-        // message a bad magic gets, and not a new string.
-        case kSealHdrBadMagic:
-        case kSealHdrArchiveSize:      return L"Not a sealed project (bad header).";
-        case kSealHdrSlotCount:        return L"Not a sealed project (bad header).";
+        case kSealHdrBadMagic:         return L"Not a sealed project (bad header).";
+        // THESE TWO GET THEIR OWN STRINGS, and the reason is not tidiness. Both refuse a
+        // file that IS a sealed project — correct magic, correct version — because a
+        // header field states something implausible. Telling that user "not a sealed
+        // project" would send them looking for a corrupt download or the wrong file,
+        // when what they have is their own data and a bound they exceeded. A lockout
+        // wearing the wrong label is the worst failure this feature has, so it says
+        // what actually happened and roughly what to do about it.
+        case kSealHdrArchiveSize:
+            return L"This sealed file states an archive size far larger than the file "
+                   L"itself could hold. It is refused rather than acted on, because that "
+                   L"size is what the unsealer would allocate. If this is genuinely your "
+                   L"project and it is very large, unseal it with an older build and "
+                   L"re-seal it.";
+        case kSealHdrSlotCount:
+            return L"This sealed file declares more unlock slots than any real container "
+                   L"uses. Each one costs a full key derivation on a wrong password, so "
+                   L"it is refused rather than attempted.";
         default:                       return L"";
     }
 }
