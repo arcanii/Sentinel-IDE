@@ -27,7 +27,8 @@
 #include "host/win32/UpdateDialog.h"
 #include "host/win32/SingleInstance.h"
 #include "host/win32/Updater.h"
-#include "host/win32/D2DEditor.h"   // THE editor — phase 46 slice 8 deleted the alternative
+#include "host/win32/D2DEditor.h"
+#include "host/win32/FindBar.h"   // THE editor — phase 46 slice 8 deleted the alternative
 
 #include <windows.h>
 #include <windowsx.h>
@@ -71,6 +72,10 @@ enum TreeImg : int { IMG_PROJECT = 0, IMG_FOLDER, IMG_FILE, IMG_TOML };
 enum MenuId : UINT { ID_OPEN_PROJECT = 1001, ID_NEW_PROJECT, ID_NEW_FILE, ID_SAVE, ID_UNDO, ID_REDO, ID_PROJECT_SETTINGS, ID_BUILD, ID_RUN, ID_SIGNING, ID_LINE_NUMBERS, ID_SETTINGS, ID_ABOUT, ID_EXIT,
                      ID_CLOSE_PROJECT, ID_RECENT_CLEAR, ID_SEAL_PROJECT, ID_OPEN_SEALED, ID_FILE_ASSOC,
                      ID_CHECK_UPDATES,
+                     // Find/Replace (phase 49). Appended rather than slotted in: the block is
+                     // sequential from 1001 and inserting anywhere above would silently renumber
+                     // every id below it, including the ones the accelerator table names.
+                     ID_FIND, ID_FIND_REPLACE, ID_FIND_NEXT, ID_FIND_PREV,
                      ID_TIER_DEV = 1100, ID_TIER_EXP, ID_TIER_STABLE, ID_TIER_HARD,
                      ID_TARGET_BASE = 1200,    // ID_TARGET_BASE + <target index>
                      ID_RECENT_BASE = 1300 };  // ID_RECENT_BASE + <recent index>
@@ -86,6 +91,7 @@ struct AppState {
     int   dpi = 96;
     HFONT ui = nullptr, uiSm = nullptr, title = nullptr, mono = nullptr;
     HWND  hTree = nullptr, hEdit = nullptr, hOut = nullptr, hProblems = nullptr;
+    HWND  hFind = nullptr;      // the modeless Find/Replace band (src/host/win32/FindBar.cpp)
     HIMAGELIST himl = nullptr;
     HDC   memDC = nullptr; HBITMAP memBmp = nullptr; int memW = 0, memH = 0;  // cached paint back-buffer
     int   sidebarView = 0;  // 0 = Project, 1 = Files
@@ -116,7 +122,7 @@ struct AppState {
     SignState signState = SignState::Unknown;     // signature state of the open file
     std::wstring signKey, signGrants;             // from the open file's .sig / verify
     RECT rToolbar{}, rMenuBtn{}, rBuild{}, rRun{}, rSave{}, rUndo{}, rRedo{}, rScheme{}, rSchemeTarget{}, rSchemeTier{}, rTreeTabs{}, rProjectTab{}, rFilesTab{},
-         rTree{}, rVSplit{}, rTabs{}, rEditor{}, rGutter{},
+         rTree{}, rVSplit{}, rTabs{}, rEditor{}, rFind{}, rGutter{},
          rDock{}, rDockBody{}, rProblemsTab{}, rOutputTab{}, rStatus{}, rStatusSign{};
 };
 AppState g;
@@ -254,6 +260,12 @@ bool createControls(HWND hwnd) {
     SendMessageW(g.hEdit, EM_SETTARGETDEVICE, 0, 1);   // no word-wrap → width changes don't reflow (code-editor default; smooth splitter)
     styleEditor(g.hEdit, th.windowBg);
 
+    // The Find/Replace band, created HIDDEN and given the editor it searches. A failure
+    // here is NOT fatal the way a missing editor is: the IDE without find is the IDE as it
+    // shipped for fifteen releases, so it degrades to that rather than refusing to start.
+    g.hFind = createFindBar(hwnd, g.hEdit, g.hInst, (UINT)g.dpi, g.ui);
+    if (!g.hFind) logMsg(LogLevel::Warn, L"Find bar could not be created - Ctrl+F will do nothing");
+
     g.hOut = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
         WS_CHILD | ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_HSCROLL,
         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_OUT, g.hInst, nullptr);
@@ -313,9 +325,20 @@ void layout(HWND hwnd) {
     g.rTabs   = { mainL, bodyTop, W, bodyTop + tabsH };
     const int editorBot = bodyBot - g.dockH;
     g.rEditor = { mainL, bodyTop + tabsH, W, editorBot };
+    // The Find band takes a strip off the TOP of the editor area rather than floating over
+    // it. Overlaying is what VS Code does, but here the editor is a sibling HWND with its
+    // own Direct2D swap chain: an overlapping sibling means z-order, WS_CLIPSIBLINGS and a
+    // D2D present that has to respect a hole in it. Shrinking the editor is arithmetic
+    // already in this function, and it also keeps the band from hiding the very line the
+    // match was scrolled to.
+    const int findH = findBarVisible(g.hFind) ? findBarHeight(g.hFind) : 0;
+    g.rFind = { mainL, bodyTop + tabsH, W, bodyTop + tabsH + findH };
+    const int editTop = bodyTop + tabsH + findH;
+    // The gutter follows the band down, or the line numbers would be drawn against the
+    // band's first line instead of the editor's.
     g.gutterW = (g.lineNumbers && g.fileOpen) ? sc(46) : 0;     // line-number gutter
-    g.rGutter = { mainL, bodyTop + tabsH, mainL + g.gutterW, editorBot };
-    const RECT rEditChild = { mainL + g.gutterW, bodyTop + tabsH, W, editorBot };
+    g.rGutter = { mainL, editTop, mainL + g.gutterW, editorBot };
+    const RECT rEditChild = { mainL + g.gutterW, editTop, W, editorBot };
     g.rDock   = { mainL, editorBot, W, bodyBot };
     g.rProblemsTab = { mainL + sc(14), editorBot, mainL + sc(14) + sc(82), editorBot + hdrH };
     g.rOutputTab   = { g.rProblemsTab.right + sc(8), editorBot, g.rProblemsTab.right + sc(8) + sc(64), editorBot + hdrH };
@@ -323,11 +346,12 @@ void layout(HWND hwnd) {
 
     // Batch all pane moves into one atomic pass so a resize/splitter-drag repaints
     // the panes together rather than child-by-child (which causes drag lag).
-    HDWP dwp = BeginDeferWindowPos(4);
+    HDWP dwp = BeginDeferWindowPos(5);
     auto place = [&](HWND h, const RECT& r) {
         if (h && dwp) dwp = DeferWindowPos(dwp, h, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
     };
     place(g.hTree, g.rTree);
+    if (findBarVisible(g.hFind)) place(g.hFind, g.rFind);
     place(g.hEdit, rEditChild);
     place(g.hOut, g.rDockBody);
     place(g.hProblems, g.rDockBody);
@@ -616,6 +640,11 @@ void onEditChanged(HWND hwnd) {
     if (g.errorMarks) clearErrorMarks();
     if (g.lineNumbers) InvalidateRect(hwnd, &g.rGutter, FALSE);
     refreshUndoButtons(hwnd);   // edits/undo/redo all arrive here via EN_CHANGE
+    // Every offset the find bar is holding belongs to the buffer as it was BEFORE this
+    // edit, so the count and the current match have to be re-derived. It re-runs the
+    // search but deliberately does not move the caret — the user is typing in the editor,
+    // not in the find field.
+    findBarBufferChanged(g.hFind);
 }
 
 HTREEITEM insertNode(HTREEITEM parent, const std::wstring& label, LPARAM data, int image) {
@@ -687,6 +716,10 @@ void loadFileIntoEditor(HWND hwnd, const std::wstring& path) {
     logMsg(LogLevel::Info, L"Opened file: " + path);
     refreshSignState(hwnd);
     ShowWindow(g.hEdit, SW_SHOW);
+    // BY HAND, because g.loadingFile suppressed the EN_CHANGE this would otherwise ride
+    // in on. A whole new document behind a bar still showing the old file's match count is
+    // the kind of stale readout that gets believed.
+    findBarBufferChanged(g.hFind);
     layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -1381,6 +1414,7 @@ void closeProject(HWND hwnd) {
     TreeView_DeleteAllItems(g.hTree);
     ShowWindow(g.hTree, SW_HIDE);
     g.loadingFile = true; SetWindowTextW(g.hEdit, L""); g.loadingFile = false;
+    hideFindBar(g.hFind);   // there is no longer a buffer to search
     ShowWindow(g.hEdit, SW_HIDE);
     outClear();   // clear Output + Problems
     g.statusLeft = L"Ln 1, Col 1"; g.statusMsg = L"No project open";
@@ -1512,6 +1546,11 @@ void showAppMenu(HWND hwnd) {
     AppendMenuW(m, MF_STRING | (canUndo ? 0 : MF_GRAYED), ID_UNDO, L"Undo\tCtrl+Z");
     AppendMenuW(m, MF_STRING | (canRedo ? 0 : MF_GRAYED), ID_REDO, L"Redo\tCtrl+Y");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (g.fileOpen ? 0 : MF_GRAYED), ID_FIND, L"Find…\tCtrl+F");
+    AppendMenuW(m, MF_STRING | (g.fileOpen ? 0 : MF_GRAYED), ID_FIND_REPLACE, L"Replace…\tCtrl+H");
+    AppendMenuW(m, MF_STRING | (g.fileOpen ? 0 : MF_GRAYED), ID_FIND_NEXT, L"Find Next\tF3");
+    AppendMenuW(m, MF_STRING | (g.fileOpen ? 0 : MF_GRAYED), ID_FIND_PREV, L"Find Previous\tShift+F3");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g.project.loaded ? 0 : MF_GRAYED), ID_PROJECT_SETTINGS, L"Project Settings…\tCtrl+;");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_BUILD, L"Build\tCtrl+Shift+B");
@@ -1558,6 +1597,7 @@ void applyTheme(HWND hwnd) {
     // + SCF_ALL; the syntax colours it recomputes from Theme in its own handler.
     d2dEditorApplyTheme(g.hEdit);
     styleEditor(g.hEdit, th.windowBg);
+    findBarApplyTheme(g.hFind);
     SetWindowTheme(g.hOut, sub, nullptr); styleEditor(g.hOut, th.windowBg);
     SetWindowTheme(g.hProblems, sub, nullptr);
     ListView_SetBkColor(g.hProblems, th.panelBg); ListView_SetTextColor(g.hProblems, th.textPrimary); ListView_SetTextBkColor(g.hProblems, th.panelBg);
@@ -1995,6 +2035,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND:
         if (lParam != 0 && LOWORD(wParam) == IDC_EDIT && HIWORD(wParam) == EN_CHANGE) { onEditChanged(hwnd); return 0; }
         if (lParam != 0 && LOWORD(wParam) == IDC_EDIT && (HIWORD(wParam) == EN_VSCROLL || HIWORD(wParam) == EN_HSCROLL)) { if (g.lineNumbers) InvalidateRect(hwnd, &g.rGutter, FALSE); return 0; }
+        // The find bar changed height (opened, closed, or grew the replace row). It never
+        // sizes itself — see FindBar.h — so this is the whole handshake.
+        if (lParam != 0 && LOWORD(wParam) == kFindBarLayoutCmd) { layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
         if (LOWORD(wParam) >= ID_TARGET_BASE && LOWORD(wParam) < ID_TARGET_BASE + 64) { setActiveTarget(hwnd, LOWORD(wParam) - ID_TARGET_BASE); return 0; }
         if (LOWORD(wParam) >= ID_RECENT_BASE && LOWORD(wParam) < ID_RECENT_BASE + kMaxRecents) { openRecent(hwnd, LOWORD(wParam) - ID_RECENT_BASE); return 0; }
         switch (LOWORD(wParam)) {
@@ -2022,6 +2065,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // revert real edits. EM_UNDO/EM_REDO raise EN_CHANGE → onEditChanged marks dirty.
         case ID_UNDO: if (g.fileOpen && SendMessageW(g.hEdit, EM_CANUNDO, 0, 0)) { SendMessageW(g.hEdit, EM_UNDO, 0, 0); SetFocus(g.hEdit); } break;
         case ID_REDO: if (g.fileOpen && SendMessageW(g.hEdit, EM_CANREDO, 0, 0)) { SendMessageW(g.hEdit, EM_REDO, 0, 0); SetFocus(g.hEdit); } break;
+        // Find / Replace. Gated on a file being open for the same reason Save is: with no
+        // buffer there is nothing to search, and a bar over the "Select a file" placeholder
+        // would be a control that cannot do anything.
+        case ID_FIND: if (g.fileOpen) showFindBar(g.hFind, false); break;
+        case ID_FIND_REPLACE: if (g.fileOpen) showFindBar(g.hFind, true); break;
+        case ID_FIND_NEXT: if (g.fileOpen) findBarStep(g.hFind, +1); break;
+        case ID_FIND_PREV: if (g.fileOpen) findBarStep(g.hFind, -1); break;
         case ID_LINE_NUMBERS:
             g.lineNumbers = !g.lineNumbers; g.settings.lineNumbers = g.lineNumbers; saveSettings(g.settings);
             layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
@@ -2076,6 +2126,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // monitor move, and the gutter (which reads EM_POSFROMCHAR) follows it into the
         // wrong scale.
         d2dEditorUpdateDpi(g.hEdit, (UINT)g.dpi);
+        findBarUpdateDpi(g.hFind, (UINT)g.dpi, g.ui);   // same reason: a child never sees this
         RECT* nr = reinterpret_cast<RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, nr->left, nr->top, nr->right - nr->left, nr->bottom - nr->top, SWP_NOZORDER | SWP_NOACTIVATE);
         layout(hwnd); InvalidateRect(hwnd, nullptr, FALSE); return 0;
@@ -2192,12 +2243,51 @@ int runApp(HINSTANCE hInstance, int nCmdShow, PWSTR /*cmdLine*/) {
         { FVIRTKEY,                     VK_F5,        ID_RUN },
         { FVIRTKEY | FCONTROL,          (WORD)'L',    ID_LINE_NUMBERS },
         { FVIRTKEY | FCONTROL,          VK_OEM_COMMA, ID_SETTINGS },
+        // Find/Replace (phase 49). These MUST be here rather than in the editor's own
+        // onKeyDown: the find bar's edit fields have the focus most of the time it is open,
+        // and a key handled inside the editor control cannot be reached from there. The
+        // accelerator table is checked before anything is dispatched, so Ctrl+F re-focuses
+        // the field and Ctrl+H switches to Replace from wherever the user is.
+        //
+        // F3 needs TWO rows because ACCEL modifiers are matched EXACTLY: a row without
+        // FSHIFT does not fire while Shift is held, so a single { FVIRTKEY, VK_F3 } would
+        // leave Shift+F3 falling through to the editor and Find Previous unreachable from
+        // the keyboard. MEASURED, by negative control, not assumed — d2d_dialect_test case
+        // 13 builds these two rows in BOTH orders and presses Shift+F3 against each; it
+        // resolves to PREVIOUS either way, so the order below is readability, not
+        // correctness. (The first draft of this comment claimed the opposite — that an
+        // unshifted row swallows the shifted chord and the order was load-bearing. It was
+        // wrong, and the test is what says so.)
+        { FVIRTKEY | FCONTROL,          (WORD)'F',    ID_FIND },
+        { FVIRTKEY | FCONTROL,          (WORD)'H',    ID_FIND_REPLACE },
+        { FVIRTKEY | FSHIFT,            VK_F3,        ID_FIND_PREV },
+        { FVIRTKEY,                     VK_F3,        ID_FIND_NEXT },
     };
     HACCEL hAccel = CreateAcceleratorTableW(accels, (int)(sizeof(accels) / sizeof(accels[0])));
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (hAccel && TranslateAcceleratorW(hwnd, hAccel, &msg)) continue;
+        // The find bar is MODELESS, so nothing else gives its fields Tab order, Enter or
+        // Escape — IsDialogMessageW is what turns Enter into WM_COMMAND(IDOK) and Escape
+        // into WM_COMMAND(IDCANCEL) there (FindBar.cpp handles both).
+        //
+        // GATED ON THE FOCUS BEING INSIDE THE BAR, and that gate is the whole safety of
+        // this line. Called unconditionally, IsDialogMessageW would swallow Tab and Escape
+        // aimed at the EDITOR — Tab is a character in a code editor, and losing it would
+        // be a regression in the control this feature is bolted onto. IsChild covers the
+        // bar's own children (the two fields and the buttons); the bar window itself never
+        // holds the focus.
+        //
+        // AFTER TranslateAcceleratorW, deliberately: the accelerators must win, or Ctrl+F
+        // from inside the find field would be handled as a plain keystroke and typing
+        // Ctrl+S in there would not save.
+        if (findBarVisible(g.hFind)) {
+            const HWND focus = GetFocus();
+            if (focus && (focus == g.hFind || IsChild(g.hFind, focus)) &&
+                IsDialogMessageW(g.hFind, &msg))
+                continue;
+        }
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     if (hAccel) DestroyAcceleratorTable(hAccel);

@@ -13,7 +13,7 @@ eventually be built *in* Sentinel (thin native host shrinking over time). Two wo
 exist so far:
 
 1. **UX design spines** (BMad) — `DESIGN.md` + `EXPERIENCE.md`, status **draft**.
-2. **A working Win32 C++ prototype** — phases 1–48 built and verified.
+2. **A working Win32 C++ prototype** — phases 1–49 built and verified.
 
 ---
 
@@ -22,7 +22,9 @@ exist so far:
 - The prototype **builds and runs**: `scripts\build.bat` → `build\Sentinel-IDE.exe`.
 - It's a real dark/coral Win32 IDE: themed shell with **dark popup/context menus**, dark
   TreeView + a **Direct2D code editor** (syntax highlighting, line gutter, dirty `●`/Save,
-  undo/redo) — RichEdit is still the **Output pane**, and only that, since phase 46's last slice,
+  undo/redo, and since phase 49 **Find/Replace** — Ctrl+F, Ctrl+H, F3/Shift+F3, wrap-around, a
+  live match count, Match case / Whole word, and a Replace All that is ONE undo step)
+  — RichEdit is still the **Output pane**, and only that, since phase 46's last slice,
   `snc` build/run with live streamed Output (**clickable `file:line:col`**) + a Problems
   triad, a configurable logfile + Settings dialog, a **Sentinel project model**
   (a `*.sntproject` file, or legacy `sentinel.toml`) with **multiple build targets**, an
@@ -1453,6 +1455,142 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
     code under test) and assert the RELATION: well-formed, same is not an update, one build older is,
     one build newer is not. A release bump cannot break it again.
 
+49. **FIND AND REPLACE — the gap that had stood for fifteen releases.** There was no Ctrl+F
+    anywhere in this product; `D2DEditor.cpp`'s dialect comment said so outright ("there is no
+    Find/Replace and no printing in this product"). There is now: **Ctrl+F**, **Ctrl+H**,
+    **F3 / Shift+F3**, wrap-around, a live match count, an explicit *No results* state, Match
+    case and Whole word, Replace and Replace All, and Escape back to the editor. Four files:
+    `src/editor/TextSearch.{h,cpp}` (the matcher), `src/host/win32/FindBar.{h,cpp}` (the bar),
+    plus `EditorModel::replaceRanges`, four calls on `D2DEditor.h` and the wiring in
+    `MainWindow.cpp`.
+
+    **THE SENTINEL-VS-C++ DECISION, WITH THE NUMBER. The matcher is C++, and the reason is not
+    the FFI boundary.** A complete Sentinel `find_matches` was written and compiled (`snc build
+    --lib`, first try) before anything was decided, and benchmarked against the C++ core on the
+    same buffers — full parity on every case, 20 cases × 4 corpus sizes, identical ranges.
+    On a **1 MB buffer with the default case-insensitive search — one find-as-you-type
+    keystroke — C++ takes ~2 ms and Sentinel ~14 ms**; at 5 MB it is ~11 ms against ~50 ms.
+    A second Sentinel version given three optimisations (the match-case branch hoisted out of
+    the scan, the fold inlined, an ASCII fast path that tests one byte per position) got to
+    ~10 ms at 1 MB — still 5x, and still most of a 16.7 ms frame spent before the editor has
+    laid out or painted a single line. So: **C++**.
+
+    **The brief's hypothesis was that the crossing would be the cost, and that is FALSE —
+    measured.** An export that scans nothing, handed the same 5 MB buffer, costs **0.00014 ms
+    per call** (140 ns): the `&[u8]` parameter is a pointer and a length, so there is no copy
+    in, and the owned `-> [u8]` return is no more expensive at 49,696 matches (a 795 KB record)
+    than at zero — `let` over 5 MB and an absent needle over 5 MB time the same. The whole gap
+    is the SCAN: snc's generated code is ~5-10x slower than MSVC /O2 on a tight indexed loop.
+    That is a useful, specific finding about the toolchain and not a reason to avoid the FFI.
+    **The port would also have cost a behavioural divergence**, which is worth stating because
+    it would have been the argument even at parity speed: whole-word search uses
+    `EditorModel`'s own `iswalnum(c) || c == '_'`, a CRT locale table with no Sentinel
+    equivalent, so a Sentinel matcher has to approximate it (">= 128 is a word character") and
+    Ctrl+Left would then disagree with Whole word about where a word ends.
+    **The buffer is passed as UTF-16-AS-BYTES, not converted**, and that decision is what made
+    the crossing free — a UTF-8 conversion would have been an O(document) pass per keystroke
+    each way, plus a second index space in which a surrogate pair can be cut. Worth reusing if
+    a future port needs the editor's buffer.
+
+    **A modeless BAND, not a modal dialog, and there are four independent reasons** (written
+    out in `FindBar.h`): a modal disables the main window, i.e. the editor the feature is about;
+    `uiIsBusy()` would then report busy for as long as the user is working, re-arming the
+    4-second deferral on the open-path and update-offer paths over and over; a modal's private
+    pump never calls `TranslateAcceleratorW`, so Ctrl+S, Ctrl+Z and F5 would all be dead inside
+    it; and its null-filter pump would dispatch the synchronous `EN_CHANGE` a Replace All
+    raises. The cost is that `runApp` now calls `IsDialogMessageW` for the bar — **gated on the
+    focus being inside it**, because called unconditionally it would swallow Tab and Escape
+    aimed at the editor, and Tab is a character in a code editor.
+
+    **Replace All is ONE undo step**, via `EditorModel::replaceRanges` — one `recordPreEdit`,
+    one buffer rebuild, one `Ctrl+Z`. Spelled as a loop in the control it would have been one
+    step per match. It refuses malformed input (descending, overlapping, out of bounds) rather
+    than half-rewriting a file, and a rewrite whose result is IDENTICAL pushes no undo step and
+    raises no notification — checked against the built result, not guessed from the arguments,
+    so a needle that merely folded to the replacement is caught too.
+
+    **TWO DEFECTS FOUND BY THE TESTS, both silent, both fixed:**
+    (a) **The bar's child-control ids started at 1, colliding with `IDOK` (1) and `IDCANCEL`
+    (2).** An EDIT sends `EN_UPDATE` with the same id and a different notification code, so
+    every character typed into the find field fell through the `WM_COMMAND` switch into
+    `case IDOK:` and ran Find Next — find-as-you-type walking forward through the file by one
+    match per keystroke. No crash, no warning, and plausible on a small file. Ids now start at
+    101; Windows reserves 1-11 for the standard dialog buttons and nothing sharing a
+    `WM_COMMAND` switch with `IsDialogMessageW` may use them.
+    (b) **`IsWindowVisible` was the wrong question for "is the bar open".** It is false whenever
+    any ANCESTOR is hidden, so it reported closed during the main window's `WM_CREATE` (where
+    `layout()` runs, and would have given the band no height) and for the whole of
+    `d2d_dialect_test`, whose host window is deliberately never shown — which silently turned
+    `hideFindBar` into a no-op there. Open/closed is now the bar's own flag.
+
+    **A comment was measured wrong and corrected.** The accelerator table lists
+    `{FVIRTKEY|FSHIFT, VK_F3}` and `{FVIRTKEY, VK_F3}`, and the first version of the comment
+    beside them claimed the order was load-bearing — that an unshifted row swallows the shifted
+    chord. It does not: `d2d_dialect_test` case 13 now builds the two rows in BOTH orders and
+    presses Shift+F3 against each, and it resolves to Find Previous either way. **ACCEL
+    modifiers are matched exactly.** Both rows are still needed; the order is readability.
+
+    **CASE-INSENSITIVITY IS ORDINAL AND PARTIAL, stated rather than implied.** The fold is
+    ASCII `A-Z` plus Latin-1 `U+00C0-U+00DE` (minus `U+00D7`, the multiplication sign — folding
+    it would make × match ÷). So `CAFÉ` finds `café`, which is the case
+    `EditorModel.cpp`'s own comment says Sentinel sources really hit. **What is NOT
+    implemented, deliberately:** Latin Extended-A and beyond (Ł/ł, Ş/ş), Greek and Cyrillic
+    (Σ/σ, Д/д), full case folding (ß vs SS), `ÿ`/`Ÿ` (the one Latin-1 letter whose uppercase
+    escapes the block), the Turkish dotless-i pair, and **any normalisation** — a precomposed
+    `é` does not match a decomposed `e`+`U+0301` in either case mode. The alternatives were a
+    Unicode case-folding table this project has no other use for, or `CompareStringOrdinal`,
+    which would drag the OS into a file whose whole value is having no OS in it. Every one of
+    these non-folds is a `check()` in `text_search_test` case 3, so widening the rule means
+    coming to that test and saying so.
+
+    **Surrogate pairs.** A match whose start or end would land between a high and a low
+    surrogate is DISCARDED, never trimmed — exactly `EditorModel::snap`'s condition, so "a
+    match is never split" and "the caret is never snapped" are one rule rather than two that
+    happen to agree. That matters because a find field really can hold half a pair (paste half
+    an emoji, or an IME): the answer is *no match*, not half a codepoint selected and replaced.
+
+    **Verified.** `BUILD_OK`, zero warnings, **ctest 14/14** with every `EXCLUDE_FROM_ALL`
+    target rebuilt first. New: `text_search_test` (**78 assertions**, `ctest -R text_search`) —
+    the matcher and `replaceRanges`, no window; `d2d_dialect_test` grew case 15 and the
+    accelerator rows (**245 assertions**, up from 218), driving the REAL find bar with WM_CHAR
+    into its real EDIT and BM_CLICK on its real BUTTONs.
+    Then, **live, against the shipping `Sentinel-IDE.exe`**, driven cross-process from a
+    background session (`VirtualAllocEx` + `ReadProcessMemory` for the pointer-taking messages;
+    a 24 KB, 722-line scratch file under `%TEMP%`, `git status --porcelain examples/` empty
+    throughout) — **31/31**:
+    * Ctrl+F raised a real `SentinelFindBar` whose bottom edge is exactly the editor's top edge
+      — it takes a strip, it does not overlap.
+    * Typing `let` reported **1 of 241**, selected the match (3 chars), and three Nexts moved
+      both the selection and the counter. `ZEBRAMARKER` near the end of the file selected at
+      24617..24628 and took the **first visible line from 0 to 695** — scrolled into view
+      through `ensureCaretVisible`, not a parallel mechanism.
+    * **Wrapping**: walked to `241 of 241`, one more Next gave `1 of 241`; Previous from there
+      gave `241 of 241`.
+    * **No results** on a needle that is not in the file, and nine more keystrokes from that
+      state moved nothing. (Note what is NOT claimed: reaching a no-match does not leave the
+      caret where it started, because a bare `q` DOES occur in the file and find-as-you-type
+      legitimately visits its matches on the way. Every editor behaves this way.)
+    * **F3 as a posted WM_KEYDOWN**, stepping the search through `TranslateAcceleratorW` in the
+      live process — the accelerator link case 13 can only reach by faking the key state.
+    * **Surrogates**: a lone low surrogate in the find field → *No results*; the whole
+      character → `1 of 2`, selected 6..8, i.e. both code units on the pair's own boundary; and
+      Replace All over both left `alpha @ beta @ gamma`.
+    * **Replace All of 241 occurrences → `Replaced 241`**, buffer 24,635 → 25,840 chars, ONE
+      undo restored it to **24,635 chars identical to the original** with nothing behind it.
+    * **THE DATA-LOSS PATH, measured rather than assumed**: after a Replace All, `WM_CLOSE`
+      raised the **`SentinelSaveDlg`** Save / Don't Save / Cancel prompt. `EN_CHANGE` really
+      does reach `onEditChanged` and `g.dirty` really is recomputed, so the buffer is not
+      discardable in silence.
+
+    **NOT COVERED, said plainly.** The bar's PIXELS — the band, the dark field, the red
+    *No results* — are not asserted anywhere: `d2d_render_test` renders the editor, not this
+    bar, and `capture.ps1` needs a foreground window an automated session cannot arrange. Nor
+    is a real mouse click on a button (`BM_CLICK` sends the same `WM_COMMAND` a click would,
+    but not the hit-test or the pressed state), the Tab cycle between the fields and the
+    buttons (`IsDialogMessageW` is exercised for Escape only), or the hardware-to-Windows link
+    for Ctrl+F and Ctrl+H. **A human should press Ctrl+F, Ctrl+H, Tab and Shift+F3 once on a
+    real build and look at the band** — that is the same short list phase 46 closed by hand.
+
 See `docs/prototype.md` and `docs/sentinel-project.md` for detail; `docs/RELEASING.md` for the
 release + update-signing procedure.
 
@@ -1705,6 +1843,11 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
 - **Targets follow-ons (remaining):** per-target `lib_paths`; a definable output dir; add/remove
   `[[target]]` blocks from the form (today it edits existing blocks' name/entry/type in place).
 - **Undo/redo follow-up:** track the saved point so undo-to-clean clears `●`; toolbar button hover states.
+- **Find/Replace follow-ons** (phase 49 shipped the core): find in FILES across the project,
+  reported into the Problems pane; regular expressions; a search-history dropdown on the field;
+  and a "selection only" scope for Replace All. None are started. The one thing OWED is a human
+  pressing Ctrl+F / Ctrl+H / Tab / Shift+F3 on a real build and LOOKING at the band — the bar's
+  pixels have no automated coverage and cannot get any without a foreground window.
 - **The Direct2D editor is DONE** — phase 46 is closed and the RichEdit *editor* is deleted, so
   there is one editor and no setting to choose another. **Unreleased**: 0.1.9 shipped the flip
   with all three escape hatches intact, and HEAD has none of them, so the next release note has to

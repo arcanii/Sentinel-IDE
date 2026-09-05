@@ -58,6 +58,16 @@ struct Selection {
     bool operator!=(const Selection& o) const { return !(*this == o); }
 };
 
+// A half-open [start, end) span in the same UTF-16 index space as Selection. Added in
+// phase 49 for Find/Replace: src/editor/TextSearch.h reports matches as Ranges and
+// replaceRanges consumes them, so a match never changes index space on its way to the
+// buffer. Not a Selection, deliberately — a Selection has a moving end and a still one,
+// and a match has neither.
+struct Range {
+    size_t start = 0;
+    size_t end = 0;
+};
+
 // Convert '\r\n' and lone '\r' to '\n'. Free function so it can be unit-tested
 // directly and reused by the control's paste path.
 std::wstring normalizeNewlines(const std::wstring& s);
@@ -115,6 +125,40 @@ public:
     // Afterwards the moved run is SELECTED, so it can be dragged straight on again, which
     // is what every other editor does and what makes a mis-drop cheap to correct.
     void moveSelectionTo(size_t dest);
+
+    // REPLACE ALL, and it is one call for one reason: ONE undo step (phase 49).
+    //
+    // `ranges` are half-open spans of the text AS IT IS NOW, ascending and
+    // non-overlapping — exactly what TextSearch::findAll produces. Each is replaced by
+    // `repl`, which may be empty (replace-with-nothing is a delete-all).
+    //
+    // WHY IT LIVES HERE, and it is the same argument moveSelectionTo makes one function
+    // up. Spelled as a loop of setSelection + insertText in the control it would be ONE
+    // recordPreEdit PER MATCH — Ctrl+Z after replacing 300 occurrences would undo the
+    // 300th and leave 299 done, and the user would have to hold Ctrl+Z to get their file
+    // back, watching it un-replace one match at a time. Undo granularity is the undo
+    // stack's business and the undo stack is in here, so the whole rewrite takes exactly
+    // one snapshot and one Ctrl+Z restores the buffer verbatim.
+    //
+    // A rewrite that produces an IDENTICAL buffer (replacing "x" with "x") pushes NO undo
+    // step and mutates nothing — same reasoning as moveSelectionTo's drop-onto-itself
+    // case: an undo step that restores an identical buffer is an invisible no-op the user
+    // has to press Ctrl+Z twice to get past. It is checked against the built result, not
+    // guessed from the arguments, so a needle that folds to the replacement under a
+    // case-insensitive search is caught too.
+    //
+    // Malformed input (descending, overlapping, or out of bounds) changes NOTHING and
+    // pushes no undo step. That is not defensive garnish: these offsets come from a search
+    // over a buffer that a notification handler could in principle have changed underneath
+    // us, and a partial rewrite of a user's file is the one outcome worth refusing outright.
+    //
+    // Afterwards the LAST replacement is selected, so the caret ends where the work ended
+    // and the view can be scrolled to something the user can see was done.
+    // Returns true iff the buffer actually changed — which is exactly the condition
+    // under which the control must run its notification funnel. Returning it, rather
+    // than having the caller guess, is what stops a no-op Replace All raising an
+    // EN_CHANGE that would set g.dirty on a buffer identical to the one on disk.
+    bool replaceRanges(const std::vector<Range>& ranges, const std::wstring& repl);
 
     void backspace();                        // delete selection, else codepoint left
     void deleteForward();                    // delete selection, else codepoint right

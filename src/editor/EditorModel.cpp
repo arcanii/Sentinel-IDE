@@ -210,6 +210,41 @@ void EditorModel::moveSelectionTo(size_t dest) {
     typingRun_ = false;
 }
 
+bool EditorModel::replaceRanges(const std::vector<Range>& ranges, const std::wstring& repl) {
+    if (ranges.empty()) return false;
+    // Validate the WHOLE list before touching anything. Half a Replace All is worse than
+    // none of one, and the check is a single pass over a list that is already in cache.
+    size_t prev = 0;
+    for (const Range& r : ranges) {
+        if (r.start < prev || r.end < r.start || r.end > text_.size()) return false;
+        prev = r.end;
+    }
+
+    // Build first, commit second — the identical-result test below needs the answer before
+    // any undo step is pushed, and building into a fresh string is O(n) once rather than
+    // O(n) per match (an in-place erase+insert loop shifts the whole tail every time).
+    std::wstring out;
+    out.reserve(text_.size() + ranges.size() * repl.size());
+    size_t at = 0, lastEnd = 0;
+    for (const Range& r : ranges) {
+        out.append(text_, at, r.start - at);
+        out.append(repl);
+        lastEnd = out.size();
+        at = r.end;
+    }
+    out.append(text_, at, text_.size() - at);
+
+    if (out == text_) return false;  // nothing actually changed — see the header note
+    recordPreEdit(false);      // ONE snapshot for the whole rewrite. Never extendRun: a
+                               // Replace All is not a keystroke and must not be folded
+                               // into a typing step that happens to be open.
+    text_.swap(out);
+    sel_.anchor = lastEnd - repl.size();
+    sel_.caret = lastEnd;
+    typingRun_ = false;
+    return true;
+}
+
 void EditorModel::deleteSelection() {
     if (sel_.empty()) return;
     recordPreEdit(false);

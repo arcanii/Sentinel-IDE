@@ -36,6 +36,12 @@ add_executable(SentinelIDE WIN32
   # compiled as part of BUILD_OK — Release /MT with NDEBUG, /W4 /permissive- — rather
   # than only into the EXCLUDE_FROM_ALL demo/test targets below.
   src/host/win32/D2DEditor.cpp
+  # Find / Replace (phase 49). The BAR is Win32 (a modeless band of real EDIT/BUTTON
+  # controls); the MATCHING is not, and lives in src/editor/TextSearch.cpp beside the model
+  # whose index space it works in. See docs/HANDOVER.md phase 49 for the measurement that
+  # kept the matcher in C++ rather than porting it to Sentinel.
+  src/host/win32/FindBar.cpp
+  src/editor/TextSearch.cpp
   src/editor/EditorModel.cpp
   # Joined the exe in phase 46 slice 4: the syntax-colouring rules, lifted out of
   # MainWindow.cpp::highlight() so BOTH editors run the same lexer. The RichEdit path turns
@@ -183,6 +189,22 @@ target_include_directories(syntax_lexer_test PRIVATE src)
 set_target_properties(syntax_lexer_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_test(NAME syntax_lexer COMMAND syntax_lexer_test)
 
+# text_search_test — Find/Replace, everything about it that needs no window (phase 49).
+# src/editor/TextSearch.cpp is the matcher and EditorModel::replaceRanges is what a Replace
+# All does to the buffer; both are pure C++, so the feature's load-bearing properties are
+# provable here rather than by driving a UI. The three that matter: REPLACE ALL IS ONE UNDO
+# STEP that restores the buffer character for character (a per-match loop would compile,
+# run, look right, and leave Ctrl+Z undoing the last match only); a match never splits a
+# surrogate pair (a lone-surrogate needle finds NOTHING rather than replacing half a
+# codepoint); and the case-folding boundary is exactly where TextSearch.h says it is —
+# ordinal ASCII + Latin-1 — so widening it means coming here and saying so.
+#     cmake --build build --target text_search_test  &&  build\text_search_test.exe
+add_executable(text_search_test tests/text_search_test.cpp
+  src/editor/TextSearch.cpp src/editor/EditorModel.cpp)
+target_include_directories(text_search_test PRIVATE src)
+set_target_properties(text_search_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_test(NAME text_search COMMAND text_search_test)
+
 # d2d_editor_demo — a standalone WIN32 host for src/host/win32/D2DEditor.cpp, the no-wrap
 # Direct2D editor control (phase 46 slice 2). NOT a ctest test: interactively it opens a
 # window. It exists because slice 2 deliberately does not touch MainWindow.cpp or the
@@ -210,7 +232,8 @@ add_executable(d2d_editor_demo WIN32
   tests/d2d_editor_demo.cpp
   src/host/win32/D2DEditor.cpp
   src/editor/EditorModel.cpp
-  src/editor/SyntaxLexer.cpp)
+  src/editor/SyntaxLexer.cpp
+  src/editor/TextSearch.cpp)
 target_include_directories(d2d_editor_demo PRIVATE src)
 # d2d1/dwrite: the renderer. imm32: IME composition-window placement. uxtheme+dwmapi:
 # Theme.h's SetWindowTheme (the scrollbars are the only non-D2D pixels) and the dark
@@ -237,7 +260,8 @@ add_executable(d2d_render_test
   tests/d2d_render_test.cpp
   src/host/win32/D2DEditor.cpp
   src/editor/EditorModel.cpp
-  src/editor/SyntaxLexer.cpp)
+  src/editor/SyntaxLexer.cpp
+  src/editor/TextSearch.cpp)
 target_include_directories(d2d_render_test PRIVATE src)
 target_link_libraries(d2d_render_test PRIVATE
   d2d1 dwrite imm32 uxtheme dwmapi windowscodecs ole32 advapi32)
@@ -270,8 +294,13 @@ add_test(NAME d2d_render COMMAND d2d_render_test
 add_executable(d2d_dialect_test
   tests/d2d_dialect_test.cpp
   src/host/win32/D2DEditor.cpp
+  # The REAL find bar (phase 49), not a stand-in: case 15 creates it, types into its own
+  # EDIT children and clicks its own BUTTONs, so there is no test-only search path that
+  # could pass while the shipping one is broken.
+  src/host/win32/FindBar.cpp
   src/editor/EditorModel.cpp
-  src/editor/SyntaxLexer.cpp)
+  src/editor/SyntaxLexer.cpp
+  src/editor/TextSearch.cpp)
 target_include_directories(d2d_dialect_test PRIVATE src)
 # shell32 is for the TEST, not the control: case 14 builds a CF_HDROP block and reads it
 # back with DragQueryFileW/DragFinish, exactly as MainWindow's WM_DROPFILES handler does.

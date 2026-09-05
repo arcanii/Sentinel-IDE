@@ -36,6 +36,8 @@
 #include <string>
 #include <vector>
 
+#include "editor/EditorModel.h"  // editor::Range — the find/replace API's index space
+
 namespace sentinelide {
 
 // The window class name. Register once per process before CreateWindowExW.
@@ -79,6 +81,60 @@ void d2dEditorSetFont(HWND edit, const wchar_t* face, float pointSize);
 // bookkeeping either way. (Duplicates are tolerated and sorted out here; two diagnostics on
 // one line is normal.)
 void d2dEditorSetErrorLines(HWND edit, const std::vector<int>& lines0Based);
+
+// ---- Find / Replace (phase 49) ----------------------------------------------
+//
+// FOUR calls, and the split between them is the design: three QUERIES that change nothing
+// and ONE mutation that goes through the control's whole notification funnel. The find bar
+// (src/host/win32/FindBar.cpp) holds the needle, the options and which match is current;
+// it holds no copy of the buffer and no second idea of what an offset means.
+//
+// WHY THE SEARCH LIVES BEHIND THE CONTROL rather than in the bar: the bar would otherwise
+// have to pull the whole document out through EM_GETTEXTEX on every keystroke — a full
+// copy of the buffer per character typed, next to a search that does not need one.
+// findAll runs over the model's own std::wstring, so a keystroke allocates nothing but the
+// match vector.
+
+// Every match of `needle` in the buffer, in ascending order, as UTF-16 [start, end) ranges
+// — see src/editor/TextSearch.h for the matching rules (ordinal case folding, whole-word,
+// and the refusal to split a surrogate pair). A pure query: no selection moves, nothing
+// scrolls, no notification is raised.
+void d2dEditorFindAll(HWND edit, const std::wstring& needle, bool matchCase, bool wholeWord,
+                      std::vector<editor::Range>& out);
+
+// Where the user is, so a search can start from there rather than from the top.
+void d2dEditorSelection(HWND edit, size_t& start, size_t& end);
+
+// The selected text, for seeding the find field on Ctrl+F. A SUBSTRING accessor rather
+// than d2dEditorText() + substr because the latter copies the whole document to read a
+// word out of it, and Ctrl+F on a large file should not allocate the file.
+std::wstring d2dEditorSelectedText(HWND edit);
+
+// Select [start, end) and scroll it into view. It routes through the control's OWN
+// setSelection + caretMoved — i.e. the same ensureCaretVisible, the same repaint and the
+// same EN_SELCHANGE/EN_VSCROLL the arrow keys use. There is deliberately no second
+// scrolling mechanism for find: a match that scrolled by different rules than the caret
+// would drift out of agreement with the gutter and the Ln/Col readout.
+//
+// The anchor is `start` and the caret is `end`, so Escape leaves the caret AFTER the match
+// — where typing continues from, which is what a user expects having just found something.
+void d2dEditorSelectRange(HWND edit, size_t start, size_t end);
+
+// REPLACE, and the only entry point in this API that mutates. Every range is replaced by
+// `repl` as ONE undo step (EditorModel::replaceRanges), and then — only if the buffer
+// actually changed — the FULL afterEdit funnel runs: line index, caret visibility,
+// repaint, the view notifications, and EN_CHANGE LAST.
+//
+// THAT LAST CLAUSE IS THE WHOLE POINT AND IS THIS PROJECT'S DEFECT #1 IF IT IS DROPPED.
+// g.dirty is a pure function of (editorText(), g.savedText) and EN_CHANGE is only the
+// trigger to recompute it, so a Replace All that rewrote the buffer without coming through
+// afterEdit would leave the file DISCARDABLE WITH NO PROMPT — closing the window, the file
+// or the project would throw the work away silently, and Ctrl+S would be a no-op. Nothing
+// in this API writes to the model anywhere else.
+//
+// Returns true iff the buffer changed (and therefore iff a notification was raised).
+bool d2dEditorReplaceRanges(HWND edit, const std::vector<editor::Range>& ranges,
+                            const std::wstring& repl);
 
 // ---- offscreen render (how this control's output is TESTED) -----------------
 // Renders the control's current view into a WIC bitmap the same size as its client

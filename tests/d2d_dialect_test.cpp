@@ -65,8 +65,10 @@
 #include <string>
 #include <vector>
 
+#include "editor/TextSearch.h"
 #include "host/win32/D2DEditor.h"
 #include "host/win32/D2DSupport.h"
+#include "host/win32/FindBar.h"
 
 namespace {
 
@@ -97,6 +99,13 @@ struct Counts {
 };
 Counts gC;
 
+// The find bar under test (case 15), or null. It is a file-scope handle for one
+// reason: MainWindow::onEditChanged forwards every EN_CHANGE to the bar so its match
+// count follows the buffer, and the host below has to do the same or case 15 would be
+// testing a bar that never learns the text changed — including during its OWN
+// Replace All, which is what exercises the re-entrancy guard.
+HWND gFindBar = nullptr;
+
 // The SAME dispatch shape as MainWindow.cpp: WM_COMMAND carries EN_CHANGE / EN_VSCROLL /
 // EN_HSCROLL and tests `lParam != 0` to tell a control notification from a menu command;
 // WM_NOTIFY carries EN_SELCHANGE with a SELCHANGE payload. Matching it is the point — if
@@ -106,7 +115,10 @@ Counts gC;
 LRESULT CALLBACK HostProc(HWND h, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_COMMAND && lParam != 0 && LOWORD(wParam) == kEditId) {
         switch (HIWORD(wParam)) {
-            case EN_CHANGE: ++gC.change; return 0;  // (menuCmd/menuCount live below)
+            case EN_CHANGE:
+                ++gC.change;
+                if (gFindBar) sentinelide::findBarBufferChanged(gFindBar);   // as MainWindow does
+                return 0;  // (menuCmd/menuCount live below)
             case EN_VSCROLL: ++gC.vscroll; return 0;
             case EN_HSCROLL: ++gC.hscroll; return 0;
             default: break;
@@ -1170,6 +1182,105 @@ int main(int argc, char** argv) {
         printf("     Ctrl+A reached the editor: selection %ld..%ld of 10\n", cr.cpMin, cr.cpMax);
         check(cr.cpMin == 0 && cr.cpMax == 10, "...and it selected all of the buffer");
 
+        // ---- phase 49: Ctrl+F / Ctrl+H / F3 / Shift+F3 -------------------------
+        // The find bar's fields hold the focus for most of the time the bar is open, so
+        // these four chords MUST come from the accelerator table rather than the editor's
+        // own onKeyDown — a key handled inside the control cannot be reached from a
+        // sibling edit box. This pins the routing for the four new rows, and one property
+        // of the table that is easy to get wrong.
+        //
+        // THE PROPERTY: does an ACCEL row with no FSHIFT also match F3 WITH shift held? If
+        // it did, a bare { FVIRTKEY, VK_F3 } would eat Shift+F3 and Find Previous would be
+        // unreachable from the keyboard. It does NOT — modifiers are matched exactly — and
+        // the negative control at the end of this block is what establishes that, by
+        // building the two rows in the opposite order and pressing the chord again.
+        // MainWindow's comment says the same thing because this measured it, not the other
+        // way round: the first version of that comment asserted the opposite.
+        {
+            enum : UINT { kIdFind = 1021, kIdRepl = 1022, kIdNext = 1023, kIdPrev = 1024 };
+            ACCEL a2[] = {
+                { FVIRTKEY | FCONTROL, (WORD)'F',  (WORD)kIdFind },
+                { FVIRTKEY | FCONTROL, (WORD)'H',  (WORD)kIdRepl },
+                { FVIRTKEY | FSHIFT,   VK_F3,      (WORD)kIdPrev },   // shifted row FIRST
+                { FVIRTKEY,            VK_F3,      (WORD)kIdNext },
+            };
+            HACCEL h2 = CreateAcceleratorTableW(a2, 4);
+            check(h2 != nullptr, "built the find/replace half of runApp's table");
+
+            auto pressWith = [&](WORD vk, bool ctrl, bool shift) -> bool {
+                BYTE ks[256];
+                GetKeyboardState(ks);
+                ks[VK_CONTROL] = ks[VK_LCONTROL] = ctrl ? 0x80 : 0x00;
+                ks[VK_SHIFT] = ks[VK_LSHIFT] = shift ? 0x80 : 0x00;
+                SetKeyboardState(ks);
+                drainQueueUndispatched();
+                gC.menuCmd = 0;
+                gC.menuCount = 0;
+                PostMessageW(edit, WM_KEYDOWN, vk, 1);
+                MSG m;
+                if (!PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) return false;
+                const bool eaten = TranslateAcceleratorW(host, h2, &m) != 0;
+                if (!eaten) { TranslateMessage(&m); DispatchMessageW(&m); }
+                return eaten;
+            };
+
+            struct { WORD vk; bool ctrl, shift; UINT id; const char* name; } rows[4] = {
+                { 'F',   true,  false, kIdFind, "Ctrl+F -> ID_FIND" },
+                { 'H',   true,  false, kIdRepl, "Ctrl+H -> ID_FIND_REPLACE" },
+                { VK_F3, false, false, kIdNext, "F3 -> ID_FIND_NEXT" },
+                { VK_F3, false, true,  kIdPrev, "Shift+F3 -> ID_FIND_PREV" },
+            };
+            for (const auto& r : rows) {
+                const bool eaten = pressWith(r.vk, r.ctrl, r.shift);
+                printf("     %s: consumed=%d, host got command %u\n", r.name, (int)eaten, gC.menuCmd);
+                check(eaten, "the accelerator consumed it");
+                check(gC.menuCount == 1 && gC.menuCmd == r.id,
+                      "...and the host received exactly that command, once");
+            }
+            // Said out loud because the whole reason the shifted row is listed first is
+            // that this could go either way: Shift+F3 must NOT come out as Find Next.
+            check(gC.menuCmd == kIdPrev,
+                  "Shift+F3 resolved to PREVIOUS, not to the unshifted F3 row");
+            DestroyAcceleratorTable(h2);
+
+            // THE NEGATIVE CONTROL, because "the shifted row must come first" is a claim
+            // and claims in comments rot. Build the SAME two rows in the OPPOSITE order and
+            // press Shift+F3 again. Whatever comes out is what the ACCEL matching rule
+            // really is, and MainWindow's comment has to agree with it.
+            {
+                ACCEL rev[] = {
+                    { FVIRTKEY,          VK_F3, (WORD)kIdNext },   // unshifted row FIRST
+                    { FVIRTKEY | FSHIFT, VK_F3, (WORD)kIdPrev },
+                };
+                HACCEL h3 = CreateAcceleratorTableW(rev, 2);
+                BYTE ks[256];
+                GetKeyboardState(ks);
+                ks[VK_CONTROL] = ks[VK_LCONTROL] = 0x00;
+                ks[VK_SHIFT] = ks[VK_LSHIFT] = 0x80;
+                SetKeyboardState(ks);
+                drainQueueUndispatched();
+                gC.menuCmd = 0;
+                gC.menuCount = 0;
+                PostMessageW(edit, WM_KEYDOWN, VK_F3, 1);
+                MSG m;
+                bool eaten = false;
+                if (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE))
+                    eaten = TranslateAcceleratorW(host, h3, &m) != 0;
+                printf("     NEGATIVE CONTROL - unshifted row first, Shift+F3 -> command %u"
+                       " (%s)\n", gC.menuCmd,
+                       gC.menuCmd == kIdPrev ? "PREV: modifiers are matched EXACTLY, order is"
+                                               " not load-bearing"
+                                             : "NEXT: an unshifted row DOES swallow the"
+                                               " shifted chord - order IS load-bearing");
+                check(eaten, "the reversed table still consumed the chord");
+                // Pinned either way: whichever answer this is, a change to it changes what
+                // MainWindow's table has to look like, and that must not happen silently.
+                check(gC.menuCmd == kIdPrev,
+                      "ACCEL modifiers are matched EXACTLY - FSHIFT is required to match Shift");
+                DestroyAcceleratorTable(h3);
+            }
+        }
+
         SetKeyboardState(saved);
         DestroyAcceleratorTable(hAccel);
         drainQueueUndispatched();
@@ -1512,6 +1623,265 @@ int main(int argc, char** argv) {
         printf("     not covered without a mouse: the drag threshold, DoDragDrop's modal\n"
                "     loop and the drop SOURCE (including the external-move delete), the\n"
                "     drop caret's pixels, cross-process transfer, and edge autoscroll.\n");
+    }
+
+    // ---- 15 -----------------------------------------------------------------
+    // FIND / REPLACE (phase 49), driven through the SHIPPING objects: the control's own
+    // find API, and the real FindBar window with its real EDIT and BUTTON children. There
+    // is no test-only search path — a keystroke here goes WM_CHAR -> the field -> EN_CHANGE
+    // -> the bar's handler, exactly as it does with a finger on the key.
+    //
+    // THE ASSERTION THIS CASE EXISTS FOR is 15c: a Replace All must raise EN_CHANGE
+    // SYNCHRONOUSLY. g.dirty is recomputed from that notification and from nothing else, so
+    // a Replace All that mutated the buffer without it would leave the file discardable
+    // with NO PROMPT — this project's defect #1, arriving through a brand-new code path.
+    // The check is the same shape as case 8's: drain the queue, send once, and require BOTH
+    // that the counter moved by the time the call returned AND that nothing was left queued.
+    printf("\n15. find / replace: the control's API and the real find bar\n");
+    {
+        // The buffer as the CONTROL reports it, through the same EM_GETTEXTLENGTHEX +
+        // EM_GETTEXTEX pair saveFile uses — so "the replace worked" is asserted on the
+        // bytes that would reach disk, not on an internal accessor.
+        auto textNow = [&]() {
+            LONG n = -1, got = -1;
+            return editorTextFetch(edit, n, got);
+        };
+
+        // Three lines with a known, hand-countable population of "let".
+        const std::wstring doc = L"let a = 1\nLET b = 2\nlet c = 3\nletter = 4\n";
+        SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)doc.c_str());
+
+        // -- (a) the query half changes nothing ----------------------------------
+        std::vector<editor::Range> m;
+        gC = Counts{};
+        sentinelide::d2dEditorFindAll(edit, L"let", false, false, m);
+        printf("     'let' case-insensitive -> %zu matches\n", m.size());
+        check(m.size() == 4, "four matches (three statements + 'letter'), case-insensitive");
+        sentinelide::d2dEditorFindAll(edit, L"let", true, false, m);
+        check(m.size() == 3, "three with Match case on - the LET is skipped");
+        sentinelide::d2dEditorFindAll(edit, L"let", false, true, m);
+        check(m.size() == 3, "three with Whole word on - 'letter' is skipped");
+        check(gC.change == 0 && gC.selchange == 0,
+              "SEARCHING RAISES NOTHING - it is a query, not an edit");
+        check(textNow() == doc, "...and does not touch the buffer");
+
+        // -- (b) selecting a match uses the control's own selection + scroll ------
+        sentinelide::d2dEditorFindAll(edit, L"let", false, false, m);
+        gC = Counts{};
+        drainQueueUndispatched();
+        sentinelide::d2dEditorSelectRange(edit, m[2].start, m[2].end);
+        CHARRANGE cr = getSel(edit);
+        printf("     selected match 3 -> %ld..%ld (wanted %zu..%zu)\n",
+               cr.cpMin, cr.cpMax, m[2].start, m[2].end);
+        check(cr.cpMin == (LONG)m[2].start && cr.cpMax == (LONG)m[2].end,
+              "the match is SELECTED in the control");
+        check(gC.selchange == 1 && gC.selMin == (LONG)m[2].start,
+              "...and EN_SELCHANGE reported it, so the Ln/Col readout follows");
+        check(gC.change == 0, "...and NO EN_CHANGE - finding is not an edit");
+
+        // Scrolled into view: put a match far below the fold and check the control moved
+        // to it. The window is 80 lines tall at most in this host, so 400 lines is safely
+        // off-screen either way round.
+        {
+            std::wstring big;
+            for (int i = 0; i < 400; ++i) big += L"filler line\n";
+            big += L"NEEDLE here\n";
+            SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)big.c_str());
+            SendMessageW(edit, EM_SETSEL, 0, 0);   // caret at the top
+            const LONG topBefore = (LONG)SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+            std::vector<editor::Range> far_;
+            sentinelide::d2dEditorFindAll(edit, L"NEEDLE", false, false, far_);
+            check(far_.size() == 1, "one match, 400 lines down");
+            sentinelide::d2dEditorSelectRange(edit, far_[0].start, far_[0].end);
+            const LONG topAfter = (LONG)SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+            printf("     first visible line %ld -> %ld after selecting the match\n",
+                   topBefore, topAfter);
+            check(topBefore == 0, "the view really did start at the top");
+            check(topAfter > 300, "SCROLLED INTO VIEW - through ensureCaretVisible, not a copy of it");
+        }
+
+        // -- (c) REPLACE ALL: one undo step, and EN_CHANGE synchronously ----------
+        SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)doc.c_str());
+        sentinelide::d2dEditorFindAll(edit, L"let", false, false, m);
+        check(m.size() == 4, "four matches to replace");
+        check(SendMessageW(edit, EM_CANUNDO, 0, 0) == 0,
+              "WM_SETTEXT cleared the undo buffer, as RichEdit's does");
+        gC = Counts{};
+        drainQueueUndispatched();
+        const bool did = sentinelide::d2dEditorReplaceRanges(edit, m, L"const");
+        check(did, "the control reports that the buffer changed");
+        printf("     EN_CHANGE count immediately after the call returned: %d\n", gC.change);
+        check(gC.change == 1,
+              "EN_CHANGE fired SYNCHRONOUSLY - g.dirty is recomputed from this and nothing else");
+        check(!queueHasCommandFor(host),
+              "...and nothing was left POSTED (a posted one is the lost-buffer failure mode)");
+        check(textNow().find(L"let ") == std::wstring::npos, "no 'let ' survives");
+        check(textNow().find(L"const a = 1") == 0, "...and the replacement really is in the text");
+
+        check(SendMessageW(edit, EM_CANUNDO, 0, 0) != 0, "there is something to undo");
+        SendMessageW(edit, EM_UNDO, 0, 0);
+        check(textNow() == doc,
+              "ONE undo restored the buffer EXACTLY - Replace All is a single step");
+        check(SendMessageW(edit, EM_CANUNDO, 0, 0) == 0,
+              "...and there is nothing behind it: four matches, one step");
+
+        // -- (d) a replace that changes nothing raises nothing --------------------
+        // A Replace All of "let" with "let" must not mark a clean file dirty. g.dirty is
+        // recomputed on EN_CHANGE, so a spurious notification is cheap — but the undo step
+        // it would sit next to is not: the user would have to press Ctrl+Z past an edit
+        // they cannot see.
+        sentinelide::d2dEditorFindAll(edit, L"let", true, false, m);
+        gC = Counts{};
+        const bool noop = sentinelide::d2dEditorReplaceRanges(edit, m, L"let");
+        check(!noop, "an identical rewrite reports NO change");
+        check(gC.change == 0, "...raises no EN_CHANGE");
+        check(SendMessageW(edit, EM_CANUNDO, 0, 0) == 0, "...and pushes no undo step");
+
+        // -- (e) surrogate pairs survive a replace --------------------------------
+        {
+            const std::wstring astral = L"x\U0001F600y\U0001F600z";
+            SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)astral.c_str());
+            std::vector<editor::Range> lone;
+            // Half a pair: the shape a find field really can hold via paste or an IME.
+            sentinelide::d2dEditorFindAll(edit, std::wstring(1, (wchar_t)0xDE00), false, false, lone);
+            check(lone.empty(), "a lone-surrogate needle finds NOTHING in the control either");
+            std::vector<editor::Range> whole;
+            sentinelide::d2dEditorFindAll(edit, L"\U0001F600", false, false, whole);
+            check(whole.size() == 2, "the two whole astral characters are found");
+            sentinelide::d2dEditorReplaceRanges(edit, whole, L"-");
+            check(textNow() == L"x-y-z", "...and replacing them leaves a well-formed buffer");
+        }
+
+        // -- (f) the REAL find bar, driven by real keystrokes ---------------------
+        SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)doc.c_str());
+        SendMessageW(edit, EM_SETSEL, 0, 0);
+        HWND bar = sentinelide::createFindBar(host, edit, GetModuleHandleW(nullptr), 96, nullptr);
+        check(bar != nullptr, "the find bar window was created");
+        if (bar) {
+            gFindBar = bar;   // so the host forwards EN_CHANGE, exactly as MainWindow does
+            check(!sentinelide::findBarVisible(bar), "it is created CLOSED");
+            check(sentinelide::findBarHeight(bar) == 0, "...and takes no height while closed");
+
+            sentinelide::showFindBar(bar, false);
+            check(sentinelide::findBarVisible(bar), "Ctrl+F opens it");
+            check(sentinelide::findBarHeight(bar) > 0, "...and it now claims a band");
+            HWND field = GetDlgItem(bar, sentinelide::kFindField);
+            check(field != nullptr, "the find field exists");
+            check(GetFocus() == field, "...and it has the focus, so you can just type");
+
+            // TYPE, one WM_CHAR at a time. This is the find-as-you-type path: the EDIT
+            // control raises EN_CHANGE per character and the bar re-runs the whole search.
+            auto typeInto = [&](HWND h, const wchar_t* s) {
+                SetFocus(h);
+                SendMessageW(h, EM_SETSEL, 0, -1);
+                SendMessageW(h, WM_CLEAR, 0, 0);
+                for (const wchar_t* p = s; *p; ++p) SendMessageW(h, WM_CHAR, (WPARAM)*p, 1);
+            };
+            typeInto(field, L"let");
+            sentinelide::FindBarStatus s = sentinelide::findBarStatus(bar);
+            printf("     typed \"let\" -> count=%d current=%d\n", s.count, s.current);
+            check(s.count == 4, "typing found all four matches");
+            check(s.current == 0, "...and landed on the first, the caret being at the top");
+            cr = getSel(edit);
+            check(cr.cpMin == 0 && cr.cpMax == 3, "...which is SELECTED in the editor");
+
+            // Next, next, next, and the WRAP.
+            HWND bNext = GetDlgItem(bar, sentinelide::kFindNext);
+            HWND bPrev = GetDlgItem(bar, sentinelide::kFindPrev);
+            check(bNext && bPrev, "the Next and Previous buttons exist");
+            for (int i = 1; i <= 3; ++i) {
+                SendMessageW(bNext, BM_CLICK, 0, 0);
+                s = sentinelide::findBarStatus(bar);
+                check(s.current == i, "Next stepped to the following match");
+            }
+            SendMessageW(bNext, BM_CLICK, 0, 0);
+            s = sentinelide::findBarStatus(bar);
+            printf("     Next from the last match -> current=%d\n", s.current);
+            check(s.current == 0, "NEXT FROM THE LAST MATCH WRAPS to the first");
+            SendMessageW(bPrev, BM_CLICK, 0, 0);
+            s = sentinelide::findBarStatus(bar);
+            printf("     Previous from the first -> current=%d\n", s.current);
+            check(s.current == 3, "PREVIOUS FROM THE FIRST WRAPS to the last");
+
+            // The no-match state, and that it moves nothing.
+            cr = getSel(edit);
+            const CHARRANGE before = cr;
+            typeInto(field, L"zzqq");
+            s = sentinelide::findBarStatus(bar);
+            printf("     typed \"zzqq\" -> count=%d current=%d\n", s.count, s.current);
+            check(s.count == 0 && s.current == -1, "a needle that is not there is a clean no-match");
+            cr = getSel(edit);
+            check(cr.cpMin == before.cpMin && cr.cpMax == before.cpMax,
+                  "...and a no-match moves NOTHING in the editor");
+
+            // Match case and Whole word, through the real checkboxes.
+            typeInto(field, L"let");
+            HWND kCase = GetDlgItem(bar, sentinelide::kFindMatchCase);
+            HWND kWord = GetDlgItem(bar, sentinelide::kFindWholeWord);
+            SendMessageW(kCase, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(bar, WM_COMMAND, MAKEWPARAM(sentinelide::kFindMatchCase, BN_CLICKED), (LPARAM)kCase);
+            check(sentinelide::findBarStatus(bar).count == 3, "Match case drops the LET");
+            SendMessageW(kCase, BM_SETCHECK, BST_UNCHECKED, 0);
+            SendMessageW(kWord, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(bar, WM_COMMAND, MAKEWPARAM(sentinelide::kFindWholeWord, BN_CLICKED), (LPARAM)kWord);
+            check(sentinelide::findBarStatus(bar).count == 3, "Whole word drops 'letter'");
+            SendMessageW(kWord, BM_SETCHECK, BST_UNCHECKED, 0);
+            SendMessageW(bar, WM_COMMAND, MAKEWPARAM(sentinelide::kFindWholeWord, BN_CLICKED), (LPARAM)kWord);
+
+            // REPLACE ALL through the bar, and the dirty notification behind it.
+            sentinelide::showFindBar(bar, true);
+            check(sentinelide::findBarStatus(bar).replaceMode, "Ctrl+H switches to Replace mode");
+            HWND rfield = GetDlgItem(bar, sentinelide::kFindReplaceField);
+            HWND bAll = GetDlgItem(bar, sentinelide::kFindReplaceAll);
+            check(rfield && bAll, "the replace field and the Replace All button exist");
+            typeInto(field, L"let");
+            typeInto(rfield, L"const");
+            const std::wstring beforeAll = textNow();
+            gC = Counts{};
+            drainQueueUndispatched();
+            SendMessageW(bAll, BM_CLICK, 0, 0);
+            printf("     Replace All via the button -> EN_CHANGE x%d, buffer now %zu chars\n",
+                   gC.change, textNow().size());
+            check(gC.change >= 1, "Replace All raised EN_CHANGE - the buffer is marked dirty");
+            check(!queueHasCommandFor(host), "...and nothing was left posted");
+            check(textNow().find(L"let ") == std::wstring::npos, "every 'let ' is gone");
+            check(sentinelide::findBarStatus(bar).count == 0, "...and the bar now counts none");
+            SendMessageW(edit, EM_UNDO, 0, 0);
+            check(textNow() == beforeAll, "ONE undo through the bar's own path restores it exactly");
+
+            // ESCAPE, through the mechanism runApp actually uses. IsDialogMessageW is what
+            // turns the key into WM_COMMAND(IDCANCEL); nothing else would.
+            sentinelide::showFindBar(bar, false);
+            SetFocus(field);
+            drainQueueUndispatched();
+            PostMessageW(field, WM_KEYDOWN, VK_ESCAPE, 1);
+            MSG em;
+            bool handled = false;
+            if (PeekMessageW(&em, nullptr, 0, 0, PM_REMOVE))
+                handled = IsDialogMessageW(bar, &em) != FALSE;
+            printf("     Escape through IsDialogMessageW: handled=%d, visible=%d, focus==editor %d\n",
+                   (int)handled, (int)sentinelide::findBarVisible(bar), (int)(GetFocus() == edit));
+            check(handled, "IsDialogMessageW claimed the Escape");
+            check(!sentinelide::findBarVisible(bar), "...the bar CLOSED");
+            check(sentinelide::findBarHeight(bar) == 0, "...gave its band back");
+            check(GetFocus() == edit, "...and the focus returned to the EDITOR");
+
+            gFindBar = nullptr;
+            DestroyWindow(bar);
+        }
+
+        // NOT COVERED HERE, said plainly. All of it needs a real pointer or a foreground
+        // window, which an automated session cannot arrange:
+        //   * the bar's PIXELS - the band, the dark field, the red "No results" - which is
+        //     d2d_render_test's business and it renders the editor, not this bar;
+        //   * a real mouse click on a button (BM_CLICK sends the same WM_COMMAND the click
+        //     would, but not the hit-test or the pressed state);
+        //   * Tab order between the fields and the buttons: IsDialogMessageW is exercised
+        //     above for Escape, but the Tab cycle is USER32's own and is not re-tested here;
+        //   * the actual keyboard -> TranslateAcceleratorW link for Ctrl+F / Ctrl+H / F3,
+        //     which case 13 reaches only by faking the key state.
+        printf("     not covered without a mouse or a foreground window: the bar's pixels,\n"
+               "     a real button click, the Tab cycle, and the hardware key link.\n");
     }
 
     DestroyWindow(edit);

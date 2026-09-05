@@ -90,6 +90,7 @@
 #include "core/Logger.h"
 #include "editor/EditorModel.h"
 #include "editor/SyntaxLexer.h"
+#include "editor/TextSearch.h"
 #include "host/win32/D2DSupport.h"
 #include "host/win32/Theme.h"
 
@@ -2616,11 +2617,20 @@ LRESULT CALLBACK D2DEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return static_cast<LRESULT>(n);
         }
         // ===== the RichEdit message dialect (slice 3) ============================
-        // Exactly the messages MainWindow.cpp sends to g.hEdit, and nothing else. Grepped:
-        // there is no Find/Replace and no printing in this product, so EM_FINDTEXT*,
+        // Exactly the messages MainWindow.cpp sends to g.hEdit, and nothing else.
         // EM_FORMATRANGE, EM_STREAM*, EM_SETZOOM, EM_GETMODIFY, EM_LIMITTEXT,
         // EM_CHARFROMPOS, EM_GETSEL/EM_SETSEL and EM_LINEFROMCHAR are deliberately absent —
         // implementing messages nobody sends is untested code pretending to be a contract.
+        //
+        // EM_FINDTEXT* IS STILL ABSENT, AND THAT IS NOT AN OVERSIGHT NOW THAT PHASE 49 HAS
+        // ADDED FIND/REPLACE. This comment used to say "there is no Find/Replace in this
+        // product"; there is, and it deliberately does NOT ride on this dialect. EM_FINDTEXT
+        // is a RichEdit message that answers one match at a time and knows nothing about
+        // whole-word rules, surrogate pairs or a match COUNT — and find-as-you-type needs
+        // every match on every keystroke. So the search is d2dEditorFindAll (see the bottom
+        // of this file), running src/editor/TextSearch.cpp over the model's own buffer with
+        // no message, no marshalling and no copy. Adding EM_FINDTEXT* now would be a second,
+        // weaker answer to a question this control already answers.
         // EM_SETREADONLY / EM_REPLACESEL / EM_GETTEXTRANGE / ENM_LINK belong to g.hOut, the
         // Output pane, which stays RichEdit permanently.
 
@@ -3035,6 +3045,63 @@ void d2dEditorSetErrorLines(HWND edit, const std::vector<int>& lines0Based) {
     st->errorLines.erase(std::unique(st->errorLines.begin(), st->errorLines.end()),
                          st->errorLines.end());
     InvalidateRect(edit, nullptr, FALSE);
+}
+
+// ---- Find / Replace (phase 49) ----------------------------------------------
+// See D2DEditor.h for why the search lives behind the control rather than in the find bar.
+
+void d2dEditorFindAll(HWND edit, const std::wstring& needle, bool matchCase, bool wholeWord,
+                      std::vector<editor::Range>& out) {
+    out.clear();
+    EditorState* st = state(edit);
+    if (!st) return;
+    editor::SearchOptions opt;
+    opt.matchCase = matchCase;
+    opt.wholeWord = wholeWord;
+    editor::findAll(st->model.text(), needle, opt, out);
+}
+
+void d2dEditorSelection(HWND edit, size_t& start, size_t& end) {
+    start = end = 0;
+    EditorState* st = state(edit);
+    if (!st) return;
+    const editor::Selection sel = st->model.selection();
+    start = sel.min();
+    end = sel.max();
+}
+
+std::wstring d2dEditorSelectedText(HWND edit) {
+    EditorState* st = state(edit);
+    if (!st) return std::wstring();
+    const editor::Selection sel = st->model.selection();
+    return st->model.text().substr(sel.min(), sel.max() - sel.min());
+}
+
+void d2dEditorSelectRange(HWND edit, size_t start, size_t end) {
+    EditorState* st = state(edit);
+    if (!st) return;
+    // setSelection SNAPS both ends off a surrogate boundary, so even a range that somehow
+    // arrived split cannot put the caret inside a pair. TextSearch never produces one (it
+    // discards such matches outright) — this is the second of the two guards, and having
+    // both is deliberate: the model's is the one that holds for every caller.
+    st->model.setSelection(start, end);
+    // The control's own path: ensureCaretVisible + repaint + EN_SELCHANGE/EN_VSCROLL, and
+    // never EN_CHANGE — finding something is not an edit. resetDesiredX is true because a
+    // jump to a match is a horizontal move, so the sticky up/down column must be forgotten
+    // exactly as it is after an arrow-key move.
+    caretMoved(st, true);
+}
+
+bool d2dEditorReplaceRanges(HWND edit, const std::vector<editor::Range>& ranges,
+                            const std::wstring& repl) {
+    EditorState* st = state(edit);
+    if (!st) return false;
+    // ONE call, ONE undo step. And afterEdit ONLY when the model says the buffer really
+    // changed — see the header: this is the funnel that recomputes g.dirty, and it must
+    // run for every mutation and for nothing else.
+    if (!st->model.replaceRanges(ranges, repl)) return false;
+    afterEdit(st);
+    return true;
 }
 
 void d2dEditorUpdateDpi(HWND edit, UINT dpi) {
