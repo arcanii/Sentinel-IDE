@@ -225,6 +225,15 @@ treat that as a safety net, never as the plan.
 6. **Commit and push `appcast.xml`** on `main`. `raw.githubusercontent.com` serves it
    within seconds.
 
+   > **Re-run `ctest` after this commit, not just before it.** `tests/appcast_xcheck.cpp`
+   > reads the real `appcast.xml`, so bumping the feed can turn a green suite red *after*
+   > the release is already out. That happened at v0.1.13: the three real-feed cases pinned
+   > the literal `0.1.12.196`, the appcast commit moved the feed to `0.1.13.202`, and
+   > `appcast_parity` was red at `HEAD` with the release already published — nobody re-ran
+   > the tests after the last commit of the procedure. Those cases now derive the version
+   > from the feed and assert the *relation* rather than a literal, so this should not
+   > recur; the step is here because the class of mistake will.
+
 7. **Verify before announcing** — fetch the feed and the enclosure yourself:
    ```powershell
    Invoke-WebRequest https://raw.githubusercontent.com/arcanii/Sentinel-IDE/main/appcast.xml
