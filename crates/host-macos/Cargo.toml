@@ -1,0 +1,22 @@
+[package]
+name = "host-macos"
+description = "Sentinel-IDE's macOS host: AppKit, from Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "sentinel-ide"
+path = "src/main.rs"
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+sentinel-sys = { path = "../sentinel-sys" }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"

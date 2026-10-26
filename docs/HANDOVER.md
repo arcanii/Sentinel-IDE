@@ -56,9 +56,10 @@ exist so far:
   the broken one. See **Releases** below and `docs/RELEASING.md` for the cut procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
-- **A macOS port has started, in Rust + Sentinel** (2026-10-25). Milestone M0 — a Cargo workspace
-  beside CMake, the Sentinel library as a dylib with safe decoders, a portable `ide-core`, and every
-  parity test ported — is in place; there is no Mac UI yet. See **macOS port** below.
+- **A macOS port has started, in Rust + Sentinel** (2026-10-25). M0 — a Cargo workspace beside CMake,
+  the Sentinel library as a dylib with safe decoders, a portable `ide-core`, every parity test ported —
+  and M1 — a native AppKit window driven from Rust, with the project tree, Build/Run, Output and
+  Problems, bundled as `Sentinel-IDE.app` — are in place. See **macOS port** below.
 
 ---
 
@@ -217,7 +218,7 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
 
-## macOS port — Rust + Sentinel (M0, 2026-10-25)
+## macOS port — Rust + Sentinel (M0 + M1, 2026-10-26)
 
 The Mac version is **Rust and Sentinel, with no C++, Objective-C or Swift**. It lives in a Cargo
 workspace at the repo root, beside the CMake build; `scripts\build.bat` never reads it and the Windows
@@ -229,20 +230,48 @@ build is untouched. Measured on an Apple-silicon Mac, macOS 27.0.1, with `../Sen
 | `crates/sentinel-sys/build.rs` | Runs `snc build --lib src/sentinel/parsers.sentinel`, then **re-links the archive into `libsentinel_parsers.dylib`** exporting only the functions the generated header declares (the list is read from the header, so a new `export "C"` fn needs no edit here). Finds snc via `$SNC`, `$SENTINEL_LANG`, a sibling `../Sentinel-lang`, then PATH. No snc, no build — there is no C++ fallback on the Mac. |
 | `crates/sentinel-sys/src/lib.rs` | One safe function per export, decoding its record into a typed value. Unlike the C++ decoders every read is **bounds-checked** — a short record is a `RecordError`, never an over-read. |
 | `crates/sentinel-sys/tests/*_parity.rs` | diag, trust, sig, appcast, seal. |
-| `crates/ide-core/src/` | The portable half: `project` (load/save via Sentinel, defaults, `build_plan` = composeBuild as arguments), `signing` (trust, `.sig`, `snc verify`, signing caps), `settings` (the same `settings.ini`, in `~/Library/Application Support/SentinelIDE/`), `stamp` (FileStamp.h whole), `proc`, `logger` (UTC), `toolchain` (findSnc). |
+| `crates/ide-core/src/` | The portable half: `project` (load/save via Sentinel, defaults, `build_plan` = composeBuild as arguments), `signing` (trust, `.sig`, `snc verify`, signing caps), `settings` (the same `settings.ini`, in `~/Library/Application Support/SentinelIDE/`), `stamp` (FileStamp.h whole), `proc` (capture, and `run_streaming` — the Build/Run worker), `logger` (UTC), `toolchain` (findSnc), `tree` (addDir/populateProject/openPathArg as data), `buildlog` (WM_APP_LINE: line colours, the `×` message + location pairing, the Problems list). |
 | `crates/ide-core/tests/` | manifest + saveproject parity, the save round trip, file stamps, and `snc_integration` (real verify + a real build of `examples/`). |
+| `crates/host-macos/` | **The Mac app (M1).** One Objective-C class defined in Rust (`controller.rs`): app delegate, tree and Problems data source, Output link handler, toolbar delegate, menu target. `ui.rs` builds the window and menu bar; `palette.rs` is Theme.h's colours as appearance-following NSColors. |
+| `scripts/make-macos-app.sh`, `packaging/macos/Info.plist` | → `build/macos/Sentinel-IDE.app`: the binary, the dylib in `Contents/Frameworks`, icons from `art/`, the `.sntproject`/`.sentinel` document types, ad-hoc signed. Build number = commit count + `BUILDBASE`, as `build.bat`. `*.sh` is `eol=lf` in `.gitattributes` — bash cannot run a CRLF script. |
 
 ```
 cargo test --workspace                 # needs snc — see the build.rs row
 cargo clippy --workspace --all-targets -- -D warnings
+scripts/make-macos-app.sh              # → build/macos/Sentinel-IDE.app (MACOS_APP_OK)
+cargo run -p host-macos -- examples --run --exit-when-done      # the real app's build loop; exits 42
+cargo run -p host-macos -- examples --run --snapshot /tmp/w.png # the window, drawn offscreen
 ```
+
+**M1, what the window does.** Open a folder, a `.sntproject` or a `sentinel.toml` (⌘O, Open Recent,
+a document double-click, or the command line); the tree shows the project, its manifest and trust
+file, its targets and its `.sentinel` sources, and a click shows a file — read-only until M2. A target
+node makes that target active (the subtitle names project › target (type) · tier). ⌘B builds the
+active target through `build_plan`, streaming coloured output into Output; every `file:line:col` is a
+link and a Problem, and either one opens the file at that line. **⌘R builds, then runs** — a
+deliberate difference from Windows, where Run runs whatever was built last: on a Mac ⌘R means build
+and run, and it cannot run a stale binary. Not in M1: signing the artifact after a build (Windows
+phase 23), the target ▾ / tier ▾ popups, Settings, About beyond the standard panel — all M3.
+
+**How M1 was verified, and what was not.** `--exit-when-done` drives the real app's loop from a shell:
+`examples --run` exits 42 (the crypto target), a project with a type error exits 1 and prints
+`problem: …/main.sentinel:2:18 type mismatch: expected i64, found bool`; the bundled binary loads its
+own `Frameworks` copy of the dylib (`DYLD_PRINT_LIBRARIES`). `--snapshot` has the app draw its own
+window frame into a PNG — the `d2d_render` idea: no screen capture, no permission, no window in front.
+It showed the titlebar, subtitle, toolbar, tree, viewer, the coloured transcript and the Problems row.
+**Unverified:** the Problems/Output tab labels render as a blank pill in that offscreen drawing (a
+limit of `cacheDisplayInRect`, or a real defect — not yet looked at on screen); and no click — on a
+Problem, a link, a tree row or a menu — has been made by hand, because screen control of the app was
+declined. The click paths share `goto`, whose line arithmetic is unit-tested (`line_range`, including
+a wrapped line number).
 
 **Why a dylib and not the static archive.** snc's archive bundles the Sentinel runtime, a Rust
 staticlib with its own copy of Rust's std. Linked straight into a Rust binary that is two stds in one
 image: ld reports a duplicate `_rust_eh_personality` and which panic runtime wins is left to link
 order. Inside a dylib the runtime's std is private (two-level namespace). ~470 KB, nine exports. The
-app bundle will carry it in `Contents/Frameworks`; test binaries find it by an rpath that
-`ide-core/build.rs` adds from sentinel-sys's `links` metadata.
+app bundle carries it in `Contents/Frameworks` (the bundle script deletes the build-tree rpath, so the
+app can only load its own copy); test binaries find it by an rpath that `ide-core/build.rs` adds from
+sentinel-sys's `links` metadata.
 
 **Measured, and worth knowing before the next step:**
 
@@ -284,7 +313,7 @@ cross-check proved both sides produce; **seal** synthesises its containers byte 
 corpus was built with CNG and LZMS. Every oracle was mutated once to confirm its test fails (appcast:
 two expectations flipped).
 
-**Milestones.** M0 (this) · M1 window, project tree, Output, Build/Run, Problems — AppKit through
+**Milestones.** M0 ✓ · M1 ✓ window, project tree, Output, Build/Run, Problems — AppKit through
 `objc2` · M2 editor · M3 scheme selector, Project Settings, Signing & Trust, recents, About · M4
 sealing · M5 signing, notarisation, auto-update. Open decisions: the editor (`NSTextView` with
 temporary-attribute colouring vs a custom Core Text view over a Rust `EditorModel`), the sealed

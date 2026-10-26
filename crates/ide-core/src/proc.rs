@@ -63,9 +63,78 @@ where
     Ok(Captured { status, output: strip_ansi(&String::from_utf8_lossy(&bytes)) })
 }
 
+/// Run `program args…` in `dir` and hand each line of its merged output to `on_line` as it
+/// arrives — the Build/Run loop (MainWindow.cpp's `worker`). Lines lose their `\n` and one
+/// trailing `\r`, are decoded lossily and ANSI-stripped; a final line without a newline is
+/// still delivered. Blocks until the child exits, so call it off the UI thread.
+pub fn run_streaming<I, S>(
+    program: &Path,
+    args: I,
+    dir: Option<&Path>,
+    mut on_line: impl FnMut(String),
+) -> io::Result<ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let (mut reader, writer) = io::pipe()?;
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer);
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    let mut child = cmd.spawn()?;
+    drop(cmd);
+    let mut emit = |raw: &[u8]| {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        on_line(strip_ansi(&String::from_utf8_lossy(raw)));
+    };
+    let (mut pending, mut chunk) = (Vec::new(), [0u8; 4096]);
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        pending.extend_from_slice(&chunk[..n]);
+        // Split on bytes, not chars: a multi-byte character can straddle two reads, and
+        // decoding a half of it would turn one é into two U+FFFDs.
+        while let Some(i) = pending.iter().position(|&b| b == b'\n') {
+            emit(&pending[..i]);
+            pending.drain(..=i);
+        }
+    }
+    if !pending.is_empty() {
+        emit(&pending);
+    }
+    child.wait()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streams_lines_in_order_including_an_unterminated_last_one() {
+        let mut lines = Vec::new();
+        let status = run_streaming(
+            Path::new("/bin/sh"),
+            [
+                "-c",
+                "printf 'one\\r\\ntwo\\n'; printf 'caf\\303\\251 \\033[31mred\\033[0m\\n' >&2; printf 'tail'",
+            ],
+            None,
+            |l| lines.push(l),
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(lines, ["one", "two", "café red", "tail"]);
+    }
 
     #[test]
     fn strips_colour_and_keeps_text() {

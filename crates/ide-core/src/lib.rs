@@ -16,6 +16,8 @@
 //! | `proc`      | `Proc.h`             | merged stdout+stderr, ANSI-stripped            |
 //! | `logger`    | `Logger.h`           | timestamps in UTC                              |
 //! | `toolchain` | `findSnc` (MainWindow.cpp) | no MSVC environment on macOS             |
+//! | `tree`      | `addDir` / `populateProject` / `openPathArg` | the tree as data      |
+//! | `buildlog`  | MainWindow.cpp's `WM_APP_LINE` | line colours + the Problems list         |
 //!
 //! Not here yet, on purpose: sealing (`Seal.h`'s crypto — milestone M4), file
 //! associations and single-instance (the OS does both on macOS), and the editor.
@@ -23,6 +25,7 @@
 use std::fmt;
 use std::io;
 
+pub mod buildlog;
 pub mod logger;
 pub mod proc;
 pub mod project;
@@ -30,6 +33,7 @@ pub mod settings;
 pub mod signing;
 pub mod stamp;
 pub mod toolchain;
+pub mod tree;
 
 pub use sentinel_sys::RecordError;
 

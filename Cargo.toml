@@ -8,9 +8,10 @@
 #                        snc and re-linked as a dylib, plus safe decoders for its records
 #   crates/ide-core      the portable IDE logic over it: project, signing, settings,
 #                        file stamps, processes, logging — no AppKit, no Win32
+#   crates/host-macos    the macOS app itself: AppKit, driven from Rust through objc2
 [workspace]
 resolver = "2"
-members = ["crates/sentinel-sys", "crates/ide-core"]
+members = ["crates/sentinel-sys", "crates/ide-core", "crates/host-macos"]
 
 [workspace.package]
 version = "0.1.15"

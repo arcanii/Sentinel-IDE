@@ -11,3 +11,8 @@
 *.dll binary
 *.lib binary
 *.exe binary
+
+# Shell scripts are the one exception to CRLF: bash reads a CR as part of the command
+# (`$'\r': command not found`), so scripts/make-macos-app.sh must check out with LF.
+*.sh text eol=lf
+*.icns binary

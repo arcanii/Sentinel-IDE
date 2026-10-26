@@ -26,7 +26,7 @@ fn repo() -> PathBuf {
 }
 
 fn snc() -> PathBuf {
-    let (p, caps) = find_snc(repo().parent()).expect("no snc found — set SNC or SENTINEL_LANG");
+    let (p, caps) = find_snc(repo().parent(), &[]).expect("no snc found — set SNC or SENTINEL_LANG");
     assert!(caps.verify, "{} cannot verify signatures", p.display());
     p
 }

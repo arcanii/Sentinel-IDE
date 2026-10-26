@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sentinel-IDE.app's Info.plist. scripts/make-macos-app.sh fills @VERSION@ (the marketing
+  version, the workspace's) and @BUILD@ (git rev-list count + BUILDBASE, the same formula
+  as scripts\build.bat, so one commit stamps one build number on both platforms).
+
+  The document types are the macOS side of src/core/FileAssoc.h and the installer's
+  [Registry] section: a double-clicked .sntproject or .sentinel opens here.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Sentinel-IDE</string>
+	<key>CFBundleDisplayName</key>
+	<string>Sentinel-IDE</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.arcanii.Sentinel-IDE</string>
+	<key>CFBundleExecutable</key>
+	<string>Sentinel-IDE</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@BUILD@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>GPL-3.0-or-later</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Sentinel Project</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>SentinelFile</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.github.arcanii.sentinel-ide.project</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Sentinel Source</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>SentinelFile</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.github.arcanii.sentinel-ide.source</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.arcanii.sentinel-ide.project</string>
+			<key>UTTypeDescription</key>
+			<string>Sentinel Project</string>
+			<key>UTTypeIconFile</key>
+			<string>SentinelFile</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>sntproject</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.arcanii.sentinel-ide.source</string>
+			<key>UTTypeDescription</key>
+			<string>Sentinel Source</string>
+			<key>UTTypeIconFile</key>
+			<string>SentinelFile</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.source-code</string>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>sentinel</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

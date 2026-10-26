@@ -9,8 +9,9 @@ use crate::signing::{snc_signing_caps, SncSigningCaps};
 
 /// Where snc is looked for, in order: `$SNC`, then `target/{release,debug}/snc` under
 /// `$SENTINEL_LANG` and under a `Sentinel-lang` checkout beside `near` (the folder holding
-/// this repo, in development), then `snc` on PATH.
-pub fn snc_candidates(near: Option<&Path>) -> Vec<PathBuf> {
+/// this repo, in development), then `extra` (a host passes the compiler it was built with),
+/// then `snc` on PATH.
+pub fn snc_candidates(near: Option<&Path>, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut c = Vec::new();
     if let Some(p) = env::var_os("SNC") {
         c.push(PathBuf::from(p));
@@ -27,6 +28,7 @@ pub fn snc_candidates(near: Option<&Path>) -> Vec<PathBuf> {
             c.push(r.join("target").join(profile).join("snc"));
         }
     }
+    c.extend(extra.iter().cloned());
     if let Some(paths) = env::var_os("PATH") {
         c.extend(env::split_paths(&paths).map(|d| d.join("snc")));
     }
@@ -36,10 +38,10 @@ pub fn snc_candidates(near: Option<&Path>) -> Vec<PathBuf> {
 /// The most ADR-0061-capable snc among the candidates: one that can sign beats one that
 /// can only verify, which beats the first that merely exists. Release is listed before
 /// debug, but capability wins over position (findSnc's rule).
-pub fn find_snc(near: Option<&Path>) -> Option<(PathBuf, SncSigningCaps)> {
+pub fn find_snc(near: Option<&Path>, extra: &[PathBuf]) -> Option<(PathBuf, SncSigningCaps)> {
     let mut first: Option<(PathBuf, SncSigningCaps)> = None;
     let mut verify_only: Option<(PathBuf, SncSigningCaps)> = None;
-    for c in snc_candidates(near).into_iter().filter(|p| p.is_file()) {
+    for c in snc_candidates(near, extra).into_iter().filter(|p| p.is_file()) {
         let caps = snc_signing_caps(&c);
         if caps.sign {
             return Some((c, caps));

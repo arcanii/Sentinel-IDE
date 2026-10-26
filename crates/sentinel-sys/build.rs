@@ -112,6 +112,9 @@ fn main() {
     // directory back as DEP_SENTINEL_PARSERS_DYLIB_DIR and add the same rpath themselves.
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out.display());
     println!("cargo:dylib_dir={}", out.display());
+    // And the compiler that built it (DEP_SENTINEL_PARSERS_SNC), so a host can offer it as
+    // a last-resort snc when nothing in the environment names one.
+    println!("cargo:snc={}", snc.display());
 }
 
 fn find_snc(repo: &Path) -> Option<PathBuf> {
