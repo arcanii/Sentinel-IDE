@@ -1,0 +1,4 @@
+# Close to the C++ house style: long lines where a statement reads better on one, and no
+# splitting short calls across several lines just because they have arguments.
+max_width = 110
+use_small_heuristics = "Max"

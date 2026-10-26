@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The Rust side of Sentinel-IDE — the start of the macOS port. It sits beside the CMake
+# build rather than replacing it: the Windows host is still C++ and is built by
+# scripts\build.bat, which never reads this file.
+#
+#   crates/sentinel-sys  the Sentinel library (src/sentinel/parsers.sentinel) built by
+#                        snc and re-linked as a dylib, plus safe decoders for its records
+#   crates/ide-core      the portable IDE logic over it: project, signing, settings,
+#                        file stamps, processes, logging — no AppKit, no Win32
+[workspace]
+resolver = "2"
+members = ["crates/sentinel-sys", "crates/ide-core"]
+
+[workspace.package]
+version = "0.1.15"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/arcanii/Sentinel-IDE"
+publish = false

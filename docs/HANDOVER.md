@@ -1,6 +1,6 @@
 # Sentinel-IDE — Handover
 
-_Last updated: 2026-09-05._
+_Last updated: 2026-10-25._
 
 > **Naming:** the product/exe is **`Sentinel-IDE`** (matching `Sentinel-lang` / `Sentinel-learning`);
 > the build output is `build\Sentinel-IDE.exe`. **Internal identifiers stay `SentinelIDE`** by design —
@@ -56,6 +56,9 @@ exist so far:
   the broken one. See **Releases** below and `docs/RELEASING.md` for the cut procedure.
 - It is built **from the UX spines + the SQLTerminal-Win32 visual reference**, and it has
   empirically reproduced real toolchain gaps (see *Known gaps*).
+- **A macOS port has started, in Rust + Sentinel** (2026-10-25). Milestone M0 — a Cargo workspace
+  beside CMake, the Sentinel library as a dylib with safe decoders, a portable `ide-core`, and every
+  parity test ported — is in place; there is no Mac UI yet. See **macOS port** below.
 
 ---
 
@@ -213,6 +216,80 @@ Small, non-obvious frictions that cost real time when rediscovered. None is a de
 - **Bash heredocs strip one level of backslash escaping** on the way to the interpreter, so a Python
   one-liner matching C++ text like `L"\r\n"` needs `\\r\\n` in the heredoc. If a search string
   mysteriously fails to match, that is usually why.
+
+## macOS port — Rust + Sentinel (M0, 2026-10-25)
+
+The Mac version is **Rust and Sentinel, with no C++, Objective-C or Swift**. It lives in a Cargo
+workspace at the repo root, beside the CMake build; `scripts\build.bat` never reads it and the Windows
+build is untouched. Measured on an Apple-silicon Mac, macOS 27.0.1, with `../Sentinel-lang`'s debug `snc`.
+
+| Path | What |
+|---|---|
+| `Cargo.toml`, `.cargo/config.toml`, `rustfmt.toml` | The workspace. The config pins `MACOSX_DEPLOYMENT_TARGET = 27.0` — the Sentinel runtime's floor, see below. |
+| `crates/sentinel-sys/build.rs` | Runs `snc build --lib src/sentinel/parsers.sentinel`, then **re-links the archive into `libsentinel_parsers.dylib`** exporting only the functions the generated header declares (the list is read from the header, so a new `export "C"` fn needs no edit here). Finds snc via `$SNC`, `$SENTINEL_LANG`, a sibling `../Sentinel-lang`, then PATH. No snc, no build — there is no C++ fallback on the Mac. |
+| `crates/sentinel-sys/src/lib.rs` | One safe function per export, decoding its record into a typed value. Unlike the C++ decoders every read is **bounds-checked** — a short record is a `RecordError`, never an over-read. |
+| `crates/sentinel-sys/tests/*_parity.rs` | diag, trust, sig, appcast, seal. |
+| `crates/ide-core/src/` | The portable half: `project` (load/save via Sentinel, defaults, `build_plan` = composeBuild as arguments), `signing` (trust, `.sig`, `snc verify`, signing caps), `settings` (the same `settings.ini`, in `~/Library/Application Support/SentinelIDE/`), `stamp` (FileStamp.h whole), `proc`, `logger` (UTC), `toolchain` (findSnc). |
+| `crates/ide-core/tests/` | manifest + saveproject parity, the save round trip, file stamps, and `snc_integration` (real verify + a real build of `examples/`). |
+
+```
+cargo test --workspace                 # needs snc — see the build.rs row
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+**Why a dylib and not the static archive.** snc's archive bundles the Sentinel runtime, a Rust
+staticlib with its own copy of Rust's std. Linked straight into a Rust binary that is two stds in one
+image: ld reports a duplicate `_rust_eh_personality` and which panic runtime wins is left to link
+order. Inside a dylib the runtime's std is private (two-level namespace). ~470 KB, nine exports. The
+app bundle will carry it in `Contents/Frameworks`; test binaries find it by an rpath that
+`ide-core/build.rs` adds from sentinel-sys's `links` metadata.
+
+**Measured, and worth knowing before the next step:**
+
+- `parsers.sentinel` builds for macOS **unchanged**, and needs no `--lib-path`.
+- **The minimum macOS is 27**, and it is not ours: 388 of the runtime archive's objects declare
+  `minos 27.0` (`otool -l`). Lowering it needs Sentinel-lang to build its runtime with a lower
+  `MACOSX_DEPLOYMENT_TARGET` — a request not yet filed; it would be R16 in
+  `docs/Sentinel-lang_request.md`.
+- **Sentinel `i64` arithmetic wraps; it does not trap.** `parse_diag` on
+  `a.sentinel:9223372036854775808:1` returns line `i64::MIN` — no crash, but no line number either.
+  The Mac host must clamp; bounding the digits inside `parse_diag` (as `parse_appcast` does) would
+  change Windows too, so it is a decision, not a fix-in-passing.
+- This Mac's snc is a debug build **without `keygen_core`/`sign_core`** beside it: verify works,
+  keygen/sign do not. `snc_signing_caps` reports exactly that.
+- **`.sealed` v2 cannot be read on macOS as it stands**: the payload is LZMS (Windows Compression API)
+  and the header has no compression id. Open decision for M4: a v3 header with a compression id and a
+  portable codec, or an LZMS decoder for read compatibility.
+- The archive index is `\`-separated on every platform; `SealEntry::components` splits it.
+- `parse_appcast` takes the first `<item>`, so the Mac needs **its own feed** or it will be offered
+  `setup.exe` (M5).
+- **Unsealing on macOS — four things M4 must handle** (found while porting `seal_xcheck`, each tried
+  with a throwaway program, none of them a parity case):
+  1. The traversal guard is sufficient once `\` is mapped to `/` — every escape in the corpus is
+     refused. The danger is a host that skips it: a leading `\` then means the filesystem root.
+  2. "Nothing written until everything is checked" covers only the index. An archive that parses can
+     still fail mid-write — `a` then `a\b`, an entry `.` or `a\`, a NUL in a name, a component over 255
+     bytes — and leave files behind. Unseal into a fresh staging directory and remove it
+     **recursively** on failure; a remove-if-empty cleanup repeats the Windows defect.
+  3. APFS folds names: `A.txt`/`a.txt`, and the two Unicode spellings of `é`, become one file
+     holding the later entry's bytes. Windows folds the case pair but keeps the two `é`s apart.
+  4. Refusing `:` "cannot cost a real file" only on Windows. `:` and `\` are legal in macOS names, so
+     a Mac **sealer** must refuse or flag `a:b`, `..\x` and `a\b` at seal time — otherwise it writes a
+     container that can never be unsealed, or one that unseals into a different tree.
+
+**How the parity tests differ from the Windows ones.** Each ports its C++ oracle to Rust and checks
+Sentinel against it, with offsets compared in bytes rather than UTF-16. Two exceptions: **manifest**
+cannot run its oracle (it is `GetPrivateProfileStringW`), so each case pins the project the Windows
+cross-check proved both sides produce; **seal** synthesises its containers byte by byte, because the
+corpus was built with CNG and LZMS. Every oracle was mutated once to confirm its test fails (appcast:
+two expectations flipped).
+
+**Milestones.** M0 (this) · M1 window, project tree, Output, Build/Run, Problems — AppKit through
+`objc2` · M2 editor · M3 scheme selector, Project Settings, Signing & Trust, recents, About · M4
+sealing · M5 signing, notarisation, auto-update. Open decisions: the editor (`NSTextView` with
+temporary-attribute colouring vs a custom Core Text view over a Rust `EditorModel`), the sealed
+format (above), and an Apple Developer ID (without one Gatekeeper blocks downloaded builds and
+auto-update cannot work).
 
 ## Prototype status — phases 1–51 (all done; screenshots cover 1–11, 13, 15 — see note below)
 
@@ -1905,6 +1982,9 @@ full site chrome — a standalone HTML notes file per release would fix it (unbu
   project's own thesis. **Do NOT scaffold empty `macos/`/`linux/` trees yet** (dead weight); add a host
   when a port actually starts. Today the `src/core/*.h` "core" is still Win32-coupled (wchar_t, BCrypt,
   Compression API, profile API) — step 1 of any port is pulling that logic behind a portable seam.
+  **The macOS port has started (2026-10-25)** and took that step in Rust rather than by de-Win32-ing
+  the headers: `crates/ide-core` is the portable seam, over the same Sentinel library. The Windows
+  host still uses `src/core/*.h`. See **macOS port** above.
 - **Sealing follow-ons:** more **unlock slots** (key file, Ed25519/smartcard, TPM — each wraps the
   same DEK, no re-encryption; **format v2 / phase 31 makes this actually work** — slots are
   skip-by-length and the AAD excludes the slot table, both covered by `tests/seal_test.cpp`);

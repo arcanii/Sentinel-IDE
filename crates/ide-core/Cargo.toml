@@ -1,0 +1,12 @@
+[package]
+name = "ide-core"
+description = "The portable half of Sentinel-IDE: project, signing, settings, file stamps, processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+sentinel-sys = { path = "../sentinel-sys" }

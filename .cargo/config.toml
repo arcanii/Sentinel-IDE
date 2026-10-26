@@ -1,0 +1,8 @@
+[env]
+# The floor is the Sentinel runtime's, not ours. snc bundles libsentinel_runtime.a into
+# every library it builds, and on this machine 388 of that archive's objects declare a
+# minimum of macOS 27.0 (measured 2026-10-25 with `otool -l`). Nothing that links them can
+# honestly claim an older minimum, so we say 27.0 everywhere rather than let ld warn about
+# it on every link. Lower this only after Sentinel-lang builds its runtime with a lower
+# MACOSX_DEPLOYMENT_TARGET.
+MACOSX_DEPLOYMENT_TARGET = "27.0"

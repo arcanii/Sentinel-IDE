@@ -1,0 +1,12 @@
+[package]
+name = "sentinel-sys"
+description = "Sentinel-IDE's Sentinel library (parsers.sentinel) as a dylib, with safe record decoders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+# Tells dependents' build scripts where the dylib landed (DEP_SENTINEL_PARSERS_DYLIB_DIR),
+# so they can put it on their test binaries' rpath. See ide-core/build.rs.
+links = "sentinel_parsers"
+build = "build.rs"
